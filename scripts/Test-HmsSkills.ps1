@@ -94,11 +94,13 @@ else {
                 Repository = 'https://github.com/Leonxlnx/taste-skill.git'
                 SkillName = 'gpt-taste'
                 SkillPath = 'skills/gpt-tasteskill'
+                DiscoveryName = 'taste-skill:gpt-taste'
             }
             impeccable = [pscustomobject]@{
                 Repository = 'https://github.com/pbakaus/impeccable.git'
                 SkillName = 'impeccable'
                 SkillPath = '.agents/skills/impeccable'
+                DiscoveryName = 'impeccable:impeccable'
             }
         }
         foreach ($key in @('taste', 'impeccable')) {
@@ -111,6 +113,7 @@ else {
             if ([string]$entry.repository -cne $contract.Repository) { $errors.Add("Unexpected $key repository in UI skills lock: $($entry.repository)") }
             if ([string]$entry.skill_name -cne $contract.SkillName) { $errors.Add("Unexpected $key skill name in UI skills lock: $($entry.skill_name)") }
             if ([string]$entry.skill_path -cne $contract.SkillPath) { $errors.Add("Unexpected $key skill path in UI skills lock: $($entry.skill_path)") }
+            if ([string]$entry.codex_discovery_name -cne $contract.DiscoveryName) { $errors.Add("Unexpected $key Codex discovery name in UI skills lock: $($entry.codex_discovery_name)") }
             if ([string]$entry.commit -notmatch '^[0-9a-f]{40}$') { $errors.Add("Invalid $key pinned commit in UI skills lock: $($entry.commit)") }
         }
     }
@@ -142,4 +145,4 @@ if ($errors.Count -gt 0) {
     throw ("HMS skill validation failed:`n - " + ($errors -join "`n - "))
 }
 
-Write-Host "PASS: validated $($skillFiles.Count) HMS skills, required Codex metadata, PowerShell syntax (including Manager UI), Superpowers pin, and Taste/Impeccable pins."
+Write-Host "PASS: validated $($skillFiles.Count) HMS skills, required Codex metadata, PowerShell syntax (including Manager UI), Superpowers pin, and Taste/Impeccable pin+discovery contracts."
