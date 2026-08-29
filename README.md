@@ -39,6 +39,32 @@ Changing the Superpowers pin is a material workflow change and should go through
 
 Restart Codex after the first installation so skill discovery refreshes.
 
+## HMS Superpowers Manager
+
+Windows users can enable or disable Codex discovery through the GUI instead of editing junctions manually.
+
+Double-click:
+
+```text
+HMS-Superpowers-Manager.cmd
+```
+
+The manager exposes independent ON/OFF controls for:
+
+- HMS Superpowers;
+- pinned upstream Superpowers;
+- both together.
+
+OFF removes only the validated discovery junction. It does **not** delete the HMS repository, Superpowers checkout, or skill data. If the expected discovery path is occupied by an unrelated folder, file, or different reparse target, the manager reports `CONFLICT` and refuses to replace or remove it.
+
+The launcher uses process-local `ExecutionPolicy Bypass`, so it does not permanently weaken the machine execution policy. Restart or refresh Codex after changing discovery state.
+
+Manager runtime self-test:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\manager\HmsSuperpowersManager.ps1 -SelfTest
+```
+
 ## Use
 
 Explicit invocation:
@@ -86,7 +112,7 @@ This fast-forwards the HMS Skills Codex repository, validates it, and reconciles
 pwsh ./scripts/Test-HmsSkills.ps1
 ```
 
-The validator checks required `SKILL.md` frontmatter, folder/name identity, duplicate names, required Codex metadata, PowerShell syntax, and the pinned Superpowers authority. GitHub Actions runs structural validation and the Windows install/update/real-Codex-discovery/uninstall contract on both pushes and pull requests.
+The validator checks required `SKILL.md` frontmatter, folder/name identity, duplicate names, required Codex metadata, PowerShell syntax including the Manager UI, and the pinned Superpowers authority. GitHub Actions runs structural validation and the Windows install/update/manager-self-test/real-Codex-discovery/uninstall contract on both pushes and pull requests.
 
 ## Status
 
