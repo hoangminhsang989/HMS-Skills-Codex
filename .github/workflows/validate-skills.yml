@@ -95,6 +95,45 @@ jobs:
             if (Test-Path -LiteralPath $hmsLink) { throw 'HMS junction remained after uninstall.' }
             if (Test-Path -LiteralPath $superpowersLink) { throw 'Superpowers junction remained after uninstall.' }
 
+            # A clean local branch that is ahead of the verified remote must never be
+            # accepted as installed/updated authority merely because merge --ff-only
+            # reports "Already up to date".
+            $aheadClone = Join-Path $env:RUNNER_TEMP 'local-ahead-hms-clone'
+            git clone --branch main --single-branch 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git' $aheadClone
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to create local-ahead synthetic clone.' }
+            git -C $aheadClone config user.email 'ci@example.invalid'
+            git -C $aheadClone config user.name 'HMS CI'
+            Set-Content -LiteralPath (Join-Path $aheadClone 'LOCAL_AHEAD_SENTINEL.txt') -Value 'unverified local commit'
+            git -C $aheadClone add LOCAL_AHEAD_SENTINEL.txt
+            git -C $aheadClone commit -m 'synthetic local-ahead commit' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to create synthetic local-ahead commit.' }
+            $aheadHead = (& git -C $aheadClone rev-parse HEAD).Trim()
+            $remoteMain = (& git -C $aheadClone rev-parse refs/remotes/origin/main).Trim()
+            if ($LASTEXITCODE -ne 0 -or $aheadHead -eq $remoteMain) { throw 'Local-ahead test setup did not create distinct identities.' }
+            if (git -C $aheadClone status --porcelain) { throw 'Local-ahead test setup is unexpectedly dirty.' }
+
+            $installRejectedAhead = $false
+            try {
+              & "$env:GITHUB_WORKSPACE\install.ps1" -InstallRoot $aheadClone -SkipSuperpowers
+            }
+            catch {
+              $installRejectedAhead = $true
+            }
+            if (-not $installRejectedAhead) { throw 'Installer incorrectly accepted a clean local-ahead branch.' }
+            if (Test-Path -LiteralPath $hmsLink) { throw 'Rejected local-ahead install created an HMS discovery junction.' }
+            if ((& git -C $aheadClone rev-parse HEAD).Trim() -ne $aheadHead) { throw 'Installer mutated local-ahead HEAD before rejection.' }
+
+            $updateRejectedAhead = $false
+            try {
+              & "$env:GITHUB_WORKSPACE\update.ps1" -InstallRoot $aheadClone -SkipSuperpowers
+            }
+            catch {
+              $updateRejectedAhead = $true
+            }
+            if (-not $updateRejectedAhead) { throw 'Updater incorrectly accepted a clean local-ahead branch.' }
+            if ((& git -C $aheadClone rev-parse HEAD).Trim() -ne $aheadHead) { throw 'Updater mutated local-ahead HEAD before rejection.' }
+            Remove-Item -LiteralPath $aheadClone -Recurse -Force
+
             # Prove the public custom -InstallRoot is honored for clone deletion.
             $customClone = Join-Path $env:RUNNER_TEMP 'custom-hms-clone'
             New-Item -ItemType Directory -Force -Path (Join-Path $customClone 'skills\hms-superpowers') | Out-Null
