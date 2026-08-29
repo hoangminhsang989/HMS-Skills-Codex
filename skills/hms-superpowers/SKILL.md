@@ -16,7 +16,7 @@ Always preserve this order:
 3. HMS fail-closed and safety rules;
 4. HMS adaptive model-routing policy;
 5. HMS project-specific skills, including `$hms-ui-design-authority`;
-6. optional design-advisor skills such as `$gpt-taste` and `$impeccable`;
+6. optional design-advisor skills such as `$taste-skill:gpt-taste` and `$impeccable:impeccable`;
 7. upstream Superpowers;
 8. Codex defaults.
 
@@ -30,7 +30,7 @@ A lower layer cannot silently override a higher one.
 4. Invoke `$hms-scope-lock` for implementation or remediation work.
 5. Invoke `$hms-model-router` for non-trivial work and obey the strongest available routing mechanism. If the runtime cannot switch model/effort itself, report the required route instead of pretending it switched.
 6. Invoke `$hms-ui-design-authority` before material UI/UX, design-system, Penpot, DESIGN.md, token, component-mapping, or visual-regression work.
-7. When useful and enabled, use `$gpt-taste` and/or `$impeccable` only as design advisors inside the UI authority and scope already established by step 6.
+7. When useful and enabled, use `$taste-skill:gpt-taste` and/or `$impeccable:impeccable` only as design advisors inside the UI authority and scope already established by step 6.
 8. Use upstream Superpowers process skills when applicable.
 9. Use `$hms-evidence-gate` before any PASS/completion claim.
 10. Add `$hms-independent-review` for architecture, security, trust-boundary, critical blocker, release, or final-stage gates.
@@ -42,6 +42,8 @@ A lower layer cannot silently override a higher one.
 Taste and Impeccable can raise visual quality, but their generic prescriptions are not product authority. Ignore or narrow any advisor rule that conflicts with owner instruction, a frozen HMS definition, Penpot, `DESIGN.md`, design tokens/component mapping, platform constraints, or behavior outside the authorized scope.
 
 Do not import marketing-site conventions such as mandatory AIDA structure, GSAP motion, randomized layouts, oversized cinematic spacing, or font bans into a desktop engineering/productivity UI unless the higher UI authority explicitly supports those choices.
+
+The external advisor repositories are intentionally namespace-qualified by Codex. Use the discovery identities recorded in `ui-skills.lock.json`; do not assume the raw frontmatter name is the invocation name.
 
 ## Superpowers adaptation
 
