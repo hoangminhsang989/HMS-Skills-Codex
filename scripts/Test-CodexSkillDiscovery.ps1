@@ -20,6 +20,7 @@ $requiredHmsSkills = @(
     'hms-release-gate',
     'hms-handoff'
 )
+$requiredUpstreamSkills = @('brainstorming')
 
 $node = Get-Command node -ErrorAction Stop
 $npmRoot = (& npm root -g).Trim()
@@ -99,7 +100,10 @@ try {
             }
         }
     }
-    [void](Read-AppServerResponse -Id 1)
+    $initializeResponse = Read-AppServerResponse -Id 1
+    if ($null -ne $initializeResponse.result.codexHome) {
+        Write-Host "Codex app-server codexHome: $($initializeResponse.result.codexHome)"
+    }
 
     Send-AppServerMessage -Message @{ method = 'initialized' }
     Send-AppServerMessage -Message @{
@@ -124,9 +128,17 @@ try {
 
     $skills = @($entry.skills)
     $names = @($skills | ForEach-Object { [string]$_.name })
+    $sortedNames = @($names | Sort-Object -Unique)
+    Write-Host ("Codex discovered skills: " + ($sortedNames -join ', '))
+
     foreach ($required in $requiredHmsSkills) {
         if ($names -notcontains $required) {
-            throw "Codex skills/list did not discover required HMS skill '$required'."
+            throw "Codex skills/list did not discover required HMS skill '$required'. Observed names: $($sortedNames -join ', ')"
+        }
+    }
+    foreach ($required in $requiredUpstreamSkills) {
+        if ($names -notcontains $required) {
+            throw "Codex skills/list did not discover required pinned Superpowers skill '$required'. Observed names: $($sortedNames -join ', ')"
         }
     }
 
@@ -135,7 +147,7 @@ try {
         throw "Expected exactly one discovered hms-superpowers skill, found $($orchestrator.Count)."
     }
 
-    Write-Host "PASS: Codex app-server skills/list discovered all $($requiredHmsSkills.Count) HMS skills including hms-superpowers."
+    Write-Host "PASS: Codex app-server skills/list discovered all $($requiredHmsSkills.Count) HMS skills and pinned Superpowers."
 }
 finally {
     try { $process.StandardInput.Close() } catch { }

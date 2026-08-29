@@ -10,26 +10,32 @@ permissions:
 
 env:
   CODEX_CLI_VERSION: '0.151.0'
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout exact event SHA
+      - name: Checkout exact candidate SHA
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.CANDIDATE_SHA }}
       - name: Validate skill structure
         shell: pwsh
-        run: ./scripts/Test-HmsSkills.ps1
+        run: |
+          $actual = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:CANDIDATE_SHA.ToLowerInvariant()) {
+            throw "Structural checkout identity mismatch. Expected $env:CANDIDATE_SHA, found $actual"
+          }
+          ./scripts/Test-HmsSkills.ps1
 
   windows-install-smoke:
     runs-on: windows-latest
     steps:
-      - name: Checkout exact event SHA
+      - name: Checkout exact candidate SHA
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ env.CANDIDATE_SHA }}
       - name: Install pinned Codex CLI for real discovery
         shell: pwsh
         run: |
@@ -44,36 +50,35 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $expectedSha = '${{ github.sha }}'.ToLowerInvariant()
+          $expectedSha = $env:CANDIDATE_SHA.ToLowerInvariant()
           $workspaceHead = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim().ToLowerInvariant()
           if ($LASTEXITCODE -ne 0 -or $workspaceHead -ne $expectedSha) {
             throw "Workflow checkout identity mismatch. Expected $expectedSha, found $workspaceHead"
           }
 
-          $testHome = Join-Path $env:RUNNER_TEMP 'hms-skills-home'
-          New-Item -ItemType Directory -Force -Path $testHome | Out-Null
-          $originalUserProfile = $env:USERPROFILE
+          # Codex resolves its user skill root from the OS home directory. Use the
+          # real ephemeral runner profile so installer and app-server observe the same home.
+          $runnerHome = $env:USERPROFILE
           $originalHome = $env:HOME
           $originalCodexHome = $env:CODEX_HOME
           try {
-            $env:USERPROFILE = $testHome
-            $env:HOME = $testHome
-            $env:CODEX_HOME = Join-Path $testHome '.codex'
+            $env:HOME = $runnerHome
+            $env:CODEX_HOME = Join-Path $runnerHome '.codex'
 
             & "$env:GITHUB_WORKSPACE\install.ps1" -InstallRoot $env:GITHUB_WORKSPACE
 
             $headAfterInstall = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim().ToLowerInvariant()
             if ($LASTEXITCODE -ne 0 -or $headAfterInstall -ne $expectedSha) {
-              throw "Installer changed event-bound HMS identity. Expected $expectedSha, found $headAfterInstall"
+              throw "Installer changed candidate-bound HMS identity. Expected $expectedSha, found $headAfterInstall"
             }
 
-            $hmsLink = Join-Path $testHome '.agents\skills\hms'
-            $superpowersLink = Join-Path $testHome '.agents\skills\superpowers'
+            $hmsLink = Join-Path $runnerHome '.agents\skills\hms'
+            $superpowersLink = Join-Path $runnerHome '.agents\skills\superpowers'
             if (-not (Test-Path -LiteralPath $hmsLink)) { throw 'HMS skills junction was not created.' }
             if (-not (Test-Path -LiteralPath $superpowersLink)) { throw 'Superpowers skills junction was not created.' }
 
             $lock = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'superpowers.lock.json') -Raw | ConvertFrom-Json
-            $actualSuperpowersHead = (& git -C (Join-Path $testHome '.codex\superpowers') rev-parse HEAD).Trim()
+            $actualSuperpowersHead = (& git -C (Join-Path $runnerHome '.codex\superpowers') rev-parse HEAD).Trim()
             if ($LASTEXITCODE -ne 0 -or $actualSuperpowersHead -ne [string]$lock.commit) {
               throw "Superpowers pin mismatch. Expected $($lock.commit), found $actualSuperpowersHead"
             }
@@ -83,7 +88,7 @@ jobs:
             & "$env:GITHUB_WORKSPACE\update.ps1" -InstallRoot $env:GITHUB_WORKSPACE
             $headAfterUpdate = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim().ToLowerInvariant()
             if ($LASTEXITCODE -ne 0 -or $headAfterUpdate -ne $expectedSha) {
-              throw "Updater changed event-bound HMS identity. Expected $expectedSha, found $headAfterUpdate"
+              throw "Updater changed candidate-bound HMS identity. Expected $expectedSha, found $headAfterUpdate"
             }
 
             & "$env:GITHUB_WORKSPACE\uninstall.ps1" -InstallRoot $env:GITHUB_WORKSPACE -IncludeSuperpowers
@@ -91,7 +96,7 @@ jobs:
             if (Test-Path -LiteralPath $superpowersLink) { throw 'Superpowers junction remained after uninstall.' }
 
             # Prove the public custom -InstallRoot is honored for clone deletion.
-            $customClone = Join-Path $testHome 'custom-hms-clone'
+            $customClone = Join-Path $env:RUNNER_TEMP 'custom-hms-clone'
             New-Item -ItemType Directory -Force -Path (Join-Path $customClone 'skills\hms-superpowers') | Out-Null
             Set-Content -LiteralPath (Join-Path $customClone 'skills\hms-superpowers\SKILL.md') -Value 'marker'
             git -C $customClone init | Out-Null
@@ -100,7 +105,7 @@ jobs:
             if (Test-Path -LiteralPath $customClone) { throw 'Custom InstallRoot clone was not removed.' }
 
             # Prove clone deletion failures remain failures rather than apparent success.
-            $blockedClone = Join-Path $testHome 'blocked-hms-clone'
+            $blockedClone = Join-Path $env:RUNNER_TEMP 'blocked-hms-clone'
             New-Item -ItemType Directory -Force -Path (Join-Path $blockedClone 'skills\hms-superpowers') | Out-Null
             $blockedMarker = Join-Path $blockedClone 'skills\hms-superpowers\SKILL.md'
             Set-Content -LiteralPath $blockedMarker -Value 'locked marker'
@@ -123,8 +128,8 @@ jobs:
             }
 
             # A tampered Superpowers repository must be rejected before any Superpowers clone/junction mutation.
-            $tamperedHome = Join-Path $testHome 'tampered-home'
-            $tamperedRepo = Join-Path $testHome 'tampered-repo'
+            $tamperedHome = Join-Path $env:RUNNER_TEMP 'tampered-home'
+            $tamperedRepo = Join-Path $env:RUNNER_TEMP 'tampered-repo'
             New-Item -ItemType Directory -Force -Path $tamperedRepo | Out-Null
             Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Force | Where-Object Name -ne '.git' | ForEach-Object {
               Copy-Item -LiteralPath $_.FullName -Destination $tamperedRepo -Recurse -Force
@@ -161,9 +166,9 @@ jobs:
             if (Test-Path -LiteralPath (Join-Path $tamperedHome '.agents\skills\hms')) { throw 'Tampered lock caused an HMS discovery junction mutation before rejection.' }
           }
           finally {
-            $env:USERPROFILE = $originalUserProfile
+            $env:USERPROFILE = $runnerHome
             $env:HOME = $originalHome
             $env:CODEX_HOME = $originalCodexHome
           }
 
-          Write-Host 'PASS: Windows event-SHA-bound install/update/Codex-discovery/uninstall contract smoke completed.'
+          Write-Host 'PASS: Windows candidate-SHA-bound install/update/Codex-discovery/uninstall contract smoke completed.'
