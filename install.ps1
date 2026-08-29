@@ -8,6 +8,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $HmsRemote = 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
+$CanonicalSuperpowersRemote = 'https://github.com/obra/superpowers.git'
 $SkillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
 $HmsLink = Join-Path $SkillsRoot 'hms'
 $SuperpowersRoot = Join-Path $env:USERPROFILE '.codex\superpowers'
@@ -19,6 +20,15 @@ function Assert-Git {
     }
 }
 
+function ConvertTo-NormalizedRemote {
+    param([Parameter(Mandatory)][string]$Remote)
+    $value = $Remote.Trim().TrimEnd('/')
+    if ($value.EndsWith('.git', [StringComparison]::OrdinalIgnoreCase)) {
+        $value = $value.Substring(0, $value.Length - 4)
+    }
+    return $value.ToLowerInvariant()
+}
+
 function Assert-ExpectedOrigin {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -27,9 +37,18 @@ function Assert-ExpectedOrigin {
 
     $origin = & git -C $Path remote get-url origin
     if ($LASTEXITCODE -ne 0) { throw "git remote get-url origin failed for $Path" }
-    if ($origin.Trim().TrimEnd('/') -ne $ExpectedRemote.Trim().TrimEnd('/')) {
+    if ((ConvertTo-NormalizedRemote $origin) -ne (ConvertTo-NormalizedRemote $ExpectedRemote)) {
         throw "Unexpected Git origin for $Path. Expected '$ExpectedRemote', found '$($origin.Trim())'."
     }
+}
+
+function Get-CurrentBranch {
+    param([Parameter(Mandatory)][string]$Path)
+    $branch = & git -C $Path symbolic-ref --quiet --short HEAD
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 0) { return $branch.Trim() }
+    if ($exitCode -eq 1) { return $null }
+    throw "git symbolic-ref failed for $Path with exit code $exitCode"
 }
 
 function Sync-Repository {
@@ -46,8 +65,23 @@ function Sync-Repository {
         $dirty = & git -C $Path status --porcelain
         if ($LASTEXITCODE -ne 0) { throw "git status failed for $Path" }
         if ($dirty) { throw "Refusing to update dirty repository: $Path" }
-        & git -C $Path pull --ff-only
-        if ($LASTEXITCODE -ne 0) { throw "git pull --ff-only failed for $Path" }
+
+        $branch = Get-CurrentBranch -Path $Path
+        if ($null -ne $branch) {
+            $sourceRef = "refs/heads/$branch"
+            $remoteRef = "refs/remotes/origin/$branch"
+            & git -C $Path fetch --prune $Remote "${sourceRef}:${remoteRef}"
+            if ($LASTEXITCODE -ne 0) { throw "git fetch from verified origin failed for $Path branch $branch" }
+            & git -C $Path merge --ff-only $remoteRef
+            if ($LASTEXITCODE -ne 0) { throw "git merge --ff-only failed for $Path from $remoteRef" }
+        }
+        else {
+            $detachedHead = (& git -C $Path rev-parse HEAD).Trim()
+            if ($LASTEXITCODE -ne 0 -or $detachedHead -notmatch '^[0-9a-fA-F]{40}$') {
+                throw "Unable to prove detached HEAD identity for $Path"
+            }
+            Write-Verbose "Preserving detached HMS candidate at $detachedHead without mutable ref synchronization."
+        }
     }
     else {
         $parent = Split-Path -Parent $Path
@@ -55,6 +89,41 @@ function Sync-Repository {
         & git clone $Remote $Path
         if ($LASTEXITCODE -ne 0) { throw "git clone failed for $Remote" }
         Assert-ExpectedOrigin -Path $Path -ExpectedRemote $Remote
+    }
+}
+
+function Read-ValidatedSuperpowersLock {
+    param([Parameter(Mandatory)][string]$LockPath)
+
+    if (-not (Test-Path -LiteralPath $LockPath)) {
+        throw "Superpowers lock file not found: $LockPath"
+    }
+
+    try {
+        $lock = Get-Content -LiteralPath $LockPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        throw "Superpowers lock file is not valid JSON: $($_.Exception.Message)"
+    }
+
+    $repository = [string]$lock.repository
+    $version = [string]$lock.version
+    $commit = [string]$lock.commit
+
+    if ($repository -cne $CanonicalSuperpowersRemote) {
+        throw "Unexpected Superpowers repository in lock: $repository"
+    }
+    if ([string]::IsNullOrWhiteSpace($version)) {
+        throw 'Superpowers lock version is missing.'
+    }
+    if ($commit -notmatch '^[0-9a-f]{40}$') {
+        throw "Superpowers lock commit is not a canonical lowercase SHA-1: $commit"
+    }
+
+    return [pscustomobject]@{
+        Repository = $repository
+        Version = $version
+        Commit = $commit
     }
 }
 
@@ -82,8 +151,8 @@ function Sync-PinnedRepository {
         Assert-ExpectedOrigin -Path $Path -ExpectedRemote $Remote
     }
 
-    & git -C $Path fetch --tags --prune origin
-    if ($LASTEXITCODE -ne 0) { throw "git fetch failed for $Path" }
+    & git -C $Path fetch --tags --prune $Remote
+    if ($LASTEXITCODE -ne 0) { throw "git fetch from verified pinned repository failed for $Path" }
 
     & git -C $Path cat-file -e "$Commit^{commit}" 2>$null
     if ($LASTEXITCODE -ne 0) {
@@ -129,31 +198,28 @@ function Ensure-Junction {
 }
 
 Assert-Git
-New-Item -ItemType Directory -Force -Path $SkillsRoot | Out-Null
 Sync-Repository -Remote $HmsRemote -Path $InstallRoot
-Ensure-Junction -Link $HmsLink -Target (Join-Path $InstallRoot 'skills')
 
+$superpowersLock = $null
 if (-not $SkipSuperpowers) {
-    $lockPath = Join-Path $InstallRoot 'superpowers.lock.json'
-    if (-not (Test-Path -LiteralPath $lockPath)) { throw "Superpowers lock file not found: $lockPath" }
-    $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
-    $superpowersRemote = [string]$lock.repository
-    $superpowersCommit = [string]$lock.commit
-    if ([string]::IsNullOrWhiteSpace($superpowersRemote) -or $superpowersCommit -notmatch '^[0-9a-fA-F]{40}$') {
-        throw 'Superpowers lock file is invalid.'
-    }
-
-    Sync-PinnedRepository -Remote $superpowersRemote -Path $SuperpowersRoot -Commit $superpowersCommit.ToLowerInvariant()
-    Ensure-Junction -Link $SuperpowersLink -Target (Join-Path $SuperpowersRoot 'skills')
+    $superpowersLock = Read-ValidatedSuperpowersLock -LockPath (Join-Path $InstallRoot 'superpowers.lock.json')
 }
 
 $validator = Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1'
 & $validator
 
+New-Item -ItemType Directory -Force -Path $SkillsRoot | Out-Null
+Ensure-Junction -Link $HmsLink -Target (Join-Path $InstallRoot 'skills')
+
+if (-not $SkipSuperpowers) {
+    Sync-PinnedRepository -Remote $superpowersLock.Repository -Path $SuperpowersRoot -Commit $superpowersLock.Commit
+    Ensure-Junction -Link $SuperpowersLink -Target (Join-Path $SuperpowersRoot 'skills')
+}
+
 Write-Host 'HMS Skills Codex installation PASS.'
 Write-Host "HMS skills: $HmsLink"
 if (-not $SkipSuperpowers) {
     Write-Host "Superpowers skills: $SuperpowersLink"
-    Write-Host "Superpowers pin: $superpowersCommit"
+    Write-Host "Superpowers pin: $($superpowersLock.Commit)"
 }
 Write-Host 'Restart Codex to refresh skill discovery.'

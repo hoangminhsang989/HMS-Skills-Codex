@@ -87,7 +87,7 @@ else {
         $repository = [string]$lock.repository
         $version = [string]$lock.version
         $commit = [string]$lock.commit
-        if ($repository -ne 'https://github.com/obra/superpowers.git') {
+        if ($repository -cne 'https://github.com/obra/superpowers.git') {
             $errors.Add("Unexpected Superpowers repository in lock: $repository")
         }
         if ([string]::IsNullOrWhiteSpace($version)) {
@@ -105,7 +105,8 @@ else {
 $powerShellScripts = @(
     (Join-Path $RepoRoot 'install.ps1'),
     (Join-Path $RepoRoot 'update.ps1'),
-    (Join-Path $RepoRoot 'uninstall.ps1')
+    (Join-Path $RepoRoot 'uninstall.ps1'),
+    (Join-Path $RepoRoot 'scripts\Test-CodexSkillDiscovery.ps1')
 )
 
 foreach ($scriptPath in $powerShellScripts) {

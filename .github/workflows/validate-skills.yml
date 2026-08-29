@@ -8,66 +8,162 @@ on:
 permissions:
   contents: read
 
+env:
+  CODEX_CLI_VERSION: '0.151.0'
+
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout exact event SHA
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
       - name: Validate skill structure
         shell: pwsh
         run: ./scripts/Test-HmsSkills.ps1
 
   windows-install-smoke:
-    if: github.event_name == 'push'
     runs-on: windows-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout exact event SHA
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install candidate into isolated user profile
+        with:
+          ref: ${{ github.sha }}
+      - name: Install pinned Codex CLI for real discovery
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          npm install --global "@openai/codex@$env:CODEX_CLI_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Codex CLI installation failed.' }
+          $actualVersion = (& codex --version) -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $actualVersion -notmatch [regex]::Escape($env:CODEX_CLI_VERSION)) {
+            throw "Unexpected Codex CLI version output: $actualVersion"
+          }
+      - name: Verify install update discovery and uninstall contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedSha = '${{ github.sha }}'.ToLowerInvariant()
+          $workspaceHead = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $workspaceHead -ne $expectedSha) {
+            throw "Workflow checkout identity mismatch. Expected $expectedSha, found $workspaceHead"
+          }
+
           $testHome = Join-Path $env:RUNNER_TEMP 'hms-skills-home'
-          $installRoot = Join-Path $testHome '.codex\hms-skills-codex'
           New-Item -ItemType Directory -Force -Path $testHome | Out-Null
-
-          git clone --branch "${{ github.ref_name }}" --single-branch "https://github.com/${{ github.repository }}.git" $installRoot
-          if ($LASTEXITCODE -ne 0) { throw 'Candidate clone failed.' }
-
           $originalUserProfile = $env:USERPROFILE
+          $originalHome = $env:HOME
+          $originalCodexHome = $env:CODEX_HOME
           try {
             $env:USERPROFILE = $testHome
-            & "$env:GITHUB_WORKSPACE\install.ps1" -InstallRoot $installRoot
+            $env:HOME = $testHome
+            $env:CODEX_HOME = Join-Path $testHome '.codex'
+
+            & "$env:GITHUB_WORKSPACE\install.ps1" -InstallRoot $env:GITHUB_WORKSPACE
+
+            $headAfterInstall = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $headAfterInstall -ne $expectedSha) {
+              throw "Installer changed event-bound HMS identity. Expected $expectedSha, found $headAfterInstall"
+            }
 
             $hmsLink = Join-Path $testHome '.agents\skills\hms'
-            if (-not (Test-Path -LiteralPath $hmsLink)) { throw 'HMS skills junction was not created.' }
-            $linkItem = Get-Item -LiteralPath $hmsLink -Force
-            if (-not ($linkItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'HMS skills path is not a junction/reparse point.' }
-
-            $skillFiles = @(Get-ChildItem -LiteralPath $hmsLink -Filter 'SKILL.md' -File -Recurse)
-            if ($skillFiles.Count -ne 11) { throw "Expected 11 HMS skills, found $($skillFiles.Count)." }
-
-            $orchestrator = Join-Path $hmsLink 'hms-superpowers\SKILL.md'
-            $metadata = Join-Path $hmsLink 'hms-superpowers\agents\openai.yaml'
-            if (-not (Test-Path -LiteralPath $orchestrator)) { throw 'hms-superpowers is missing from installed discovery tree.' }
-            if (-not (Test-Path -LiteralPath $metadata)) { throw 'hms-superpowers Codex metadata is missing from installed discovery tree.' }
-
             $superpowersLink = Join-Path $testHome '.agents\skills\superpowers'
+            if (-not (Test-Path -LiteralPath $hmsLink)) { throw 'HMS skills junction was not created.' }
             if (-not (Test-Path -LiteralPath $superpowersLink)) { throw 'Superpowers skills junction was not created.' }
-            $superLinkItem = Get-Item -LiteralPath $superpowersLink -Force
-            if (-not ($superLinkItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Superpowers skills path is not a junction/reparse point.' }
-            $superSkillFiles = @(Get-ChildItem -LiteralPath $superpowersLink -Filter 'SKILL.md' -File -Recurse)
-            if ($superSkillFiles.Count -eq 0) { throw 'No Superpowers skills were discovered through the installed junction.' }
 
-            $lock = Get-Content -LiteralPath (Join-Path $installRoot 'superpowers.lock.json') -Raw | ConvertFrom-Json
+            $lock = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'superpowers.lock.json') -Raw | ConvertFrom-Json
             $actualSuperpowersHead = (& git -C (Join-Path $testHome '.codex\superpowers') rev-parse HEAD).Trim()
             if ($LASTEXITCODE -ne 0 -or $actualSuperpowersHead -ne [string]$lock.commit) {
               throw "Superpowers pin mismatch. Expected $($lock.commit), found $actualSuperpowersHead"
             }
+
+            & "$env:GITHUB_WORKSPACE\scripts\Test-CodexSkillDiscovery.ps1" -Cwd $env:GITHUB_WORKSPACE
+
+            & "$env:GITHUB_WORKSPACE\update.ps1" -InstallRoot $env:GITHUB_WORKSPACE
+            $headAfterUpdate = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $headAfterUpdate -ne $expectedSha) {
+              throw "Updater changed event-bound HMS identity. Expected $expectedSha, found $headAfterUpdate"
+            }
+
+            & "$env:GITHUB_WORKSPACE\uninstall.ps1" -InstallRoot $env:GITHUB_WORKSPACE -IncludeSuperpowers
+            if (Test-Path -LiteralPath $hmsLink) { throw 'HMS junction remained after uninstall.' }
+            if (Test-Path -LiteralPath $superpowersLink) { throw 'Superpowers junction remained after uninstall.' }
+
+            # Prove the public custom -InstallRoot is honored for clone deletion.
+            $customClone = Join-Path $testHome 'custom-hms-clone'
+            New-Item -ItemType Directory -Force -Path (Join-Path $customClone 'skills\hms-superpowers') | Out-Null
+            Set-Content -LiteralPath (Join-Path $customClone 'skills\hms-superpowers\SKILL.md') -Value 'marker'
+            git -C $customClone init | Out-Null
+            git -C $customClone remote add origin 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
+            & "$env:GITHUB_WORKSPACE\uninstall.ps1" -InstallRoot $customClone -RemoveClones
+            if (Test-Path -LiteralPath $customClone) { throw 'Custom InstallRoot clone was not removed.' }
+
+            # Prove clone deletion failures remain failures rather than apparent success.
+            $blockedClone = Join-Path $testHome 'blocked-hms-clone'
+            New-Item -ItemType Directory -Force -Path (Join-Path $blockedClone 'skills\hms-superpowers') | Out-Null
+            $blockedMarker = Join-Path $blockedClone 'skills\hms-superpowers\SKILL.md'
+            Set-Content -LiteralPath $blockedMarker -Value 'locked marker'
+            git -C $blockedClone init | Out-Null
+            git -C $blockedClone remote add origin 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
+            $stream = [IO.File]::Open($blockedMarker, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            try {
+              $failedClosed = $false
+              try {
+                & "$env:GITHUB_WORKSPACE\uninstall.ps1" -InstallRoot $blockedClone -RemoveClones
+              }
+              catch {
+                $failedClosed = $true
+              }
+              if (-not $failedClosed) { throw 'Locked clone deletion was incorrectly reported as success.' }
+            }
+            finally {
+              $stream.Dispose()
+              if (Test-Path -LiteralPath $blockedClone) { Remove-Item -LiteralPath $blockedClone -Recurse -Force }
+            }
+
+            # A tampered Superpowers repository must be rejected before any Superpowers clone/junction mutation.
+            $tamperedHome = Join-Path $testHome 'tampered-home'
+            $tamperedRepo = Join-Path $testHome 'tampered-repo'
+            New-Item -ItemType Directory -Force -Path $tamperedRepo | Out-Null
+            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Force | Where-Object Name -ne '.git' | ForEach-Object {
+              Copy-Item -LiteralPath $_.FullName -Destination $tamperedRepo -Recurse -Force
+            }
+            $tamperedLockPath = Join-Path $tamperedRepo 'superpowers.lock.json'
+            $tamperedLock = Get-Content -LiteralPath $tamperedLockPath -Raw | ConvertFrom-Json
+            $tamperedLock.repository = 'https://127.0.0.1:9/attacker/superpowers.git'
+            $tamperedLock | ConvertTo-Json | Set-Content -LiteralPath $tamperedLockPath
+            git -C $tamperedRepo init | Out-Null
+            git -C $tamperedRepo config user.email 'ci@example.invalid'
+            git -C $tamperedRepo config user.name 'HMS CI'
+            git -C $tamperedRepo remote add origin 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
+            git -C $tamperedRepo add -A
+            git -C $tamperedRepo commit -m 'synthetic tampered lock' | Out-Null
+            git -C $tamperedRepo checkout --detach HEAD | Out-Null
+
+            $env:USERPROFILE = $tamperedHome
+            $env:HOME = $tamperedHome
+            $env:CODEX_HOME = Join-Path $tamperedHome '.codex'
+            $lockRejected = $false
+            try {
+              & "$env:GITHUB_WORKSPACE\install.ps1" -InstallRoot $tamperedRepo
+            }
+            catch {
+              if ($_.Exception.Message -match 'Unexpected Superpowers repository in lock') {
+                $lockRejected = $true
+              }
+              else {
+                throw
+              }
+            }
+            if (-not $lockRejected) { throw 'Tampered Superpowers repository was not rejected by pre-network lock validation.' }
+            if (Test-Path -LiteralPath (Join-Path $tamperedHome '.codex\superpowers')) { throw 'Tampered lock caused a Superpowers clone mutation before rejection.' }
+            if (Test-Path -LiteralPath (Join-Path $tamperedHome '.agents\skills\hms')) { throw 'Tampered lock caused an HMS discovery junction mutation before rejection.' }
           }
           finally {
             $env:USERPROFILE = $originalUserProfile
+            $env:HOME = $originalHome
+            $env:CODEX_HOME = $originalCodexHome
           }
 
-          Write-Host 'PASS: Windows isolated install/discovery-layout smoke completed with pinned Superpowers.'
+          Write-Host 'PASS: Windows event-SHA-bound install/update/Codex-discovery/uninstall contract smoke completed.'
