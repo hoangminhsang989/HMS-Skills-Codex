@@ -15,9 +15,10 @@ Always preserve this order:
 2. latest valid HMS checkpoint or frozen authority;
 3. HMS fail-closed and safety rules;
 4. HMS adaptive model-routing policy;
-5. HMS project-specific skills;
-6. upstream Superpowers;
-7. Codex defaults.
+5. HMS project-specific skills, including `$hms-ui-design-authority`;
+6. optional design-advisor skills such as `$gpt-taste` and `$impeccable`;
+7. upstream Superpowers;
+8. Codex defaults.
 
 A lower layer cannot silently override a higher one.
 
@@ -29,17 +30,24 @@ A lower layer cannot silently override a higher one.
 4. Invoke `$hms-scope-lock` for implementation or remediation work.
 5. Invoke `$hms-model-router` for non-trivial work and obey the strongest available routing mechanism. If the runtime cannot switch model/effort itself, report the required route instead of pretending it switched.
 6. Invoke `$hms-ui-design-authority` before material UI/UX, design-system, Penpot, DESIGN.md, token, component-mapping, or visual-regression work.
-7. Use upstream Superpowers process skills when applicable.
-8. Use `$hms-evidence-gate` before any PASS/completion claim.
-9. Add `$hms-independent-review` for architecture, security, trust-boundary, critical blocker, release, or final-stage gates.
-10. Use `$hms-release-gate` before merge/push/release when those actions are in scope.
-11. Use `$hms-handoff` after every material checkpoint.
+7. When useful and enabled, use `$gpt-taste` and/or `$impeccable` only as design advisors inside the UI authority and scope already established by step 6.
+8. Use upstream Superpowers process skills when applicable.
+9. Use `$hms-evidence-gate` before any PASS/completion claim.
+10. Add `$hms-independent-review` for architecture, security, trust-boundary, critical blocker, release, or final-stage gates.
+11. Use `$hms-release-gate` before merge/push/release when those actions are in scope.
+12. Use `$hms-handoff` after every material checkpoint.
+
+## UI advisor adaptation
+
+Taste and Impeccable can raise visual quality, but their generic prescriptions are not product authority. Ignore or narrow any advisor rule that conflicts with owner instruction, a frozen HMS definition, Penpot, `DESIGN.md`, design tokens/component mapping, platform constraints, or behavior outside the authorized scope.
+
+Do not import marketing-site conventions such as mandatory AIDA structure, GSAP motion, randomized layouts, oversized cinematic spacing, or font bans into a desktop engineering/productivity UI unless the higher UI authority explicitly supports those choices.
 
 ## Superpowers adaptation
 
 Do not rerun brainstorming merely because upstream prefers it when an approved/frozen HMS product definition already resolves the design question. Brainstorm only genuinely unresolved choices.
 
-For UI work, an approved canonical design cannot be silently replaced by upstream brainstorming or agent visual preference. Route material UI work through `$hms-ui-design-authority` and preserve Penpot, `DESIGN.md`, design tokens, component mapping, and visual evidence according to the project authority.
+For UI work, an approved canonical design cannot be silently replaced by upstream brainstorming, Taste, Impeccable, or agent visual preference. Route material UI work through `$hms-ui-design-authority` and preserve Penpot, `DESIGN.md`, design tokens, component mapping, and visual evidence according to the project authority.
 
 Use upstream systematic debugging when root cause is unknown. Use upstream worktree discipline for material mutations. Use TDD for deterministic production logic. For OS/kernel/UAC/service/native-I/O/hardware-dependent behavior, require the strongest appropriate deterministic harness plus real runtime evidence rather than inventing artificial unit tests.
 
