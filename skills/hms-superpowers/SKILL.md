@@ -23,16 +23,16 @@ A lower layer cannot silently override a higher one.
 
 ## Start procedure
 
-1. Invoke `hms-authority-loader` when the task depends on prior HMS state.
+1. Invoke `$hms-authority-loader` when the task depends on prior HMS state.
 2. Establish current repository/runtime identity before a material mutation.
-3. Invoke `hms-authority-gate` before changing production state.
-4. Invoke `hms-scope-lock` for implementation or remediation work.
-5. Invoke `hms-model-router` for non-trivial work and obey the strongest available routing mechanism. If the runtime cannot switch model/effort itself, report the required route instead of pretending it switched.
+3. Invoke `$hms-authority-gate` before changing production state.
+4. Invoke `$hms-scope-lock` for implementation or remediation work.
+5. Invoke `$hms-model-router` for non-trivial work and obey the strongest available routing mechanism. If the runtime cannot switch model/effort itself, report the required route instead of pretending it switched.
 6. Use upstream Superpowers process skills when applicable.
-7. Use `hms-evidence-gate` before any PASS/completion claim.
-8. Add `hms-independent-review` for architecture, security, trust-boundary, critical blocker, release, or final-stage gates.
-9. Use `hms-release-gate` before merge/push/release when those actions are in scope.
-10. Use `hms-handoff` after every material checkpoint.
+7. Use `$hms-evidence-gate` before any PASS/completion claim.
+8. Add `$hms-independent-review` for architecture, security, trust-boundary, critical blocker, release, or final-stage gates.
+9. Use `$hms-release-gate` before merge/push/release when those actions are in scope.
+10. Use `$hms-handoff` after every material checkpoint.
 
 ## Superpowers adaptation
 
