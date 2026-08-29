@@ -84,6 +84,13 @@ function Get-ManagedJunctionState {
     if (-not [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
         return [pscustomobject]@{ State = 'Conflict'; Detail = "Existing path is not a reparse point: $Link" }
     }
+
+    $linkTypeProperty = $item.PSObject.Properties['LinkType']
+    $linkType = if ($null -eq $linkTypeProperty) { '' } else { [string]$item.LinkType }
+    if ($linkType -ine 'Junction') {
+        return [pscustomobject]@{ State = 'Conflict'; Detail = "Existing reparse point is not the managed Junction type: $Link (LinkType='$linkType')" }
+    }
+
     if (-not (Test-Path -LiteralPath $Target)) {
         return [pscustomobject]@{ State = 'Conflict'; Detail = "Expected target is missing: $Target" }
     }
@@ -98,7 +105,7 @@ function Get-ManagedJunctionState {
         }
         catch { }
     }
-    return [pscustomobject]@{ State = 'Conflict'; Detail = "Existing reparse point does not target the managed path: $Link" }
+    return [pscustomobject]@{ State = 'Conflict'; Detail = "Existing Junction does not target the managed path: $Link" }
 }
 
 function Assert-ManagedStateChangeAllowed {
@@ -116,13 +123,86 @@ function Assert-ManagedStateChangeAllowed {
     return $state
 }
 
-function Remove-ManagedJunction {
-    param([Parameter(Mandatory)][string]$Link)
+function Restore-QuarantinedPath {
+    param(
+        [Parameter(Mandatory)][string]$Original,
+        [Parameter(Mandatory)][string]$Quarantine
+    )
 
-    & $env:ComSpec /d /c "rmdir `"$Link`""
-    if ($LASTEXITCODE -ne 0) { throw "Failed to remove managed junction: $Link" }
-    if (Get-Item -LiteralPath $Link -Force -ErrorAction SilentlyContinue) {
-        throw "Managed junction still exists after removal: $Link"
+    $quarantineItem = Get-Item -LiteralPath $Quarantine -Force -ErrorAction SilentlyContinue
+    if ($null -eq $quarantineItem) { return }
+    if ($null -ne (Get-Item -LiteralPath $Original -Force -ErrorAction SilentlyContinue)) {
+        throw "Cannot restore quarantined path because the original path is occupied: $Original"
+    }
+    Rename-Item -LiteralPath $Quarantine -NewName (Split-Path -Leaf $Original) -ErrorAction Stop
+}
+
+function Remove-ManagedJunction {
+    param(
+        [Parameter(Mandatory)][string]$Link,
+        [Parameter(Mandatory)][string]$Target
+    )
+
+    # Revalidate identity at the destructive boundary. Never trust an earlier pathname check.
+    $boundary = Get-ManagedJunctionState -Link $Link -Target $Target
+    if ($boundary.State -ne 'Enabled') {
+        throw "Refusing destructive removal because junction identity is not currently managed: $Link : $($boundary.Detail)"
+    }
+
+    # Rename the exact entry to an unpredictable same-directory quarantine name first.
+    # If a path substitution happened before this rename, the quarantined object is
+    # revalidated and restored instead of being deleted.
+    $parent = Split-Path -Parent $Link
+    $quarantineLeaf = '.hms-removing-' + [guid]::NewGuid().ToString('N')
+    $quarantine = Join-Path $parent $quarantineLeaf
+    if ($null -ne (Get-Item -LiteralPath $quarantine -Force -ErrorAction SilentlyContinue)) {
+        throw "Unexpected quarantine collision: $quarantine"
+    }
+
+    try {
+        Rename-Item -LiteralPath $Link -NewName $quarantineLeaf -ErrorAction Stop
+    }
+    catch {
+        throw "Failed to quarantine managed junction before removal: $Link : $($_.Exception.Message)"
+    }
+
+    $quarantinedState = Get-ManagedJunctionState -Link $quarantine -Target $Target
+    if ($quarantinedState.State -ne 'Enabled') {
+        try {
+            Restore-QuarantinedPath -Original $Link -Quarantine $quarantine
+        }
+        catch {
+            throw "Quarantined path failed managed-junction revalidation and rollback was incomplete. State: $($quarantinedState.Detail). Rollback error: $($_.Exception.Message)"
+        }
+        throw "Quarantined path failed managed-junction revalidation; deletion refused and original path restored: $Link : $($quarantinedState.Detail)"
+    }
+
+    # Revalidate once more immediately before the only destructive call. The random
+    # quarantine name also removes the original public pathname from the delete target.
+    $finalBoundary = Get-ManagedJunctionState -Link $quarantine -Target $Target
+    if ($finalBoundary.State -ne 'Enabled') {
+        try {
+            Restore-QuarantinedPath -Original $Link -Quarantine $quarantine
+        }
+        catch {
+            throw "Final destructive-boundary revalidation failed and rollback was incomplete. State: $($finalBoundary.Detail). Rollback error: $($_.Exception.Message)"
+        }
+        throw "Final destructive-boundary revalidation failed; deletion refused and original path restored: $Link : $($finalBoundary.Detail)"
+    }
+
+    & $env:ComSpec /d /c "rmdir `"$quarantine`""
+    if ($LASTEXITCODE -ne 0) {
+        $removeExit = $LASTEXITCODE
+        try {
+            Restore-QuarantinedPath -Original $Link -Quarantine $quarantine
+        }
+        catch {
+            throw "Managed junction removal failed with exit code $removeExit and rollback was incomplete: $($_.Exception.Message)"
+        }
+        throw "Managed junction removal failed with exit code $removeExit; original path restored: $Link"
+    }
+    if ($null -ne (Get-Item -LiteralPath $quarantine -Force -ErrorAction SilentlyContinue)) {
+        throw "Quarantined managed junction still exists after removal: $quarantine"
     }
 }
 
@@ -144,7 +224,7 @@ function Set-ManagedJunctionEnabled {
     }
 
     if ($state.State -eq 'Disabled') { return }
-    Remove-ManagedJunction -Link $Link
+    Remove-ManagedJunction -Link $Link -Target $Target
     $after = Get-ManagedJunctionState -Link $Link -Target $Target
     if ($after.State -ne 'Disabled') { throw "Junction disable verification failed for $Link : $($after.Detail)" }
 }
@@ -212,9 +292,10 @@ function Invoke-ManagerSelfTest {
 
         Set-ManagedGroupState -Entries $entries -Enable $true
         foreach ($entry in $entries) {
-            if ((Get-ManagedJunctionState -Link $entry.Link -Target $entry.Target).State -ne 'Enabled') {
-                throw "Expected Enabled state for $($entry.Key)."
-            }
+            $enabledState = Get-ManagedJunctionState -Link $entry.Link -Target $entry.Target
+            if ($enabledState.State -ne 'Enabled') { throw "Expected Enabled state for $($entry.Key)." }
+            $enabledItem = Get-Item -LiteralPath $entry.Link -Force
+            if ([string]$enabledItem.LinkType -ine 'Junction') { throw "Managed entry was not created as an exact Junction for $($entry.Key)." }
         }
 
         Set-ManagedGroupState -Entries $entries -Enable $false
@@ -227,18 +308,64 @@ function Invoke-ManagerSelfTest {
             }
         }
 
+        # Conflict preflight must reject for the expected reason and preserve foreign data.
         $conflictEntry = $entries[2]
         New-Item -ItemType Directory -Force -Path $conflictEntry.Link | Out-Null
-        $blocked = $false
-        try { Set-ManagedGroupState -Entries $entries -Enable $true } catch { $blocked = $true }
-        if (-not $blocked) { throw 'Conflict path was incorrectly accepted by group enable.' }
+        $conflictSentinel = Join-Path $conflictEntry.Link 'FOREIGN-OWNER-SENTINEL.txt'
+        Set-Content -LiteralPath $conflictSentinel -Value 'foreign-owner-data'
+        $blockedForExpectedReason = $false
+        try {
+            Set-ManagedGroupState -Entries $entries -Enable $true
+        }
+        catch {
+            if ($_.Exception.Message -match '^Existing path is not a reparse point:') {
+                $blockedForExpectedReason = $true
+            }
+            else {
+                throw
+            }
+        }
+        if (-not $blockedForExpectedReason) { throw 'Conflict path was incorrectly accepted by group enable.' }
+        if (-not (Test-Path -LiteralPath $conflictSentinel)) { throw 'Conflict sentinel was removed during rejected group enable.' }
+        if ((Get-Content -LiteralPath $conflictSentinel -Raw).Trim() -cne 'foreign-owner-data') { throw 'Conflict sentinel content changed during rejected group enable.' }
+        $conflictItem = Get-Item -LiteralPath $conflictEntry.Link -Force
+        if ([bool]($conflictItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Foreign conflict directory was replaced by a reparse point.' }
         foreach ($entry in @($entries[0], $entries[1], $entries[3])) {
             if ((Get-ManagedJunctionState -Link $entry.Link -Target $entry.Target).State -ne 'Disabled') {
                 throw 'Group preflight mutated another skill before rejecting a conflict.'
             }
         }
+        Remove-Item -LiteralPath $conflictEntry.Link -Recurse -Force
 
-        Write-Host 'PASS: HMS Skills Manager self-test verified four-skill enable/disable, target preservation, transactional preflight, and conflict fail-closed behavior.'
+        # Destructive-boundary test: simulate a path substitution after a prior valid
+        # managed state. Remove-ManagedJunction itself must reject the replacement and
+        # preserve its sentinel rather than deleting by pathname.
+        $boundaryEntry = $entries[0]
+        Set-ManagedJunctionEnabled -Link $boundaryEntry.Link -Target $boundaryEntry.Target -Enable $true
+        & $env:ComSpec /d /c "rmdir `"$($boundaryEntry.Link)`""
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to prepare destructive-boundary substitution test.' }
+        New-Item -ItemType Directory -Force -Path $boundaryEntry.Link | Out-Null
+        $boundarySentinel = Join-Path $boundaryEntry.Link 'BOUNDARY-SENTINEL.txt'
+        Set-Content -LiteralPath $boundarySentinel -Value 'do-not-delete'
+
+        $boundaryRejected = $false
+        try {
+            Remove-ManagedJunction -Link $boundaryEntry.Link -Target $boundaryEntry.Target
+        }
+        catch {
+            if ($_.Exception.Message -match '^Refusing destructive removal because junction identity is not currently managed:') {
+                $boundaryRejected = $true
+            }
+            else {
+                throw
+            }
+        }
+        if (-not $boundaryRejected) { throw 'Destructive-boundary path substitution was incorrectly accepted.' }
+        if (-not (Test-Path -LiteralPath $boundarySentinel)) { throw 'Destructive-boundary rejection removed the replacement sentinel.' }
+        if ((Get-Content -LiteralPath $boundarySentinel -Raw).Trim() -cne 'do-not-delete') { throw 'Destructive-boundary rejection changed replacement sentinel content.' }
+        Remove-Item -LiteralPath $boundaryEntry.Link -Recurse -Force
+
+        Write-Host 'PASS: HMS Skills Manager self-test verified four-skill Junction enable/disable, exact Junction type, target preservation, transactional preflight, conflict sentinel preservation, and destructive-boundary revalidation.'
     }
     finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
