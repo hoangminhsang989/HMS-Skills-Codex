@@ -7,6 +7,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+$uiLockPath = Join-Path $RepoRoot 'ui-skills.lock.json'
+if (-not (Test-Path -LiteralPath $uiLockPath)) { throw "UI skills lock file not found: $uiLockPath" }
+$uiLock = Get-Content -LiteralPath $uiLockPath -Raw | ConvertFrom-Json
+
 $requiredHmsSkills = @(
     'hms-superpowers',
     'hms-authority-loader',
@@ -22,7 +27,13 @@ $requiredHmsSkills = @(
     'hms-ui-design-authority'
 )
 $requiredUpstreamSkills = @('superpowers:brainstorming')
-$requiredUiAdvisorSkills = @('gpt-taste', 'impeccable')
+$requiredUiAdvisorSkills = @(
+    [string]$uiLock.taste.codex_discovery_name,
+    [string]$uiLock.impeccable.codex_discovery_name
+)
+foreach ($name in $requiredUiAdvisorSkills) {
+    if ([string]::IsNullOrWhiteSpace($name)) { throw 'UI advisor Codex discovery name is missing from ui-skills.lock.json.' }
+}
 
 $node = Get-Command node -ErrorAction Stop
 $npmRoot = (& npm root -g).Trim()
@@ -109,12 +120,13 @@ try {
         }
     }
 
-    if (@($skills | Where-Object { $_.name -eq 'hms-superpowers' }).Count -ne 1) { throw 'Expected exactly one discovered hms-superpowers skill.' }
-    if (@($skills | Where-Object { $_.name -eq 'hms-ui-design-authority' }).Count -ne 1) { throw 'Expected exactly one discovered hms-ui-design-authority skill.' }
-    if (@($skills | Where-Object { $_.name -eq 'gpt-taste' }).Count -ne 1) { throw 'Expected exactly one discovered gpt-taste skill.' }
-    if (@($skills | Where-Object { $_.name -eq 'impeccable' }).Count -ne 1) { throw 'Expected exactly one discovered impeccable skill.' }
+    foreach ($uniqueName in @('hms-superpowers', 'hms-ui-design-authority') + $requiredUiAdvisorSkills) {
+        if (@($skills | Where-Object { $_.name -eq $uniqueName }).Count -ne 1) {
+            throw "Expected exactly one discovered '$uniqueName' skill."
+        }
+    }
 
-    Write-Host "PASS: Codex app-server skills/list discovered all $($requiredHmsSkills.Count) HMS skills, pinned Superpowers, GPT Taste, and Impeccable."
+    Write-Host "PASS: Codex app-server skills/list discovered all $($requiredHmsSkills.Count) HMS skills, pinned Superpowers, $($requiredUiAdvisorSkills -join ', ')."
 }
 finally {
     try { $process.StandardInput.Close() } catch { }
