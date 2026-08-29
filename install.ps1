@@ -13,10 +13,10 @@ $ErrorActionPreference = 'Stop'
 
 $HmsRemote = 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
 $CanonicalSuperpowersRemote = 'https://github.com/obra/superpowers.git'
-$SkillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
-$HmsLink = Join-Path $SkillsRoot 'hms'
 $SuperpowersRoot = Join-Path $env:USERPROFILE '.codex\superpowers'
-$SuperpowersLink = Join-Path $SkillsRoot 'superpowers'
+$CompositeRoot = Join-Path $env:USERPROFILE '.codex\hms-composite\hms-superpowers'
+$CompositeManifest = Join-Path $CompositeRoot 'manifest.json'
+$SkillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
 
 function Assert-Git {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }
@@ -25,17 +25,12 @@ function Assert-Git {
 function ConvertTo-NormalizedRemote {
     param([Parameter(Mandatory)][string]$Remote)
     $value = $Remote.Trim().TrimEnd('/')
-    if ($value.EndsWith('.git', [StringComparison]::OrdinalIgnoreCase)) {
-        $value = $value.Substring(0, $value.Length - 4)
-    }
+    if ($value.EndsWith('.git', [StringComparison]::OrdinalIgnoreCase)) { $value = $value.Substring(0, $value.Length - 4) }
     return $value.ToLowerInvariant()
 }
 
 function Assert-ExpectedOrigin {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$ExpectedRemote
-    )
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$ExpectedRemote)
     $origin = & git -C $Path remote get-url origin
     if ($LASTEXITCODE -ne 0) { throw "git remote get-url origin failed for $Path" }
     if ((ConvertTo-NormalizedRemote $origin) -ne (ConvertTo-NormalizedRemote $ExpectedRemote)) {
@@ -53,35 +48,23 @@ function Get-CurrentBranch {
 }
 
 function Assert-BranchMatchesFetchedRef {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$RemoteRef
-    )
-    $localHead = & git -C $Path rev-parse HEAD
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$RemoteRef)
+    $localHead = (& git -C $Path rev-parse HEAD).Trim().ToLowerInvariant()
     if ($LASTEXITCODE -ne 0) { throw "git rev-parse HEAD failed for $Path" }
-    $fetchedHead = & git -C $Path rev-parse $RemoteRef
+    $fetchedHead = (& git -C $Path rev-parse $RemoteRef).Trim().ToLowerInvariant()
     if ($LASTEXITCODE -ne 0) { throw "git rev-parse failed for fetched ref $RemoteRef in $Path" }
-    $localHead = $localHead.Trim().ToLowerInvariant()
-    $fetchedHead = $fetchedHead.Trim().ToLowerInvariant()
     if ($localHead -notmatch '^[0-9a-f]{40}$' -or $fetchedHead -notmatch '^[0-9a-f]{40}$') { throw "Unable to prove canonical branch identities for $Path" }
-    if ($localHead -ne $fetchedHead) {
-        throw "HMS branch identity mismatch for $Path. Local HEAD $localHead does not equal verified fetched ref $RemoteRef at $fetchedHead."
-    }
+    if ($localHead -ne $fetchedHead) { throw "HMS branch identity mismatch for $Path. Local HEAD $localHead does not equal verified fetched ref $RemoteRef at $fetchedHead." }
 }
 
 function Sync-Repository {
-    param(
-        [Parameter(Mandatory)][string]$Remote,
-        [Parameter(Mandatory)][string]$Path
-    )
-
+    param([Parameter(Mandatory)][string]$Remote,[Parameter(Mandatory)][string]$Path)
     if (Test-Path -LiteralPath $Path) {
         if (-not (Test-Path -LiteralPath (Join-Path $Path '.git'))) { throw "Refusing to overwrite existing non-Git path: $Path" }
         Assert-ExpectedOrigin -Path $Path -ExpectedRemote $Remote
         $dirty = & git -C $Path status --porcelain
         if ($LASTEXITCODE -ne 0) { throw "git status failed for $Path" }
         if ($dirty) { throw "Refusing to update dirty repository: $Path" }
-
         $branch = Get-CurrentBranch -Path $Path
         if ($null -ne $branch) {
             $sourceRef = "refs/heads/$branch"
@@ -93,9 +76,8 @@ function Sync-Repository {
             Assert-BranchMatchesFetchedRef -Path $Path -RemoteRef $remoteRef
         }
         else {
-            $detachedHead = (& git -C $Path rev-parse HEAD).Trim()
-            if ($LASTEXITCODE -ne 0 -or $detachedHead -notmatch '^[0-9a-fA-F]{40}$') { throw "Unable to prove detached HEAD identity for $Path" }
-            Write-Verbose "Preserving detached HMS candidate at $detachedHead without mutable ref synchronization."
+            $head = (& git -C $Path rev-parse HEAD).Trim()
+            if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-fA-F]{40}$') { throw "Unable to prove detached HEAD identity for $Path" }
         }
     }
     else {
@@ -107,33 +89,22 @@ function Sync-Repository {
 }
 
 function Read-ValidatedSuperpowersLock {
-    param([Parameter(Mandatory)][string]$LockPath)
-    if (-not (Test-Path -LiteralPath $LockPath)) { throw "Superpowers lock file not found: $LockPath" }
-    try { $lock = Get-Content -LiteralPath $LockPath -Raw | ConvertFrom-Json }
+    $path = Join-Path $InstallRoot 'superpowers.lock.json'
+    if (-not (Test-Path -LiteralPath $path)) { throw "Superpowers lock file not found: $path" }
+    try { $lock = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json }
     catch { throw "Superpowers lock file is not valid JSON: $($_.Exception.Message)" }
-
-    $repository = [string]$lock.repository
-    $version = [string]$lock.version
-    $commit = [string]$lock.commit
-    if ($repository -cne $CanonicalSuperpowersRemote) { throw "Unexpected Superpowers repository in lock: $repository" }
-    if ([string]::IsNullOrWhiteSpace($version)) { throw 'Superpowers lock version is missing.' }
-    if ($commit -notmatch '^[0-9a-f]{40}$') { throw "Superpowers lock commit is not a canonical lowercase SHA-1: $commit" }
-    return [pscustomobject]@{ Repository = $repository; Version = $version; Commit = $commit }
+    if ([string]$lock.repository -cne $CanonicalSuperpowersRemote) { throw "Unexpected Superpowers repository in lock: $($lock.repository)" }
+    if ([string]$lock.commit -notmatch '^[0-9a-f]{40}$') { throw "Invalid Superpowers commit in lock: $($lock.commit)" }
+    return $lock
 }
 
 function Sync-PinnedRepository {
-    param(
-        [Parameter(Mandatory)][string]$Remote,
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Commit
-    )
-
+    param([Parameter(Mandatory)][string]$Remote,[Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Commit)
     if (Test-Path -LiteralPath $Path) {
         if (-not (Test-Path -LiteralPath (Join-Path $Path '.git'))) { throw "Refusing to overwrite existing non-Git path: $Path" }
         Assert-ExpectedOrigin -Path $Path -ExpectedRemote $Remote
         $dirty = & git -C $Path status --porcelain
-        if ($LASTEXITCODE -ne 0) { throw "git status failed for $Path" }
-        if ($dirty) { throw "Refusing to update dirty repository: $Path" }
+        if ($LASTEXITCODE -ne 0 -or $dirty) { throw "Refusing to reconcile non-clean pinned repository: $Path" }
     }
     else {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
@@ -141,73 +112,83 @@ function Sync-PinnedRepository {
         if ($LASTEXITCODE -ne 0) { throw "git clone failed for $Remote" }
         Assert-ExpectedOrigin -Path $Path -ExpectedRemote $Remote
     }
-
     & git -C $Path fetch --tags --prune $Remote
-    if ($LASTEXITCODE -ne 0) { throw "git fetch from verified pinned repository failed for $Path" }
+    if ($LASTEXITCODE -ne 0) { throw "git fetch failed for pinned repository: $Path" }
     & git -C $Path cat-file -e "$Commit^{commit}" 2>$null
     if ($LASTEXITCODE -ne 0) { throw "Pinned commit is unavailable in $Path : $Commit" }
     & git -C $Path checkout --detach $Commit
     if ($LASTEXITCODE -ne 0) { throw "git checkout of pinned commit failed for $Path" }
     $actual = (& git -C $Path rev-parse HEAD).Trim().ToLowerInvariant()
-    if ($LASTEXITCODE -ne 0 -or $actual -ne $Commit) { throw "Pinned identity mismatch for $Path. Expected $Commit, found $actual" }
+    if ($actual -ne $Commit) { throw "Pinned identity mismatch for $Path. Expected $Commit, found $actual" }
 }
 
-function Ensure-Junction {
-    param(
-        [Parameter(Mandatory)][string]$Link,
-        [Parameter(Mandatory)][string]$Target
-    )
-
-    if (-not (Test-Path -LiteralPath $Target)) { throw "Junction target does not exist: $Target" }
-    $item = Get-Item -LiteralPath $Link -Force -ErrorAction SilentlyContinue
-    if ($null -ne $item) {
-        if (-not [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Refusing to replace existing non-link path: $Link" }
-        $resolvedTarget = (Resolve-Path -LiteralPath $Target).Path
-        foreach ($candidate in @($item.Target)) {
-            if (-not $candidate) { continue }
-            try { if ((Resolve-Path -LiteralPath $candidate).Path -ieq $resolvedTarget) { return } } catch { }
+function Get-ModuleState {
+    if (Test-Path -LiteralPath $CompositeManifest) {
+        try { $manifest = Get-Content -LiteralPath $CompositeManifest -Raw | ConvertFrom-Json }
+        catch { throw "Composite manifest is invalid JSON: $($_.Exception.Message)" }
+        if ([string]$manifest.managed_by -cne 'HMS-Skills-Codex' -or [string]$manifest.artifact -cne 'hms-superpowers-composite') { throw 'Composite manifest ownership mismatch.' }
+        return [ordered]@{
+            hms = [bool]$manifest.modules.hms
+            superpowers = [bool]$manifest.modules.superpowers
+            taste = [bool]$manifest.modules.taste
+            impeccable = [bool]$manifest.modules.impeccable
         }
-        throw "Refusing to replace existing path with a different target: $Link"
     }
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Link) | Out-Null
-    New-Item -ItemType Junction -Path $Link -Target $Target | Out-Null
+
+    $legacy = [ordered]@{
+        hms = (Join-Path $SkillsRoot 'hms')
+        superpowers = (Join-Path $SkillsRoot 'superpowers')
+        taste = (Join-Path $SkillsRoot 'gpt-taste')
+        impeccable = (Join-Path $SkillsRoot 'impeccable')
+    }
+    $state = [ordered]@{}
+    $legacyFound = $false
+    foreach ($key in $legacy.Keys) {
+        $exists = $null -ne (Get-Item -LiteralPath $legacy[$key] -Force -ErrorAction SilentlyContinue)
+        $state[$key] = $exists
+        if ($exists) { $legacyFound = $true }
+    }
+    if ($legacyFound) { return $state }
+    return [ordered]@{
+        hms = $true
+        superpowers = (-not $SkipSuperpowers)
+        taste = (-not $SkipTaste)
+        impeccable = (-not $SkipImpeccable)
+    }
 }
 
 Assert-Git
 Sync-Repository -Remote $HmsRemote -Path $InstallRoot
-
-$superpowersLock = $null
-if (-not $SkipSuperpowers) {
-    $superpowersLock = Read-ValidatedSuperpowersLock -LockPath (Join-Path $InstallRoot 'superpowers.lock.json')
-}
+$state = Get-ModuleState
 
 & (Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1')
 & (Join-Path $InstallRoot 'scripts\Test-DeliveryTools.ps1')
-New-Item -ItemType Directory -Force -Path $SkillsRoot | Out-Null
-Ensure-Junction -Link $HmsLink -Target (Join-Path $InstallRoot 'skills')
 
 if (-not $SkipSuperpowers) {
-    Sync-PinnedRepository -Remote $superpowersLock.Repository -Path $SuperpowersRoot -Commit $superpowersLock.Commit
-    Ensure-Junction -Link $SuperpowersLink -Target (Join-Path $SuperpowersRoot 'skills')
+    $superLock = Read-ValidatedSuperpowersLock
+    Sync-PinnedRepository -Remote ([string]$superLock.repository) -Path $SuperpowersRoot -Commit ([string]$superLock.commit)
 }
 
-$uiSyncArgs = @{}
-if ($SkipTaste) { $uiSyncArgs.SkipTaste = $true }
-if ($SkipImpeccable) { $uiSyncArgs.SkipImpeccable = $true }
-& (Join-Path $InstallRoot 'scripts\Sync-UiSkills.ps1') -EnsureDiscovery @uiSyncArgs
+$uiArgs = @{}
+if ($SkipTaste) { $uiArgs.SkipTaste = $true }
+if ($SkipImpeccable) { $uiArgs.SkipImpeccable = $true }
+& (Join-Path $InstallRoot 'scripts\Sync-UiSkills.ps1') @uiArgs
 
-$deliverySyncArgs = @{}
-if (-not $SkipCodeGraph) { $deliverySyncArgs.EnsureCodeGraphConfig = $true }
-if ($SkipCodeGraph) { $deliverySyncArgs.SkipCodeGraph = $true }
-if ($SkipThreeLevelDelivery) { $deliverySyncArgs.SkipThreeLevelDelivery = $true }
-& (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') @deliverySyncArgs
+$deliveryArgs = @{}
+if (-not $SkipCodeGraph) { $deliveryArgs.EnsureCodeGraphConfig = $true }
+if ($SkipCodeGraph) { $deliveryArgs.SkipCodeGraph = $true }
+if ($SkipThreeLevelDelivery) { $deliveryArgs.SkipThreeLevelDelivery = $true }
+& (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') @deliveryArgs
+
+& (Join-Path $InstallRoot 'scripts\Build-HmsCompositeSkill.ps1') `
+    -InstallRoot $InstallRoot `
+    -Hms ([bool]$state.hms) `
+    -Superpowers ([bool]$state.superpowers) `
+    -Taste ([bool]$state.taste) `
+    -Impeccable ([bool]$state.impeccable)
 
 Write-Host 'HMS Skills Codex installation PASS.'
-Write-Host "HMS skills: $HmsLink"
-if (-not $SkipSuperpowers) {
-    Write-Host "Superpowers skills: $SuperpowersLink"
-    Write-Host "Superpowers pin: $($superpowersLock.Commit)"
-}
-if (-not $SkipCodeGraph) { Write-Host 'CodeGraph: pinned bundle installed and Codex MCP registered by absolute path.' }
-if (-not $SkipThreeLevelDelivery) { Write-Host 'Three-Level Delivery: pinned canonical source installed; invoke through $three-level-delivery.' }
-Write-Host 'Restart Codex to refresh skill and MCP discovery.'
+Write-Host 'Codex public skill: $hms-superpowers'
+Write-Host ('Enabled modules: ' + (@($state.Keys | Where-Object { [bool]$state[$_] }) -join ', '))
+if (-not $SkipCodeGraph) { Write-Host 'CodeGraph remains an MCP tool, not a separate public skill.' }
+Write-Host 'Restart Codex to refresh discovery.'
