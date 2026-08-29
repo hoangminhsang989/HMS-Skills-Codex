@@ -1,0 +1,7 @@
+interface:
+  display_name: "HMS Superpowers"
+  short_description: "Authority-first HMS engineering workflow"
+  default_prompt: "Use $hms-superpowers to continue the current HMS project under the latest valid authority, preserve fail-closed evidence gates, and report the exact next action."
+
+policy:
+  allow_implicit_invocation: true
