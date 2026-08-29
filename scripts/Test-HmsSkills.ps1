@@ -63,7 +63,8 @@ $required = @(
     'hms-independent-review',
     'hms-fail-closed',
     'hms-release-gate',
-    'hms-handoff'
+    'hms-handoff',
+    'hms-ui-design-authority'
 )
 
 foreach ($requiredName in $required) {
@@ -72,9 +73,15 @@ foreach ($requiredName in $required) {
     }
 }
 
-$metadataPath = Join-Path $skillsRoot 'hms-superpowers\agents\openai.yaml'
-if (-not (Test-Path -LiteralPath $metadataPath)) {
-    $errors.Add('Codex metadata missing for hms-superpowers: skills/hms-superpowers/agents/openai.yaml')
+$metadataRequirements = @(
+    'hms-superpowers',
+    'hms-ui-design-authority'
+)
+foreach ($skillName in $metadataRequirements) {
+    $metadataPath = Join-Path $skillsRoot "$skillName\agents\openai.yaml"
+    if (-not (Test-Path -LiteralPath $metadataPath)) {
+        $errors.Add("Codex metadata missing for ${skillName}: skills/$skillName/agents/openai.yaml")
+    }
 }
 
 $lockPath = Join-Path $RepoRoot 'superpowers.lock.json'
@@ -133,4 +140,4 @@ if ($errors.Count -gt 0) {
     throw $message
 }
 
-Write-Host "PASS: validated $($skillFiles.Count) HMS skills, PowerShell syntax, and the pinned Superpowers authority."
+Write-Host "PASS: validated $($skillFiles.Count) HMS skills, required Codex metadata, PowerShell syntax, and the pinned Superpowers authority."

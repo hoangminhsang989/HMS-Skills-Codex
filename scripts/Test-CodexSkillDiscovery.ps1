@@ -18,7 +18,8 @@ $requiredHmsSkills = @(
     'hms-independent-review',
     'hms-fail-closed',
     'hms-release-gate',
-    'hms-handoff'
+    'hms-handoff',
+    'hms-ui-design-authority'
 )
 $requiredUpstreamSkills = @('superpowers:brainstorming')
 
@@ -96,7 +97,7 @@ try {
             clientInfo = @{
                 name = 'hms_skills_ci'
                 title = 'HMS Skills CI'
-                version = '0.1.0'
+                version = '0.2.0'
             }
         }
     }
@@ -145,6 +146,11 @@ try {
     $orchestrator = @($skills | Where-Object { $_.name -eq 'hms-superpowers' })
     if ($orchestrator.Count -ne 1) {
         throw "Expected exactly one discovered hms-superpowers skill, found $($orchestrator.Count)."
+    }
+
+    $uiAuthority = @($skills | Where-Object { $_.name -eq 'hms-ui-design-authority' })
+    if ($uiAuthority.Count -ne 1) {
+        throw "Expected exactly one discovered hms-ui-design-authority skill, found $($uiAuthority.Count)."
     }
 
     Write-Host "PASS: Codex app-server skills/list discovered all $($requiredHmsSkills.Count) HMS skills and pinned Superpowers namespace."
