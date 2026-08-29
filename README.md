@@ -2,7 +2,7 @@
 
 Reusable HMS workflow skills for OpenAI Codex.
 
-HMS Skills Codex is an **overlay**, not a fork of Superpowers. It keeps upstream Superpowers available for planning, debugging, worktrees, TDD, review, and verification while adding HMS authority control, fail-closed gates, scope locking, evidence requirements, model routing, and checkpoint handoff.
+HMS Skills Codex is an **overlay**, not a fork of Superpowers. It keeps upstream Superpowers available for planning, debugging, worktrees, TDD, review, and verification while adding HMS authority control, fail-closed gates, scope locking, evidence requirements, model routing, UI design authority, and checkpoint handoff.
 
 ## Authority order
 
@@ -15,6 +15,8 @@ HMS Skills Codex is an **overlay**, not a fork of Superpowers. It keeps upstream
 7. Codex defaults
 
 A lower layer must never silently override a higher layer.
+
+For material UI work, `$hms-ui-design-authority` applies inside the already-authorized project scope. When Penpot is the declared visual authority, the expected chain is approved HMS UI definition → Penpot → `DESIGN.md` → design tokens/component mapping → production UI → fresh visual/runtime evidence.
 
 ## Install on Windows
 
@@ -46,7 +48,14 @@ $hms-superpowers
 Continue the current project from the latest valid authority.
 ```
 
-Codex may also activate the skill automatically when the task matches its description.
+For UI-specific work:
+
+```text
+$hms-ui-design-authority
+Implement the authorized UI change from the canonical project design and verify it visually before PASS.
+```
+
+Codex may also activate skills automatically when the task matches their descriptions.
 
 ## Core skills
 
@@ -61,6 +70,7 @@ Codex may also activate the skill automatically when the task matches its descri
 - `hms-fail-closed` — preserve UNKNOWN/BLOCKED states instead of guessing PASS
 - `hms-release-gate` — gate integration, push, and release
 - `hms-handoff` — produce durable HMS checkpoint output
+- `hms-ui-design-authority` — preserve Penpot/DESIGN.md/tokens/component mapping and require production visual evidence
 
 ## Update
 
@@ -76,10 +86,10 @@ This fast-forwards the HMS Skills Codex repository, validates it, and reconciles
 pwsh ./scripts/Test-HmsSkills.ps1
 ```
 
-The validator checks required `SKILL.md` frontmatter, folder/name identity, duplicate names, Codex orchestrator metadata, and the pinned Superpowers authority. GitHub Actions runs structural validation on pushes and pull requests; branch pushes also run an isolated Windows installation smoke that verifies the junction layout and exact Superpowers HEAD.
+The validator checks required `SKILL.md` frontmatter, folder/name identity, duplicate names, required Codex metadata, PowerShell syntax, and the pinned Superpowers authority. GitHub Actions runs structural validation and the Windows install/update/real-Codex-discovery/uninstall contract on both pushes and pull requests.
 
 ## Status
 
-Current bootstrap version: **0.1.0**.
+Current version: **0.2.0**.
 
 See `docs/AUTHORITY_MODEL.md` for the design contract.

@@ -28,15 +28,18 @@ A lower layer cannot silently override a higher one.
 3. Invoke `$hms-authority-gate` before changing production state.
 4. Invoke `$hms-scope-lock` for implementation or remediation work.
 5. Invoke `$hms-model-router` for non-trivial work and obey the strongest available routing mechanism. If the runtime cannot switch model/effort itself, report the required route instead of pretending it switched.
-6. Use upstream Superpowers process skills when applicable.
-7. Use `$hms-evidence-gate` before any PASS/completion claim.
-8. Add `$hms-independent-review` for architecture, security, trust-boundary, critical blocker, release, or final-stage gates.
-9. Use `$hms-release-gate` before merge/push/release when those actions are in scope.
-10. Use `$hms-handoff` after every material checkpoint.
+6. Invoke `$hms-ui-design-authority` before material UI/UX, design-system, Penpot, DESIGN.md, token, component-mapping, or visual-regression work.
+7. Use upstream Superpowers process skills when applicable.
+8. Use `$hms-evidence-gate` before any PASS/completion claim.
+9. Add `$hms-independent-review` for architecture, security, trust-boundary, critical blocker, release, or final-stage gates.
+10. Use `$hms-release-gate` before merge/push/release when those actions are in scope.
+11. Use `$hms-handoff` after every material checkpoint.
 
 ## Superpowers adaptation
 
 Do not rerun brainstorming merely because upstream prefers it when an approved/frozen HMS product definition already resolves the design question. Brainstorm only genuinely unresolved choices.
+
+For UI work, an approved canonical design cannot be silently replaced by upstream brainstorming or agent visual preference. Route material UI work through `$hms-ui-design-authority` and preserve Penpot, `DESIGN.md`, design tokens, component mapping, and visual evidence according to the project authority.
 
 Use upstream systematic debugging when root cause is unknown. Use upstream worktree discipline for material mutations. Use TDD for deterministic production logic. For OS/kernel/UAC/service/native-I/O/hardware-dependent behavior, require the strongest appropriate deterministic harness plus real runtime evidence rather than inventing artificial unit tests.
 
