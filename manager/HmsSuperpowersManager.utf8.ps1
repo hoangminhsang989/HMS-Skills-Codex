@@ -19,26 +19,41 @@ $ModuleDefinitions = @(
         Key = 'hms'
         Name = 'HMS Core'
         Role = 'Authority, scope, evidence, review, release, handoff'
+        DescriptionVi = 'Tiếng Việt: Quản lý quyền hạn, phạm vi, bằng chứng, review/release và bàn giao.'
     },
     [pscustomobject]@{
         Key = 'superpowers'
         Name = 'Superpowers'
         Role = 'Engineering method: plan, debug, TDD, worktree, implementation'
+        DescriptionVi = 'Tiếng Việt: Phương pháp kỹ thuật để lập kế hoạch, debug, TDD, worktree và triển khai.'
     },
     [pscustomobject]@{
         Key = 'taste'
         Name = 'GPT Taste'
         Role = 'Visual direction and aesthetic critique only'
+        DescriptionVi = 'Tiếng Việt: Định hướng thẩm mỹ, bố cục và phê bình hình ảnh khi thiết kế còn chưa chốt.'
     },
     [pscustomobject]@{
         Key = 'impeccable'
         Name = 'Impeccable'
         Role = 'UI audit, consistency, accessibility, and final polish'
+        DescriptionVi = 'Tiếng Việt: Kiểm tra và hoàn thiện UI về tính nhất quán, kiểu chữ, khoảng cách, khả năng truy cập và polish cuối.'
     }
 )
 
 function Assert-BuilderAvailable {
     if (-not (Test-Path -LiteralPath $BuilderPath)) { throw "Composite compiler is missing: $BuilderPath" }
+}
+
+function Assert-VietnameseModuleDescriptions {
+    foreach ($module in $ModuleDefinitions) {
+        if ([string]::IsNullOrWhiteSpace([string]$module.DescriptionVi)) {
+            throw "Vietnamese module description is missing for '$($module.Key)'."
+        }
+        if (-not ([string]$module.DescriptionVi).StartsWith('Tiếng Việt:', [StringComparison]::Ordinal)) {
+            throw "Vietnamese module description prefix is invalid for '$($module.Key)'."
+        }
+    }
 }
 
 function New-DefaultState {
@@ -146,6 +161,7 @@ function Assert-OneSkillBundle {
 function Invoke-ManagerSelfTest {
     if ($env:OS -ne 'Windows_NT') { throw 'Manager self-test requires Windows.' }
     Assert-BuilderAvailable
+    Assert-VietnameseModuleDescriptions
 
     $root = Join-Path ([IO.Path]::GetTempPath()) ('hms-unified-manager-' + [guid]::NewGuid().ToString('N'))
     $testOutput = Join-Path $root 'composite'
@@ -166,7 +182,7 @@ function Invoke-ManagerSelfTest {
         Invoke-CompositeBuild -State $allOff -BuildOutputRoot $testOutput -BuildSkillsRoot $testSkills
         Assert-OneSkillBundle -Root $testOutput -DiscoveryRoot $testSkills -ExpectedState $allOff
 
-        Write-Host 'PASS: HMS Skills Manager compiled module selections into exactly one public hms-superpowers skill and preserved exclusive role routing.'
+        Write-Host 'PASS: HMS Skills Manager compiled module selections into exactly one public hms-superpowers skill, preserved exclusive role routing, and validated Vietnamese module descriptions.'
     }
     finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
@@ -180,6 +196,7 @@ if ($SelfTest) {
 
 if ($env:OS -ne 'Windows_NT') { throw 'HMS Skills Manager UI is supported on Windows only.' }
 Assert-BuilderAvailable
+Assert-VietnameseModuleDescriptions
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -188,8 +205,8 @@ Add-Type -AssemblyName System.Drawing
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'HMS Unified Skill Manager'
 $form.StartPosition = 'CenterScreen'
-$form.ClientSize = New-Object System.Drawing.Size(760, 610)
-$form.MinimumSize = New-Object System.Drawing.Size(776, 649)
+$form.ClientSize = New-Object System.Drawing.Size(760, 630)
+$form.MinimumSize = New-Object System.Drawing.Size(776, 669)
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 10)
 $form.BackColor = [System.Drawing.Color]::FromArgb(245, 247, 250)
 
@@ -219,31 +236,38 @@ $top = 125
 foreach ($module in $ModuleDefinitions) {
     $panel = New-Object System.Windows.Forms.Panel
     $panel.Location = New-Object System.Drawing.Point(28, $top)
-    $panel.Size = New-Object System.Drawing.Size(704, 72)
+    $panel.Size = New-Object System.Drawing.Size(704, 88)
     $panel.BackColor = [System.Drawing.Color]::White
     $panel.BorderStyle = 'FixedSingle'
 
     $check = New-Object System.Windows.Forms.CheckBox
     $check.Text = $module.Name
     $check.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 11)
-    $check.Location = New-Object System.Drawing.Point(16, 10)
+    $check.Location = New-Object System.Drawing.Point(16, 8)
     $check.AutoSize = $true
     $panel.Controls.Add($check)
 
     $role = New-Object System.Windows.Forms.Label
     $role.Text = $module.Role
     $role.ForeColor = [System.Drawing.Color]::DimGray
-    $role.Location = New-Object System.Drawing.Point(38, 40)
-    $role.AutoSize = $true
+    $role.Location = New-Object System.Drawing.Point(38, 34)
+    $role.Size = New-Object System.Drawing.Size(650, 20)
     $panel.Controls.Add($role)
+
+    $descriptionVi = New-Object System.Windows.Forms.Label
+    $descriptionVi.Text = $module.DescriptionVi
+    $descriptionVi.ForeColor = [System.Drawing.Color]::FromArgb(45, 70, 90)
+    $descriptionVi.Location = New-Object System.Drawing.Point(38, 57)
+    $descriptionVi.Size = New-Object System.Drawing.Size(650, 22)
+    $panel.Controls.Add($descriptionVi)
 
     $form.Controls.Add($panel)
     $checks[$module.Key] = $check
-    $top += 82
+    $top += 96
 }
 
 $status = New-Object System.Windows.Forms.Label
-$status.Location = New-Object System.Drawing.Point(30, 465)
+$status.Location = New-Object System.Drawing.Point(30, 516)
 $status.Size = New-Object System.Drawing.Size(700, 28)
 $status.ForeColor = [System.Drawing.Color]::FromArgb(30, 100, 60)
 $form.Controls.Add($status)
@@ -251,31 +275,31 @@ $form.Controls.Add($status)
 $applyButton = New-Object System.Windows.Forms.Button
 $applyButton.Text = 'Apply + Rebuild'
 $applyButton.Size = New-Object System.Drawing.Size(145, 42)
-$applyButton.Location = New-Object System.Drawing.Point(28, 510)
+$applyButton.Location = New-Object System.Drawing.Point(28, 557)
 $form.Controls.Add($applyButton)
 
 $allOnButton = New-Object System.Windows.Forms.Button
 $allOnButton.Text = 'Enable All'
 $allOnButton.Size = New-Object System.Drawing.Size(120, 42)
-$allOnButton.Location = New-Object System.Drawing.Point(183, 510)
+$allOnButton.Location = New-Object System.Drawing.Point(183, 557)
 $form.Controls.Add($allOnButton)
 
 $allOffButton = New-Object System.Windows.Forms.Button
 $allOffButton.Text = 'Disable All'
 $allOffButton.Size = New-Object System.Drawing.Size(120, 42)
-$allOffButton.Location = New-Object System.Drawing.Point(313, 510)
+$allOffButton.Location = New-Object System.Drawing.Point(313, 557)
 $form.Controls.Add($allOffButton)
 
 $validateButton = New-Object System.Windows.Forms.Button
 $validateButton.Text = 'Validate'
 $validateButton.Size = New-Object System.Drawing.Size(120, 42)
-$validateButton.Location = New-Object System.Drawing.Point(443, 510)
+$validateButton.Location = New-Object System.Drawing.Point(443, 557)
 $form.Controls.Add($validateButton)
 
 $closeButton = New-Object System.Windows.Forms.Button
 $closeButton.Text = 'Close'
 $closeButton.Size = New-Object System.Drawing.Size(159, 42)
-$closeButton.Location = New-Object System.Drawing.Point(573, 510)
+$closeButton.Location = New-Object System.Drawing.Point(573, 557)
 $form.Controls.Add($closeButton)
 
 function Show-ManagerError {
