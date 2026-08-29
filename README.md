@@ -1,49 +1,41 @@
 # HMS Skills Codex
 
-Reusable HMS workflow modules compiled into **one public OpenAI Codex skill**.
+Reusable HMS workflow skills for OpenAI Codex.
 
-The user-facing contract is intentionally simple:
+HMS Skills Codex exposes exactly **one public Codex skill**:
 
 ```text
 $hms-superpowers
 ```
 
-HMS Core, upstream Superpowers, GPT Taste, and Impeccable remain separate reviewed/pinned source modules, but the Manager compiles whichever modules are ON into one generated `$hms-superpowers` bundle. Codex does not discover the enabled source modules as separate skills.
+The Manager selects which internal modules are compiled into that one skill. Source repositories remain separate and exact-pinned for review, update, and supply-chain control, but Codex does not discover them as competing public skills.
 
-## Why one skill
+## Unified module model
 
-Multiple independently discovered workflow/design skills can compete for triggers, authority, or implementation ownership. HMS avoids that by enforcing **one public entry point + one primary owner per task slice**.
-
-| Module | Primary responsibility | Must not own |
+| Module | Primary responsibility | Mô tả tiếng Việt |
 | --- | --- | --- |
-| HMS Core | authority, checkpoint, scope, model routing, evidence, independent-review criteria, release, handoff | engineering-method details or visual taste |
-| Superpowers | planning, worktrees, debugging, TDD, implementation/review method | HMS authority, scope expansion, release permission, visual authority |
-| GPT Taste | visual direction, composition, hierarchy, aesthetic critique | production mutation, release, final UI audit |
-| Impeccable | UI audit/polish, consistency, typography, spacing, accessibility, interaction refinement | frozen product/design authority or independent competing redesign |
+| HMS Core | Authority, scope, model routing, evidence, review/release, handoff | Quản lý quyền hạn, phạm vi, bằng chứng, review/release và bàn giao; là lớp quản trị và phân xử cuối cùng. |
+| Superpowers | Engineering method: planning, worktrees, debugging, TDD, implementation | Phương pháp kỹ thuật để lập kế hoạch, debug, TDD, worktree và triển khai; không tự mở rộng authority hoặc scope. |
+| GPT Taste | Visual direction and aesthetic critique | Định hướng thẩm mỹ, bố cục và phê bình hình ảnh khi design authority còn phần chưa chốt. |
+| Impeccable | UI audit, consistency, accessibility, final polish | Kiểm tra và hoàn thiện UI về tính nhất quán, kiểu chữ, khoảng cách, khả năng truy cập và polish cuối. |
 
-For UI work with all relevant modules enabled, the sequence is:
+Every task slice has exactly one primary owner. Supporting modules may advise, but they must not independently redefine the same decision or mutate the same artifact concurrently.
 
-**owner/project/HMS UI authority → GPT Taste direction → Impeccable audit/polish → Superpowers implementation → HMS evidence/release gates**.
+For UI work with all relevant modules enabled:
 
-Taste and Impeccable are not asked to independently redesign the same artifact. Taste owns direction; Impeccable owns audit/polish inside the accepted direction.
+```text
+project/HMS UI authority
+        ↓
+GPT Taste direction
+        ↓
+Impeccable audit/polish
+        ↓
+Superpowers implementation
+        ↓
+HMS evidence/release
+```
 
-See `docs/UNIFIED_SKILL_ARCHITECTURE.md` for the full routing contract.
-
-## Authority order
-
-1. Owner instruction
-2. Latest valid HMS checkpoint / frozen authority
-3. HMS fail-closed and safety rules
-4. HMS adaptive model routing
-5. HMS project-specific product/UI authority
-6. Explicit Three-Level Delivery governance when the owner requests that mode for the current HMS slice
-7. Enabled Superpowers engineering method
-8. Enabled derived/advisory modules such as CodeGraph context, GPT Taste, and Impeccable
-9. Codex defaults
-
-A lower layer never silently overrides a higher one. CodeGraph is context/evidence, not authority.
-
-For material UI work, when Penpot is declared canonical visual authority, the expected chain is approved HMS UI definition → Penpot → `DESIGN.md` → design tokens/component mapping → production UI → fresh visual/runtime evidence. Taste and Impeccable operate only where that chain leaves discretion.
+Taste owns direction; Impeccable owns audit/polish inside the accepted direction. Neither can override owner instruction, frozen HMS authority, Penpot, `DESIGN.md`, design tokens, or component mapping.
 
 ## Install on Windows
 
@@ -53,58 +45,62 @@ cd "$env:USERPROFILE\.codex\hms-skills-codex"
 .\install.ps1
 ```
 
-The installer keeps reviewed source dependencies separately:
-
-- HMS source → `%USERPROFILE%\.codex\hms-skills-codex`
-- pinned Superpowers source → `%USERPROFILE%\.codex\superpowers`
-- pinned GPT Taste source → `%USERPROFILE%\.codex\taste-skill`
-- pinned Impeccable source → `%USERPROFILE%\.codex\impeccable`
-- pinned Three-Level Delivery canonical source → `%USERPROFILE%\.codex\three-level-delivery`
-- pinned CodeGraph bundle → `%USERPROFILE%\.codex\codegraph\current`
-
-It then generates:
+The installer reconciles pinned sources and compiles the generated bundle at:
 
 ```text
 %USERPROFILE%\.codex\hms-composite\hms-superpowers
 ```
 
-and exposes only:
+Codex discovery is exposed only at:
 
 ```text
 %USERPROFILE%\.agents\skills\hms-superpowers
 ```
 
-All copied internal `SKILL.md` entry files are renamed to `MODULE.md`, leaving exactly one public `SKILL.md` at the composite root.
+Enabled source skills are copied into the composite as internal references. Every copied `SKILL.md` becomes `MODULE.md`, so the generated bundle contains exactly one public `SKILL.md`.
 
-HMS does **not** track mutable upstream `main`. Superpowers is locked by `superpowers.lock.json`; GPT Taste and Impeccable are locked by `ui-skills.lock.json`; CodeGraph and Three-Level Delivery are locked by `delivery-tools.lock.json`. CodeGraph additionally locks exact Windows release-asset SHA-256 before extraction.
+The installer also provisions the delivery-intelligence layer:
 
-Use `-SkipSuperpowers`, `-SkipTaste`, `-SkipImpeccable`, `-SkipCodeGraph`, or `-SkipThreeLevelDelivery` only when intentionally omitting/managing that source elsewhere. Restart Codex after first installation.
+- pinned Superpowers source → `%USERPROFILE%\.codex\superpowers`
+- pinned GPT Taste source → `%USERPROFILE%\.codex\taste-skill`
+- pinned Impeccable source → `%USERPROFILE%\.codex\impeccable`
+- pinned CodeGraph bundle → `%USERPROFILE%\.codex\codegraph\current`
+- Codex MCP server `codegraph` → registered through the official Codex CLI and bound to the HMS-managed binary
+- pinned canonical Three-Level Delivery source → `%USERPROFILE%\.codex\three-level-delivery`
+
+CodeGraph remains an MCP/tool layer, not another public skill. Three-Level Delivery remains an internal HMS adapter/module path rather than a competing public entry point.
+
+HMS does **not** track mutable upstream `main`. Superpowers is locked by `superpowers.lock.json`; GPT Taste and Impeccable are locked by `ui-skills.lock.json`; CodeGraph and Three-Level Delivery are locked by `delivery-tools.lock.json`. Changing any pin is a material workflow change and should go through a reviewed HMS Skills Codex commit/PR.
+
+Use `-SkipSuperpowers`, `-SkipTaste`, `-SkipImpeccable`, `-SkipCodeGraph`, or `-SkipThreeLevelDelivery` only when that dependency is intentionally managed elsewhere.
+
+Restart Codex after the first installation so skill and MCP discovery refresh.
 
 ## HMS Unified Skill Manager
 
-Double-click either compatible launcher:
+Double-click either launcher:
 
 ```text
 HMS-Skills-Manager.cmd
 HMS-Superpowers-Manager.cmd
 ```
 
-The Manager controls four **internal module switches**:
+The Manager exposes four module switches:
 
 - HMS Core
 - Superpowers
 - GPT Taste
 - Impeccable
 
-`Apply + Rebuild` recompiles the single public `$hms-superpowers` skill from the current selection. `Enable All` and `Disable All` apply the complete selection atomically through the composite compiler.
+Each row shows the technical role in English plus a **Vietnamese description** explaining what the module does.
 
-Turning a module OFF does not delete its source repository. It removes that module from the generated bundle. When all four modules are OFF, the managed bundle/manifest remains for state and audit, while `%USERPROFILE%\.agents\skills\hms-superpowers` is absent, so no HMS public skill is exposed.
+The switches do not expose four separate Codex skills. They select which modules are compiled into `$hms-superpowers`.
 
-State is stored in the generated `manifest.json`, making the Manager display and actual compiled bundle share one source of truth. `update.ps1` preserves these ON/OFF choices.
+The Manager also provides **Enable All / Disable All**, Apply + Rebuild, Validate, and conflict-safe lifecycle behavior. OFF removes a module from the next composite build; it does not delete the pinned source repository. With every module OFF, the manifest/state is preserved but the public `$hms-superpowers` discovery junction is removed.
 
-Legacy direct discovery paths (`hms`, `superpowers`, `gpt-taste`, `impeccable`) are migrated only after exact Junction type and target verification. Unexpected files, directories, symlinks, or reparse points are conflicts and are never overwritten or removed silently. Destructive Junction removal uses quarantine + boundary revalidation + rollback.
+Unexpected folders, files, symlinks, reparse points, or junction targets fail closed. The Manager will not silently replace or remove an unowned path.
 
-The launcher uses process-local `ExecutionPolicy Bypass`; it does not permanently weaken the machine execution policy.
+The launcher uses process-local `ExecutionPolicy Bypass`, so it does not permanently weaken the machine execution policy.
 
 Manager runtime self-test:
 
@@ -112,63 +108,59 @@ Manager runtime self-test:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\manager\HmsSuperpowersManager.ps1 -SelfTest
 ```
 
-The self-test validates all-ON, one-module-OFF, all-OFF, exactly-one-public-SKILL, no legacy discovery leakage, and Windows PowerShell 5.1 compatibility.
+The self-test validates all-ON, one-module-OFF, all-OFF, the one-public-SKILL invariant, exclusive role routing, and presence of Vietnamese module descriptions under Windows PowerShell 5.1.
 
 ## Delivery intelligence
 
 ### CodeGraph
 
-CodeGraph is an MCP/tool layer, **not another public skill**. The HMS-managed binary is pinned and its MCP registration is created through the official Codex CLI. The internal CodeGraph adapter binds graph context to the exact checkout/worktree and keeps graph output subordinate to committed source and HMS evidence gates.
+CodeGraph is structural repository intelligence, not authority. HMS binds it to the exact checkout/worktree, rejects cross-worktree index reuse, and keeps graph results subordinate to source/Git/runtime evidence.
 
-The installer refuses to overwrite a pre-existing MCP server named `codegraph` when it points to a different command.
+The installer refuses to overwrite a pre-existing Codex MCP server named `codegraph` when it points to a different command.
+
+Per-project `.codegraph/` data is local tooling state. Prefer `.git/info/exclude` for local ignore state; do not modify a tracked `.gitignore` merely to hide CodeGraph unless that file is explicitly in scope.
 
 ### Three-Level Delivery
 
-Three-Level Delivery is an internal explicit-only HMS adapter in the composite. To use it, ask through the one public entry point, for example:
+Three-Level Delivery remains explicit governance inside an already-authorized HMS slice. Its exact upstream source is pinned, and the HMS adapter preserves its one-slice Owner → read-only Lead → one Writer + one independent Reviewer topology.
 
-```text
-$hms-superpowers
-Use Three-Level Delivery for this owner-approved slice.
-```
+It does not replace HMS authority or release authorization. Merge, push, deployment, UAC, service changes, physical-machine execution, and other HMS release boundaries remain subject to the current HMS authority and release gate.
 
-The adapter verifies the pinned canonical source and follows its freshness gate. It never auto-updates the pin. Three-Level Delivery remains one-slice governance inside already-authorized HMS scope; Superpowers remains engineering method and CodeGraph remains context/evidence.
+## UI advisor rule
 
-## UI advisors
+GPT Taste and Impeccable are optional internal design-advisor modules, not HMS authority.
 
-GPT Taste and Impeccable source repositories have namespace-qualified Codex identities recorded in `ui-skills.lock.json`. Those identities are retained for source qualification and for tests that ensure **direct discovery does not leak**. They are not the normal runtime invocation contract.
+Their generic rules about fonts, AIDA, motion, spacing, layout, redesign, or framework choices do not override owner instruction, frozen product/UI definitions, Penpot, `DESIGN.md`, tokens/component mapping, platform requirements, or behavior outside the authorized scope.
 
-Use only:
-
-```text
-$hms-superpowers
-```
-
-The dispatcher routes unresolved visual direction to Taste and UI audit/polish to Impeccable according to the role matrix. Neither can override owner instruction, frozen product/UI definitions, Penpot, `DESIGN.md`, tokens/component mapping, platform requirements, or behavior outside scope.
+This matters especially for engineering desktop software: web/marketing conventions from a generic design skill must not be imported into a desktop CAD/CAM or operations UI merely because the advisor prefers them.
 
 ## Use
 
-Normal continuation:
+Normal use requires only one invocation:
 
 ```text
 $hms-superpowers
 Continue the current project from the latest valid authority.
 ```
 
-UI work:
+Examples of internal routing through the same entry point:
 
 ```text
 $hms-superpowers
-Implement the authorized UI change from the canonical project design and verify it visually before PASS.
+Use Three-Level Delivery for this owner-approved slice.
 ```
-
-Three-Level Delivery:
 
 ```text
 $hms-superpowers
-Use Three-Level Delivery for one owner-approved slice under the current authority.
+Use CodeGraph for focused structural context before implementing this change.
 ```
 
-You do not invoke HMS child gates, Superpowers source skills, Taste, Impeccable, CodeGraph adapter, or Three-Level adapter as separate public skills. The unified dispatcher loads only the internal modules needed for the current task.
+```text
+$hms-superpowers
+Implement the authorized UI change, use the enabled design advisors where appropriate, and verify it visually before PASS.
+```
+
+Users do not need to remember or directly invoke HMS child skills, Superpowers namespace skills, GPT Taste, or Impeccable. The composite dispatcher assigns one primary module owner for each task slice and loads only the required internal `MODULE.md` references.
 
 ## Update
 
@@ -176,11 +168,11 @@ You do not invoke HMS child gates, Superpowers source skills, Taste, Impeccable,
 & "$env:USERPROFILE\.codex\hms-skills-codex\update.ps1"
 ```
 
-Update reconciles exact pinned sources and rebuilds the composite from the current manifest state. It does not silently turn an OFF module back ON.
+Update reconciles pinned sources and rebuilds the composite while preserving existing Manager ON/OFF choices.
 
 ## Uninstall
 
-Normal uninstall removes the verified composite discovery Junction and preserves source repositories plus composite state. Add `-IncludeSuperpowers`, `-IncludeUiSkills`, or `-IncludeDeliveryTools` for those managed source/tool layers. Add `-RemoveClones` only when verified managed source/bundle directories should also be deleted.
+Normal uninstall removes the verified composite discovery junction while preserving pinned sources and composite state. Optional flags can remove verified managed dependencies or clones, but destructive operations fail closed if ownership cannot be proven.
 
 ## Validate
 
@@ -189,10 +181,10 @@ pwsh ./scripts/Test-HmsSkills.ps1
 pwsh ./scripts/Test-DeliveryTools.ps1
 ```
 
-GitHub Actions additionally installs the exact candidate on Windows, qualifies the Manager on Windows PowerShell 5.1, exercises module-state rebuild/update/uninstall behavior, starts real Codex app-server `skills/list`, and fails if any HMS child module, `superpowers:*`, GPT Taste, or Impeccable leaks into public discovery.
+GitHub Actions runs source validation plus the Windows exact-SHA install/update/Manager/real-Codex-discovery/uninstall lifecycle. Real discovery must expose `hms-superpowers` as the only HMS public entry point.
 
-## Current candidate
+## Status
 
-Version: **0.2.0**.
+Current candidate version: **0.2.0**.
 
-The current v0.2.0 branch is still a release candidate until exact-head CI and a fresh independent review are both satisfied. See `docs/AUTHORITY_MODEL.md` and `docs/UNIFIED_SKILL_ARCHITECTURE.md`.
+See `docs/AUTHORITY_MODEL.md` and `docs/UNIFIED_SKILL_ARCHITECTURE.md` for the authority and unified-dispatch contracts.
