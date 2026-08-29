@@ -102,9 +102,34 @@ else {
     }
 }
 
+$powerShellScripts = @(
+    (Join-Path $RepoRoot 'install.ps1'),
+    (Join-Path $RepoRoot 'update.ps1'),
+    (Join-Path $RepoRoot 'uninstall.ps1')
+)
+
+foreach ($scriptPath in $powerShellScripts) {
+    if (-not (Test-Path -LiteralPath $scriptPath)) {
+        $errors.Add("Required PowerShell script missing: $scriptPath")
+        continue
+    }
+
+    $tokens = $null
+    $parseErrors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile(
+        $scriptPath,
+        [ref]$tokens,
+        [ref]$parseErrors
+    ) | Out-Null
+
+    foreach ($parseError in @($parseErrors)) {
+        $errors.Add(("PowerShell parser error in {0} at line {1}, column {2}: {3}" -f $scriptPath, $parseError.Extent.StartLineNumber, $parseError.Extent.StartColumnNumber, $parseError.Message))
+    }
+}
+
 if ($errors.Count -gt 0) {
     $message = "HMS skill validation failed:`n - " + ($errors -join "`n - ")
     throw $message
 }
 
-Write-Host "PASS: validated $($skillFiles.Count) HMS skills and the pinned Superpowers authority."
+Write-Host "PASS: validated $($skillFiles.Count) HMS skills, PowerShell syntax, and the pinned Superpowers authority."
