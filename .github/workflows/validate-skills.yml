@@ -17,3 +17,44 @@ jobs:
       - name: Validate skill structure
         shell: pwsh
         run: ./scripts/Test-HmsSkills.ps1
+
+  windows-install-smoke:
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install candidate into isolated user profile
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $testHome = Join-Path $env:RUNNER_TEMP 'hms-skills-home'
+          $installRoot = Join-Path $testHome '.codex\hms-skills-codex'
+          New-Item -ItemType Directory -Force -Path $testHome | Out-Null
+
+          git clone --branch "${{ github.ref_name }}" --single-branch "https://github.com/${{ github.repository }}.git" $installRoot
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate clone failed.' }
+
+          $originalUserProfile = $env:USERPROFILE
+          try {
+            $env:USERPROFILE = $testHome
+            & "$env:GITHUB_WORKSPACE\install.ps1" -InstallRoot $installRoot -SkipSuperpowers
+
+            $hmsLink = Join-Path $testHome '.agents\skills\hms'
+            if (-not (Test-Path -LiteralPath $hmsLink)) { throw 'HMS skills junction was not created.' }
+            $linkItem = Get-Item -LiteralPath $hmsLink -Force
+            if (-not ($linkItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'HMS skills path is not a junction/reparse point.' }
+
+            $skillFiles = @(Get-ChildItem -LiteralPath $hmsLink -Filter 'SKILL.md' -File -Recurse)
+            if ($skillFiles.Count -ne 11) { throw "Expected 11 HMS skills, found $($skillFiles.Count)." }
+
+            $orchestrator = Join-Path $hmsLink 'hms-superpowers\SKILL.md'
+            $metadata = Join-Path $hmsLink 'hms-superpowers\agents\openai.yaml'
+            if (-not (Test-Path -LiteralPath $orchestrator)) { throw 'hms-superpowers is missing from installed discovery tree.' }
+            if (-not (Test-Path -LiteralPath $metadata)) { throw 'hms-superpowers Codex metadata is missing from installed discovery tree.' }
+          }
+          finally {
+            $env:USERPROFILE = $originalUserProfile
+          }
+
+          Write-Host 'PASS: Windows isolated install/discovery-layout smoke completed.'
