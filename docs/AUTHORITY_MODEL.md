@@ -17,6 +17,8 @@ HMS ADAPTIVE MODEL ROUTING
       ↓
 HMS PROJECT-SPECIFIC SKILLS
       ↓
+OPTIONAL DESIGN-ADVISOR SKILLS (GPT TASTE / IMPECCABLE)
+      ↓
 UPSTREAM SUPERPOWERS
       ↓
 CODEX DEFAULTS
@@ -65,12 +67,20 @@ SCREENSHOT / VISUAL-REGRESSION / RUNTIME EVIDENCE
 
 A production screenshot cannot silently supersede the editable canonical design, and an agent preference cannot silently supersede Penpot or `DESIGN.md`. If required design authority is unavailable or conflicting, the dependent UI mutation remains non-PASS until a higher authority resolves the gap.
 
+### Optional design advisors
+
+`gpt-taste` and `impeccable` may be enabled as reusable UI-quality advisors. They can propose or inspect typography, composition, interaction, motion, accessibility, responsive behavior, anti-patterns, and visual polish.
+
+They are not product authority. Generic directives from those skills — including AIDA structure, GSAP motion, font bans/preferences, randomized layout choices, dramatic spacing, redesign defaults, or framework/dependency suggestions — apply only when they are compatible with the higher HMS/UI authority and exact task scope. A frozen desktop engineering UI must not be converted into a marketing-web aesthetic merely because an advisor skill recommends one.
+
+Their upstream source identities are pinned in `ui-skills.lock.json`; changing a pin is a material workflow change requiring the normal HMS review/evidence gates.
+
 ## Superpowers adaptation
 
 Use upstream Superpowers where it improves execution discipline. HMS may adapt it as follows:
 
 - Skip redundant brainstorming when a frozen/approved HMS specification already resolves the design question.
-- For UI work, do not let brainstorming or agent style preference replace an approved canonical design; route material UI work through `$hms-ui-design-authority`.
+- For UI work, do not let brainstorming, Taste, Impeccable, or agent style preference replace an approved canonical design; route material UI work through `$hms-ui-design-authority`.
 - Use TDD directly for deterministic production logic.
 - For OS/kernel/UAC/service/native-I/O/hardware-dependent behavior, use the strongest appropriate deterministic harness plus real runtime evidence rather than artificial unit tests.
 - Keep upstream worktree, systematic-debugging, code-review, and verification disciplines unless a higher HMS authority requires a stricter process.
