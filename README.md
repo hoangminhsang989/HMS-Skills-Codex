@@ -10,13 +10,14 @@ HMS Skills Codex is an **overlay**, not a fork of Superpowers. It keeps upstream
 2. Latest valid HMS checkpoint / frozen authority
 3. HMS fail-closed and safety rules
 4. HMS adaptive model routing
-5. HMS project-specific skills
-6. Upstream Superpowers skills
-7. Codex defaults
+5. HMS project-specific skills, including `$hms-ui-design-authority`
+6. Optional design-advisor skills such as GPT Taste and Impeccable
+7. Upstream Superpowers skills
+8. Codex defaults
 
 A lower layer must never silently override a higher layer.
 
-For material UI work, `$hms-ui-design-authority` applies inside the already-authorized project scope. When Penpot is the declared visual authority, the expected chain is approved HMS UI definition → Penpot → `DESIGN.md` → design tokens/component mapping → production UI → fresh visual/runtime evidence.
+For material UI work, `$hms-ui-design-authority` applies inside the already-authorized project scope. When Penpot is the declared visual authority, the expected chain is approved HMS UI definition → Penpot → `DESIGN.md` → design tokens/component mapping → production UI → fresh visual/runtime evidence. GPT Taste and Impeccable may improve craft only where that chain leaves a choice unresolved.
 
 ## Install on Windows
 
@@ -26,36 +27,40 @@ cd "$env:USERPROFILE\.codex\hms-skills-codex"
 .\install.ps1
 ```
 
-The installer creates a junction:
+The installer exposes these user-level Codex skills through `%USERPROFILE%\.agents\skills`:
 
-```text
-%USERPROFILE%\.agents\skills\hms
-  -> %USERPROFILE%\.codex\hms-skills-codex\skills
-```
+- HMS skills → `%USERPROFILE%\.codex\hms-skills-codex\skills`
+- pinned Superpowers → `%USERPROFILE%\.codex\superpowers\skills`
+- pinned GPT Taste → `%USERPROFILE%\.codex\taste-skill\skills\gpt-tasteskill`
+- pinned Impeccable → `%USERPROFILE%\.codex\impeccable\.agents\skills\impeccable`
 
-By default it also installs upstream `obra/superpowers` and exposes it at `%USERPROFILE%\.agents\skills\superpowers`. HMS does **not** track mutable upstream `main`: the reviewed upstream identity is locked in `superpowers.lock.json`, and install/update always checks out that exact commit in detached-HEAD state. Use `-SkipSuperpowers` when Superpowers is managed separately, such as through the Codex plugin marketplace.
+HMS does **not** track mutable upstream `main`. Superpowers is locked by `superpowers.lock.json`; GPT Taste and Impeccable are locked by `ui-skills.lock.json`. Install/update checks out exact commits in detached-HEAD state. Changing any pin is a material workflow change and should go through a reviewed HMS Skills Codex commit/PR.
 
-Changing the Superpowers pin is a material workflow change and should go through a reviewed HMS Skills Codex commit/PR rather than an unreviewed `git pull` of upstream.
+Use `-SkipSuperpowers`, `-SkipTaste`, or `-SkipImpeccable` only when that dependency is intentionally managed elsewhere.
 
 Restart Codex after the first installation so skill discovery refreshes.
 
-## HMS Superpowers Manager
+## HMS Skills Manager
 
 Windows users can enable or disable Codex discovery through the GUI instead of editing junctions manually.
 
-Double-click:
+Double-click either launcher:
 
 ```text
+HMS-Skills-Manager.cmd
 HMS-Superpowers-Manager.cmd
 ```
 
-The manager exposes independent ON/OFF controls for:
+The Manager exposes four independent ON/OFF controls:
 
-- HMS Superpowers;
-- pinned upstream Superpowers;
-- both together.
+- HMS Superpowers
+- Upstream Superpowers
+- GPT Taste
+- Impeccable
 
-OFF removes only the validated discovery junction. It does **not** delete the HMS repository, Superpowers checkout, or skill data. If the expected discovery path is occupied by an unrelated folder, file, or different reparse target, the manager reports `CONFLICT` and refuses to replace or remove it.
+It also provides **BẬT TẤT CẢ / TẮT TẤT CẢ**, Refresh, Validate, and conflict status.
+
+OFF removes only the validated discovery junction. It does **not** delete repositories or skill data. If a discovery path is occupied by an unrelated folder, file, or different reparse target, the Manager reports `CONFLICT` and refuses to replace or remove it.
 
 The launcher uses process-local `ExecutionPolicy Bypass`, so it does not permanently weaken the machine execution policy. Restart or refresh Codex after changing discovery state.
 
@@ -65,9 +70,13 @@ Manager runtime self-test:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\manager\HmsSuperpowersManager.ps1 -SelfTest
 ```
 
-## Use
+## UI advisor rule
 
-Explicit invocation:
+`gpt-taste` and `impeccable` are optional design advisors, not HMS authority. Their generic rules about fonts, AIDA, motion, spacing, layout, redesign, or framework choices do not override owner instruction, frozen product/UI definitions, Penpot, `DESIGN.md`, tokens/component mapping, platform requirements, or behavior outside the authorized scope.
+
+This matters especially for engineering desktop software: web/marketing conventions from a generic design skill must not be imported into a desktop CAD/CAM or operations UI merely because the advisor prefers them.
+
+## Use
 
 ```text
 $hms-superpowers
@@ -81,9 +90,16 @@ $hms-ui-design-authority
 Implement the authorized UI change from the canonical project design and verify it visually before PASS.
 ```
 
-Codex may also activate skills automatically when the task matches their descriptions.
+Optional advisor invocation:
 
-## Core skills
+```text
+$gpt-taste
+$impeccable
+```
+
+Codex may also activate skills automatically when the task matches their descriptions; HMS precedence still applies.
+
+## Core HMS skills
 
 - `hms-superpowers` — orchestration entry point
 - `hms-authority-loader` — recover the newest valid project authority
@@ -104,7 +120,7 @@ Codex may also activate skills automatically when the task matches their descrip
 & "$env:USERPROFILE\.codex\hms-skills-codex\update.ps1"
 ```
 
-This fast-forwards the HMS Skills Codex repository, validates it, and reconciles the local Superpowers checkout back to the commit currently recorded in `superpowers.lock.json`.
+This fast-forwards HMS Skills Codex and reconciles pinned dependencies. When GPT Taste or Impeccable already exists locally, update preserves the Manager's current ON/OFF discovery choice; a newly introduced source is exposed once so it is immediately usable.
 
 ## Validate
 
@@ -112,7 +128,7 @@ This fast-forwards the HMS Skills Codex repository, validates it, and reconciles
 pwsh ./scripts/Test-HmsSkills.ps1
 ```
 
-The validator checks required `SKILL.md` frontmatter, folder/name identity, duplicate names, required Codex metadata, PowerShell syntax including the Manager UI, and the pinned Superpowers authority. GitHub Actions runs structural validation and the Windows install/update/manager-self-test/real-Codex-discovery/uninstall contract on both pushes and pull requests.
+The validator checks HMS skill metadata, PowerShell syntax, and all pinned dependency contracts. GitHub Actions runs structural validation plus the Windows install/update/Manager-self-test/real-Codex-discovery/uninstall contract on pushes and pull requests.
 
 ## Status
 
