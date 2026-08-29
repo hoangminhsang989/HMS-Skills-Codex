@@ -7,13 +7,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$managerScript = Join-Path $repoRoot 'manager\HmsSuperpowersManager.ps1'
-if (-not (Test-Path -LiteralPath $managerScript)) {
-    throw "HMS Superpowers Manager script not found: $managerScript"
-}
-& $managerScript -SelfTest
-
 $requiredHmsSkills = @(
     'hms-superpowers',
     'hms-authority-loader',
@@ -29,16 +22,13 @@ $requiredHmsSkills = @(
     'hms-ui-design-authority'
 )
 $requiredUpstreamSkills = @('superpowers:brainstorming')
+$requiredUiAdvisorSkills = @('gpt-taste', 'impeccable')
 
 $node = Get-Command node -ErrorAction Stop
 $npmRoot = (& npm root -g).Trim()
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($npmRoot)) {
-    throw 'Unable to determine global npm root for Codex CLI.'
-}
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($npmRoot)) { throw 'Unable to determine global npm root for Codex CLI.' }
 $codexJs = Join-Path $npmRoot '@openai\codex\bin\codex.js'
-if (-not (Test-Path -LiteralPath $codexJs)) {
-    throw "Pinned Codex CLI entry point not found: $codexJs"
-}
+if (-not (Test-Path -LiteralPath $codexJs)) { throw "Pinned Codex CLI entry point not found: $codexJs" }
 
 $startInfo = [Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = $node.Source
@@ -65,27 +55,16 @@ function Send-AppServerMessage {
 
 function Read-AppServerResponse {
     param([Parameter(Mandatory)][int]$Id)
-
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
         $remaining = [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
         $readTask = $process.StandardOutput.ReadLineAsync()
-        if (-not $readTask.Wait($remaining)) {
-            throw "Timed out waiting for Codex app-server response id $Id."
-        }
+        if (-not $readTask.Wait($remaining)) { throw "Timed out waiting for Codex app-server response id $Id." }
         $line = $readTask.Result
-        if ($null -eq $line) {
-            throw "Codex app-server stdout closed while waiting for response id $Id."
-        }
+        if ($null -eq $line) { throw "Codex app-server stdout closed while waiting for response id $Id." }
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
-
-        try {
-            $message = $line | ConvertFrom-Json
-        }
-        catch {
-            throw "Codex app-server emitted non-JSON stdout: $line"
-        }
-
+        try { $message = $line | ConvertFrom-Json }
+        catch { throw "Codex app-server emitted non-JSON stdout: $line" }
         if ($null -ne $message.PSObject.Properties['id'] -and [int]$message.id -eq $Id) {
             if ($null -ne $message.PSObject.Properties['error'] -and $null -ne $message.error) {
                 throw "Codex app-server request $Id failed: $($message.error | ConvertTo-Json -Compress -Depth 10)"
@@ -100,80 +79,51 @@ try {
     Send-AppServerMessage -Message @{
         method = 'initialize'
         id = 1
-        params = @{
-            clientInfo = @{
-                name = 'hms_skills_ci'
-                title = 'HMS Skills CI'
-                version = '0.2.0'
-            }
-        }
+        params = @{ clientInfo = @{ name = 'hms_skills_ci'; title = 'HMS Skills CI'; version = '0.2.0' } }
     }
     $initializeResponse = Read-AppServerResponse -Id 1
-    if ($null -ne $initializeResponse.result.codexHome) {
-        Write-Host "Codex app-server codexHome: $($initializeResponse.result.codexHome)"
-    }
+    if ($null -ne $initializeResponse.result.codexHome) { Write-Host "Codex app-server codexHome: $($initializeResponse.result.codexHome)" }
 
     Send-AppServerMessage -Message @{ method = 'initialized' }
     Send-AppServerMessage -Message @{
         method = 'skills/list'
         id = 2
-        params = @{
-            cwds = @([IO.Path]::GetFullPath($Cwd))
-            forceReload = $true
-        }
+        params = @{ cwds = @([IO.Path]::GetFullPath($Cwd)); forceReload = $true }
     }
 
     $response = Read-AppServerResponse -Id 2
     $entries = @($response.result.data)
-    if ($entries.Count -ne 1) {
-        throw "Expected one skills/list cwd result, found $($entries.Count)."
-    }
+    if ($entries.Count -ne 1) { throw "Expected one skills/list cwd result, found $($entries.Count)." }
     $entry = $entries[0]
     $discoveryErrors = @($entry.errors)
-    if ($discoveryErrors.Count -gt 0) {
-        throw "Codex skills/list reported discovery errors: $($discoveryErrors | ConvertTo-Json -Compress -Depth 10)"
-    }
+    if ($discoveryErrors.Count -gt 0) { throw "Codex skills/list reported discovery errors: $($discoveryErrors | ConvertTo-Json -Compress -Depth 10)" }
 
     $skills = @($entry.skills)
     $names = @($skills | ForEach-Object { [string]$_.name })
     $sortedNames = @($names | Sort-Object -Unique)
     Write-Host ("Codex discovered skills: " + ($sortedNames -join ', '))
 
-    foreach ($required in $requiredHmsSkills) {
+    foreach ($required in @($requiredHmsSkills + $requiredUpstreamSkills + $requiredUiAdvisorSkills)) {
         if ($names -notcontains $required) {
-            throw "Codex skills/list did not discover required HMS skill '$required'. Observed names: $($sortedNames -join ', ')"
-        }
-    }
-    foreach ($required in $requiredUpstreamSkills) {
-        if ($names -notcontains $required) {
-            throw "Codex skills/list did not discover required pinned Superpowers skill '$required'. Observed names: $($sortedNames -join ', ')"
+            throw "Codex skills/list did not discover required skill '$required'. Observed names: $($sortedNames -join ', ')"
         }
     }
 
-    $orchestrator = @($skills | Where-Object { $_.name -eq 'hms-superpowers' })
-    if ($orchestrator.Count -ne 1) {
-        throw "Expected exactly one discovered hms-superpowers skill, found $($orchestrator.Count)."
-    }
+    if (@($skills | Where-Object { $_.name -eq 'hms-superpowers' }).Count -ne 1) { throw 'Expected exactly one discovered hms-superpowers skill.' }
+    if (@($skills | Where-Object { $_.name -eq 'hms-ui-design-authority' }).Count -ne 1) { throw 'Expected exactly one discovered hms-ui-design-authority skill.' }
+    if (@($skills | Where-Object { $_.name -eq 'gpt-taste' }).Count -ne 1) { throw 'Expected exactly one discovered gpt-taste skill.' }
+    if (@($skills | Where-Object { $_.name -eq 'impeccable' }).Count -ne 1) { throw 'Expected exactly one discovered impeccable skill.' }
 
-    $uiAuthority = @($skills | Where-Object { $_.name -eq 'hms-ui-design-authority' })
-    if ($uiAuthority.Count -ne 1) {
-        throw "Expected exactly one discovered hms-ui-design-authority skill, found $($uiAuthority.Count)."
-    }
-
-    Write-Host "PASS: Codex app-server skills/list discovered all $($requiredHmsSkills.Count) HMS skills and pinned Superpowers namespace."
+    Write-Host "PASS: Codex app-server skills/list discovered all $($requiredHmsSkills.Count) HMS skills, pinned Superpowers, GPT Taste, and Impeccable."
 }
 finally {
     try { $process.StandardInput.Close() } catch { }
-    if (-not $process.HasExited) {
-        try { $process.Kill($true) } catch { }
-    }
+    if (-not $process.HasExited) { try { $process.Kill($true) } catch { } }
     try { $process.WaitForExit(5000) | Out-Null } catch { }
     try {
         if ($stderrTask.IsCompleted) {
             $stderr = $stderrTask.Result
-            if (-not [string]::IsNullOrWhiteSpace($stderr)) {
-                Write-Verbose "Codex app-server stderr: $stderr"
-            }
+            if (-not [string]::IsNullOrWhiteSpace($stderr)) { Write-Verbose "Codex app-server stderr: $stderr" }
         }
     }
     catch { }
