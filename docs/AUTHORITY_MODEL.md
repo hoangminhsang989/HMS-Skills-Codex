@@ -43,11 +43,34 @@ A durable authority should identify enough of the following to make continuation
 
 A skill may refine the reason for one of these states but must not promote it to PASS without fresh evidence satisfying the required gate.
 
+## UI design authority
+
+Material HMS UI work uses `$hms-ui-design-authority` inside the already-authorized project scope. It does not create new mutation authority.
+
+When the project declares Penpot as canonical visual authority, the default UI evidence chain is:
+
+```text
+APPROVED/FROZEN HMS UI DEFINITION
+      ↓
+PENPOT CANONICAL VISUAL DESIGN
+      ↓
+DESIGN.md PROJECT UI LAW
+      ↓
+DESIGN TOKENS + COMPONENT MAPPING
+      ↓
+PRODUCTION UI IMPLEMENTATION
+      ↓
+SCREENSHOT / VISUAL-REGRESSION / RUNTIME EVIDENCE
+```
+
+A production screenshot cannot silently supersede the editable canonical design, and an agent preference cannot silently supersede Penpot or `DESIGN.md`. If required design authority is unavailable or conflicting, the dependent UI mutation remains non-PASS until a higher authority resolves the gap.
+
 ## Superpowers adaptation
 
 Use upstream Superpowers where it improves execution discipline. HMS may adapt it as follows:
 
 - Skip redundant brainstorming when a frozen/approved HMS specification already resolves the design question.
+- For UI work, do not let brainstorming or agent style preference replace an approved canonical design; route material UI work through `$hms-ui-design-authority`.
 - Use TDD directly for deterministic production logic.
 - For OS/kernel/UAC/service/native-I/O/hardware-dependent behavior, use the strongest appropriate deterministic harness plus real runtime evidence rather than artificial unit tests.
 - Keep upstream worktree, systematic-debugging, code-review, and verification disciplines unless a higher HMS authority requires a stricter process.
