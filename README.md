@@ -31,7 +31,9 @@ The installer creates a junction:
   -> %USERPROFILE%\.codex\hms-skills-codex\skills
 ```
 
-By default it also installs or updates upstream `obra/superpowers` and exposes it at `%USERPROFILE%\.agents\skills\superpowers`. Use `-SkipSuperpowers` if upstream Superpowers is managed separately.
+By default it also installs upstream `obra/superpowers` and exposes it at `%USERPROFILE%\.agents\skills\superpowers`. HMS does **not** track mutable upstream `main`: the reviewed upstream identity is locked in `superpowers.lock.json`, and install/update always checks out that exact commit in detached-HEAD state. Use `-SkipSuperpowers` when Superpowers is managed separately, such as through the Codex plugin marketplace.
+
+Changing the Superpowers pin is a material workflow change and should go through a reviewed HMS Skills Codex commit/PR rather than an unreviewed `git pull` of upstream.
 
 Restart Codex after the first installation so skill discovery refreshes.
 
@@ -66,13 +68,15 @@ Codex may also activate the skill automatically when the task matches its descri
 & "$env:USERPROFILE\.codex\hms-skills-codex\update.ps1"
 ```
 
+This fast-forwards the HMS Skills Codex repository, validates it, and reconciles the local Superpowers checkout back to the commit currently recorded in `superpowers.lock.json`.
+
 ## Validate
 
 ```powershell
 pwsh ./scripts/Test-HmsSkills.ps1
 ```
 
-The validator checks required `SKILL.md` frontmatter, folder/name identity, duplicate names, and basic repository invariants. GitHub Actions runs the same check on pushes and pull requests.
+The validator checks required `SKILL.md` frontmatter, folder/name identity, duplicate names, Codex orchestrator metadata, and the pinned Superpowers authority. GitHub Actions runs structural validation on pushes and pull requests; branch pushes also run an isolated Windows installation smoke that verifies the junction layout and exact Superpowers HEAD.
 
 ## Status
 

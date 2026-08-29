@@ -38,7 +38,7 @@ jobs:
           $originalUserProfile = $env:USERPROFILE
           try {
             $env:USERPROFILE = $testHome
-            & "$env:GITHUB_WORKSPACE\install.ps1" -InstallRoot $installRoot -SkipSuperpowers
+            & "$env:GITHUB_WORKSPACE\install.ps1" -InstallRoot $installRoot
 
             $hmsLink = Join-Path $testHome '.agents\skills\hms'
             if (-not (Test-Path -LiteralPath $hmsLink)) { throw 'HMS skills junction was not created.' }
@@ -52,9 +52,22 @@ jobs:
             $metadata = Join-Path $hmsLink 'hms-superpowers\agents\openai.yaml'
             if (-not (Test-Path -LiteralPath $orchestrator)) { throw 'hms-superpowers is missing from installed discovery tree.' }
             if (-not (Test-Path -LiteralPath $metadata)) { throw 'hms-superpowers Codex metadata is missing from installed discovery tree.' }
+
+            $superpowersLink = Join-Path $testHome '.agents\skills\superpowers'
+            if (-not (Test-Path -LiteralPath $superpowersLink)) { throw 'Superpowers skills junction was not created.' }
+            $superLinkItem = Get-Item -LiteralPath $superpowersLink -Force
+            if (-not ($superLinkItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Superpowers skills path is not a junction/reparse point.' }
+            $superSkillFiles = @(Get-ChildItem -LiteralPath $superpowersLink -Filter 'SKILL.md' -File -Recurse)
+            if ($superSkillFiles.Count -eq 0) { throw 'No Superpowers skills were discovered through the installed junction.' }
+
+            $lock = Get-Content -LiteralPath (Join-Path $installRoot 'superpowers.lock.json') -Raw | ConvertFrom-Json
+            $actualSuperpowersHead = (& git -C (Join-Path $testHome '.codex\superpowers') rev-parse HEAD).Trim()
+            if ($LASTEXITCODE -ne 0 -or $actualSuperpowersHead -ne [string]$lock.commit) {
+              throw "Superpowers pin mismatch. Expected $($lock.commit), found $actualSuperpowersHead"
+            }
           }
           finally {
             $env:USERPROFILE = $originalUserProfile
           }
 
-          Write-Host 'PASS: Windows isolated install/discovery-layout smoke completed.'
+          Write-Host 'PASS: Windows isolated install/discovery-layout smoke completed with pinned Superpowers.'

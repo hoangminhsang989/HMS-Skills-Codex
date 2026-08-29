@@ -72,9 +72,39 @@ foreach ($requiredName in $required) {
     }
 }
 
+$metadataPath = Join-Path $skillsRoot 'hms-superpowers\agents\openai.yaml'
+if (-not (Test-Path -LiteralPath $metadataPath)) {
+    $errors.Add('Codex metadata missing for hms-superpowers: skills/hms-superpowers/agents/openai.yaml')
+}
+
+$lockPath = Join-Path $RepoRoot 'superpowers.lock.json'
+if (-not (Test-Path -LiteralPath $lockPath)) {
+    $errors.Add('Missing superpowers.lock.json')
+}
+else {
+    try {
+        $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+        $repository = [string]$lock.repository
+        $version = [string]$lock.version
+        $commit = [string]$lock.commit
+        if ($repository -ne 'https://github.com/obra/superpowers.git') {
+            $errors.Add("Unexpected Superpowers repository in lock: $repository")
+        }
+        if ([string]::IsNullOrWhiteSpace($version)) {
+            $errors.Add('Superpowers lock version is missing.')
+        }
+        if ($commit -notmatch '^[0-9a-f]{40}$') {
+            $errors.Add("Superpowers lock commit is not a canonical lowercase SHA-1: $commit")
+        }
+    }
+    catch {
+        $errors.Add("Invalid superpowers.lock.json: $($_.Exception.Message)")
+    }
+}
+
 if ($errors.Count -gt 0) {
     $message = "HMS skill validation failed:`n - " + ($errors -join "`n - ")
     throw $message
 }
 
-Write-Host "PASS: validated $($skillFiles.Count) HMS skills."
+Write-Host "PASS: validated $($skillFiles.Count) HMS skills and the pinned Superpowers authority."
