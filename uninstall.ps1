@@ -3,7 +3,8 @@ param(
     [string]$InstallRoot = (Join-Path $env:USERPROFILE '.codex\hms-skills-codex'),
     [switch]$RemoveClones,
     [switch]$IncludeSuperpowers,
-    [switch]$IncludeUiSkills
+    [switch]$IncludeUiSkills,
+    [switch]$IncludeDeliveryTools
 )
 
 Set-StrictMode -Version Latest
@@ -13,6 +14,7 @@ $HmsRemote = 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
 $SuperpowersRemote = 'https://github.com/obra/superpowers.git'
 $TasteRemote = 'https://github.com/Leonxlnx/taste-skill.git'
 $ImpeccableRemote = 'https://github.com/pbakaus/impeccable.git'
+$ThreeLevelRemote = 'https://github.com/nguyenduytamgithub/three-level-delivery.git'
 
 $skillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
 $hmsLink = Join-Path $skillsRoot 'hms'
@@ -24,6 +26,8 @@ $hmsClone = $InstallRoot
 $superpowersClone = Join-Path $env:USERPROFILE '.codex\superpowers'
 $tasteClone = Join-Path $env:USERPROFILE '.codex\taste-skill'
 $impeccableClone = Join-Path $env:USERPROFILE '.codex\impeccable'
+$codeGraphRoot = Join-Path $env:USERPROFILE '.codex\codegraph'
+$threeLevelClone = Join-Path $env:USERPROFILE '.codex\three-level-delivery'
 
 function ConvertTo-NormalizedRemote {
     param([Parameter(Mandatory)][string]$Remote)
@@ -63,6 +67,21 @@ function Assert-CloneIdentity {
     if ((ConvertTo-NormalizedRemote $origin) -ne (ConvertTo-NormalizedRemote $ExpectedRemote)) {
         throw "Refusing to remove clone with unexpected origin: $Path ($($origin.Trim()))"
     }
+}
+
+function Assert-ManagedCodeGraphRoot {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-SafeRemovalPath -Path $Path
+    $manifestPath = Join-Path $Path 'hms-codegraph-install.json'
+    if (-not (Test-Path -LiteralPath $manifestPath)) { throw "Refusing to remove CodeGraph directory without HMS ownership manifest: $Path" }
+    try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json }
+    catch { throw "Refusing to remove CodeGraph directory with invalid ownership manifest: $($_.Exception.Message)" }
+    if ([string]$manifest.managed_by -cne 'HMS-Skills-Codex') { throw "Refusing to remove CodeGraph directory with unexpected owner: $Path" }
+    if ([string]$manifest.version -cne '1.6.0' -or [string]$manifest.commit -cne 'dfccdf62547fcd76d343344d823a0e1998d3a89f') {
+        throw "Refusing to remove CodeGraph directory whose pinned identity is not recognized by this HMS candidate: $Path"
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $Path 'current\bin\codegraph.cmd'))) { throw "Refusing to remove CodeGraph directory without expected launcher: $Path" }
 }
 
 function Assert-LinkTarget {
@@ -109,6 +128,15 @@ function Remove-VerifiedClone {
     }
 }
 
+function Remove-VerifiedManagedDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if ($PSCmdlet.ShouldProcess($Path, 'Remove verified HMS-managed directory')) {
+        Remove-Item -LiteralPath $Path -Recurse -Force
+        if (Test-Path -LiteralPath $Path) { throw "Managed directory removal did not complete: $Path" }
+    }
+}
+
 # Preflight every selected target before the first mutation.
 Assert-LinkTarget -Path $hmsLink -ExpectedTarget (Join-Path $hmsClone 'skills')
 if ($IncludeSuperpowers) {
@@ -128,6 +156,19 @@ if ($RemoveClones) {
         Assert-CloneIdentity -Path $tasteClone -ExpectedRemote $TasteRemote -MarkerRelativePath 'skills\gpt-tasteskill\SKILL.md'
         Assert-CloneIdentity -Path $impeccableClone -ExpectedRemote $ImpeccableRemote -MarkerRelativePath '.agents\skills\impeccable\SKILL.md'
     }
+    if ($IncludeDeliveryTools) {
+        Assert-ManagedCodeGraphRoot -Path $codeGraphRoot
+        Assert-CloneIdentity -Path $threeLevelClone -ExpectedRemote $ThreeLevelRemote -MarkerRelativePath 'three-level-delivery\SKILL.md'
+    }
+}
+
+if ($IncludeDeliveryTools) {
+    if (-not (Test-Path -LiteralPath (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1'))) {
+        throw 'Cannot safely remove CodeGraph MCP config because scripts/Sync-DeliveryTools.ps1 is unavailable.'
+    }
+    if ($PSCmdlet.ShouldProcess('Codex MCP server codegraph', 'Remove HMS-managed CodeGraph MCP configuration')) {
+        & (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') -RemoveCodeGraphConfig -SkipThreeLevelDelivery
+    }
 }
 
 Remove-VerifiedLink -Path $hmsLink
@@ -138,12 +179,16 @@ if ($IncludeUiSkills) {
 }
 
 if ($RemoveClones) {
-    Remove-VerifiedClone -Path $hmsClone
     if ($IncludeSuperpowers) { Remove-VerifiedClone -Path $superpowersClone }
     if ($IncludeUiSkills) {
         Remove-VerifiedClone -Path $tasteClone
         Remove-VerifiedClone -Path $impeccableClone
     }
+    if ($IncludeDeliveryTools) {
+        Remove-VerifiedClone -Path $threeLevelClone
+        Remove-VerifiedManagedDirectory -Path $codeGraphRoot
+    }
+    Remove-VerifiedClone -Path $hmsClone
 }
 
 Write-Host 'Requested HMS Skills Codex uninstall actions completed.'

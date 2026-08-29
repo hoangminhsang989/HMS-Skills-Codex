@@ -2,7 +2,7 @@
 
 ## Purpose
 
-HMS Skills Codex separates **what is authorized** from **how an agent prefers to work**. Process convenience must never become authority.
+HMS Skills Codex separates **what is authorized** from **how an agent prefers to work**. Process convenience, graph-derived context, and upstream workflow defaults must never become authority.
 
 ## Precedence
 
@@ -15,16 +15,21 @@ HMS FAIL-CLOSED + SAFETY RULES
       ↓
 HMS ADAPTIVE MODEL ROUTING
       ↓
-HMS PROJECT-SPECIFIC SKILLS
+HMS PROJECT-SPECIFIC AUTHORITY / SKILLS
       ↓
-OPTIONAL DESIGN-ADVISOR SKILLS (GPT TASTE / IMPECCABLE)
+EXPLICIT THREE-LEVEL DELIVERY GOVERNANCE
+(only inside an already-authorized HMS slice)
       ↓
-UPSTREAM SUPERPOWERS
+UPSTREAM SUPERPOWERS TECHNICAL METHOD
+      ↓
+CODEGRAPH CONTEXT/EVIDENCE + OPTIONAL DESIGN ADVISORS
       ↓
 CODEX DEFAULTS
 ```
 
 When two sources conflict, the higher layer wins. At the same layer, use the newest valid authority that actually supersedes the older one; do not assume a newer filename automatically supersedes an older checkpoint.
+
+Three-Level Delivery is not active implicitly. Its layer exists only after the owner explicitly invokes `$three-level-delivery`. CodeGraph, GPT Taste, and Impeccable are derived/advisory helpers and do not create mutation authority.
 
 ## Authority is evidence-bearing
 
@@ -44,6 +49,26 @@ A durable authority should identify enough of the following to make continuation
 `UNKNOWN`, `UNVERIFIED`, `PARTIAL`, `TIMEOUT`, `CANCELED`, `INCONCLUSIVE`, `BLOCKED`, `STOP`, `DEFERRED`, and `REJECTED` are not synonyms for PASS.
 
 A skill may refine the reason for one of these states but must not promote it to PASS without fresh evidence satisfying the required gate.
+
+## Three-Level Delivery boundary
+
+The canonical Three-Level Delivery source is pinned in `delivery-tools.lock.json` and loaded through the HMS `$three-level-delivery` compatibility adapter. On explicit activation it must qualify that exact source and execute the upstream freshness gate before target-repository mutation. A newer canonical version produces an update-required stop until the HMS pin itself is reviewed and changed.
+
+Inside an authorized slice, preserve the canonical topology: one Owner-approved slice, one read-only Lead, one Writer, one independent read-only Reviewer, one writable checkout, durable state, and a hard stop at the Owner gate. Do not silently open the next slice.
+
+The single Three-Level Delivery Reviewer should satisfy applicable HMS independent-review requirements as well. Do not add a second reviewer merely because both systems mention review; if a higher HMS authority explicitly requires a distinct second reviewer, that is a topology conflict that must be resolved before execution.
+
+Three-Level Delivery approval does not imply HMS release authority. Merge, protected-main integration, push, deploy, UAC, service changes, production adoption, physical-machine actions, or other privileged/release boundaries remain subject to `$hms-release-gate` and the current HMS authority.
+
+## CodeGraph boundary
+
+CodeGraph is structural repository intelligence, not authority. HMS pins the CodeGraph release identity and Windows release-asset SHA-256 in `delivery-tools.lock.json`, installs it locally, and registers the MCP server through the official Codex CLI using the absolute HMS-managed binary path.
+
+Use `$codegraph-context` to bind CodeGraph to the exact checkout/worktree, ensure/synchronize its local graph, reject cross-worktree index reuse, and make a bounded query. Graph results may accelerate discovery and blast-radius analysis but cannot supersede committed source, Git identity, an HMS checkpoint, test output, runtime receipts, or physical qualification.
+
+Under Three-Level Delivery, the canonical CodeGraph gate is fail-closed and does not permit a silent grep/manual fallback. Outside that explicit workflow, CodeGraph is optional unless a higher HMS authority requires it.
+
+Project `.codegraph/` data is local tooling state. Do not mutate tracked `.gitignore` merely to hide it; prefer repository-local Git exclude state unless the tracked ignore file is explicitly in scope.
 
 ## UI design authority
 
@@ -80,10 +105,11 @@ Their upstream source identities are pinned in `ui-skills.lock.json`; changing a
 Use upstream Superpowers where it improves execution discipline. HMS may adapt it as follows:
 
 - Skip redundant brainstorming when a frozen/approved HMS specification already resolves the design question.
+- When Three-Level Delivery is explicitly active, use Superpowers as its technical method layer rather than as a competing delivery controller.
 - For UI work, do not let brainstorming, Taste, Impeccable, or agent style preference replace an approved canonical design; route material UI work through `$hms-ui-design-authority`.
 - Use TDD directly for deterministic production logic.
 - For OS/kernel/UAC/service/native-I/O/hardware-dependent behavior, use the strongest appropriate deterministic harness plus real runtime evidence rather than artificial unit tests.
-- Keep upstream worktree, systematic-debugging, code-review, and verification disciplines unless a higher HMS authority requires a stricter process.
+- Keep upstream worktree, systematic-debugging, code-review, and verification disciplines unless a higher HMS authority or the active Three-Level Delivery topology requires a stricter process.
 
 ## Mutation rule
 

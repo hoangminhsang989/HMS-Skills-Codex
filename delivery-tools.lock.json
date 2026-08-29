@@ -1,0 +1,27 @@
+{
+  "codegraph": {
+    "repository": "https://github.com/colbymchenry/codegraph",
+    "version": "1.6.0",
+    "tag": "v1.6.0",
+    "commit": "dfccdf62547fcd76d343344d823a0e1998d3a89f",
+    "mcp_server": "codegraph",
+    "windows_assets": {
+      "x64": {
+        "name": "codegraph-win32-x64.zip",
+        "sha256": "cd76c3c3391f2d40abef12b142151950b6d77abc2d8429e648f89eaa90f5b68a"
+      },
+      "arm64": {
+        "name": "codegraph-win32-arm64.zip",
+        "sha256": "3ca980010bd718a6b5e75be1145806ae6491afb1a59a2cec6cee4bf5c39f1b3a"
+      }
+    }
+  },
+  "three_level_delivery": {
+    "repository": "https://github.com/nguyenduytamgithub/three-level-delivery.git",
+    "version": "0.1.4",
+    "tag": "v0.1.4",
+    "commit": "667d15066784dd192e34efdff432ad47ae2298a9",
+    "skill_path": "three-level-delivery",
+    "skill_name": "three-level-delivery"
+  }
+}

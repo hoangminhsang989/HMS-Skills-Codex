@@ -39,7 +39,9 @@ $requiredHmsSkills = @(
     'hms-fail-closed',
     'hms-release-gate',
     'hms-handoff',
-    'hms-ui-design-authority'
+    'hms-ui-design-authority',
+    'codegraph-context',
+    'three-level-delivery'
 )
 $requiredUpstreamSkills = @('superpowers:brainstorming')
 $requiredUiAdvisorSkills = @(
@@ -135,13 +137,13 @@ try {
         }
     }
 
-    foreach ($uniqueName in @('hms-superpowers', 'hms-ui-design-authority') + $requiredUiAdvisorSkills) {
+    foreach ($uniqueName in @('hms-superpowers', 'hms-ui-design-authority', 'codegraph-context', 'three-level-delivery') + $requiredUiAdvisorSkills) {
         if (@($skills | Where-Object { $_.name -eq $uniqueName }).Count -ne 1) {
             throw "Expected exactly one discovered '$uniqueName' skill."
         }
     }
 
-    Write-Host "PASS: Codex app-server skills/list discovered all $($requiredHmsSkills.Count) HMS skills, pinned Superpowers, $($requiredUiAdvisorSkills -join ', ')."
+    Write-Host "PASS: Codex app-server skills/list discovered all $($requiredHmsSkills.Count) HMS/adapter skills, pinned Superpowers, and $($requiredUiAdvisorSkills -join ', ')."
 }
 finally {
     try { $process.StandardInput.Close() } catch { }

@@ -3,7 +3,9 @@ param(
     [string]$InstallRoot = (Join-Path $env:USERPROFILE '.codex\hms-skills-codex'),
     [switch]$SkipSuperpowers,
     [switch]$SkipTaste,
-    [switch]$SkipImpeccable
+    [switch]$SkipImpeccable,
+    [switch]$SkipCodeGraph,
+    [switch]$SkipThreeLevelDelivery
 )
 
 Set-StrictMode -Version Latest
@@ -180,6 +182,7 @@ if (-not $SkipSuperpowers) {
 }
 
 & (Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1')
+& (Join-Path $InstallRoot 'scripts\Test-DeliveryTools.ps1')
 New-Item -ItemType Directory -Force -Path $SkillsRoot | Out-Null
 Ensure-Junction -Link $HmsLink -Target (Join-Path $InstallRoot 'skills')
 
@@ -193,10 +196,18 @@ if ($SkipTaste) { $uiSyncArgs.SkipTaste = $true }
 if ($SkipImpeccable) { $uiSyncArgs.SkipImpeccable = $true }
 & (Join-Path $InstallRoot 'scripts\Sync-UiSkills.ps1') -EnsureDiscovery @uiSyncArgs
 
+$deliverySyncArgs = @{}
+if (-not $SkipCodeGraph) { $deliverySyncArgs.EnsureCodeGraphConfig = $true }
+if ($SkipCodeGraph) { $deliverySyncArgs.SkipCodeGraph = $true }
+if ($SkipThreeLevelDelivery) { $deliverySyncArgs.SkipThreeLevelDelivery = $true }
+& (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') @deliverySyncArgs
+
 Write-Host 'HMS Skills Codex installation PASS.'
 Write-Host "HMS skills: $HmsLink"
 if (-not $SkipSuperpowers) {
     Write-Host "Superpowers skills: $SuperpowersLink"
     Write-Host "Superpowers pin: $($superpowersLock.Commit)"
 }
-Write-Host 'Restart Codex to refresh skill discovery.'
+if (-not $SkipCodeGraph) { Write-Host 'CodeGraph: pinned bundle installed and Codex MCP registered by absolute path.' }
+if (-not $SkipThreeLevelDelivery) { Write-Host 'Three-Level Delivery: pinned canonical source installed; invoke through $three-level-delivery.' }
+Write-Host 'Restart Codex to refresh skill and MCP discovery.'

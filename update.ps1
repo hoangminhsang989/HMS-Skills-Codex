@@ -3,7 +3,9 @@ param(
     [string]$InstallRoot = (Join-Path $env:USERPROFILE '.codex\hms-skills-codex'),
     [switch]$SkipSuperpowers,
     [switch]$SkipTaste,
-    [switch]$SkipImpeccable
+    [switch]$SkipImpeccable,
+    [switch]$SkipCodeGraph,
+    [switch]$SkipThreeLevelDelivery
 )
 
 Set-StrictMode -Version Latest
@@ -142,6 +144,7 @@ if (-not $SkipSuperpowers) {
 }
 
 & (Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1')
+& (Join-Path $InstallRoot 'scripts\Test-DeliveryTools.ps1')
 
 if (-not $SkipSuperpowers) {
     Sync-PinnedRepo -Path (Join-Path $env:USERPROFILE '.codex\superpowers') -Remote $superpowersLock.Repository -Commit $superpowersLock.Commit
@@ -152,7 +155,13 @@ if ($SkipTaste) { $uiSyncArgs.SkipTaste = $true }
 if ($SkipImpeccable) { $uiSyncArgs.SkipImpeccable = $true }
 & (Join-Path $InstallRoot 'scripts\Sync-UiSkills.ps1') -EnableIfNew @uiSyncArgs
 
+$deliverySyncArgs = @{}
+if (-not $SkipCodeGraph) { $deliverySyncArgs.EnableCodeGraphIfNew = $true }
+if ($SkipCodeGraph) { $deliverySyncArgs.SkipCodeGraph = $true }
+if ($SkipThreeLevelDelivery) { $deliverySyncArgs.SkipThreeLevelDelivery = $true }
+& (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') @deliverySyncArgs
+
 Write-Host 'HMS Skills Codex update PASS.'
 if (-not $SkipSuperpowers) { Write-Host "Superpowers pin: $($superpowersLock.Commit)" }
-Write-Host 'Existing Manager ON/OFF choices are preserved for already-installed Taste and Impeccable sources.'
-Write-Host 'Restart Codex if the running session does not refresh skill metadata automatically.'
+Write-Host 'Existing ON/OFF choices are preserved for already-installed Taste, Impeccable, and CodeGraph MCP configuration.'
+Write-Host 'Restart Codex if the running session does not refresh skill/MCP metadata automatically.'
