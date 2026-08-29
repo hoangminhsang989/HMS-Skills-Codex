@@ -113,7 +113,8 @@ $powerShellScripts = @(
     (Join-Path $RepoRoot 'install.ps1'),
     (Join-Path $RepoRoot 'update.ps1'),
     (Join-Path $RepoRoot 'uninstall.ps1'),
-    (Join-Path $RepoRoot 'scripts\Test-CodexSkillDiscovery.ps1')
+    (Join-Path $RepoRoot 'scripts\Test-CodexSkillDiscovery.ps1'),
+    (Join-Path $RepoRoot 'manager\HmsSuperpowersManager.ps1')
 )
 
 foreach ($scriptPath in $powerShellScripts) {
@@ -140,4 +141,4 @@ if ($errors.Count -gt 0) {
     throw $message
 }
 
-Write-Host "PASS: validated $($skillFiles.Count) HMS skills, required Codex metadata, PowerShell syntax, and the pinned Superpowers authority."
+Write-Host "PASS: validated $($skillFiles.Count) HMS skills, required Codex metadata, PowerShell syntax (including Manager UI), and the pinned Superpowers authority."
