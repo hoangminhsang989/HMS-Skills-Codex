@@ -90,6 +90,6 @@ The validator checks required `SKILL.md` frontmatter, folder/name identity, dupl
 
 ## Status
 
-Current candidate version: **0.2.0**.
+Current version: **0.2.0**.
 
 See `docs/AUTHORITY_MODEL.md` for the design contract.
