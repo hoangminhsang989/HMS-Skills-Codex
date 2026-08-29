@@ -72,7 +72,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\manager\HmsSuperpowers
 
 ## UI advisor rule
 
-`gpt-taste` and `impeccable` are optional design advisors, not HMS authority. Their generic rules about fonts, AIDA, motion, spacing, layout, redesign, or framework choices do not override owner instruction, frozen product/UI definitions, Penpot, `DESIGN.md`, tokens/component mapping, platform requirements, or behavior outside the authorized scope.
+`gpt-taste` and `impeccable` are the upstream skill names, but Codex namespace-qualifies these external repositories. The qualified discovery/invocation identities are pinned in `ui-skills.lock.json` and currently are:
+
+```text
+$taste-skill:gpt-taste
+$impeccable:impeccable
+```
+
+They are optional design advisors, not HMS authority. Their generic rules about fonts, AIDA, motion, spacing, layout, redesign, or framework choices do not override owner instruction, frozen product/UI definitions, Penpot, `DESIGN.md`, tokens/component mapping, platform requirements, or behavior outside the authorized scope.
 
 This matters especially for engineering desktop software: web/marketing conventions from a generic design skill must not be imported into a desktop CAD/CAM or operations UI merely because the advisor prefers them.
 
@@ -93,8 +100,8 @@ Implement the authorized UI change from the canonical project design and verify 
 Optional advisor invocation:
 
 ```text
-$gpt-taste
-$impeccable
+$taste-skill:gpt-taste
+$impeccable:impeccable
 ```
 
 Codex may also activate skills automatically when the task matches their descriptions; HMS precedence still applies.
@@ -128,7 +135,7 @@ This fast-forwards HMS Skills Codex and reconciles pinned dependencies. When GPT
 pwsh ./scripts/Test-HmsSkills.ps1
 ```
 
-The validator checks HMS skill metadata, PowerShell syntax, and all pinned dependency contracts. GitHub Actions runs structural validation plus the Windows install/update/Manager-self-test/real-Codex-discovery/uninstall contract on pushes and pull requests.
+The validator checks HMS skill metadata, PowerShell syntax, exact dependency pins, and namespace-qualified external discovery contracts. GitHub Actions runs structural validation plus the Windows install/update/Manager-self-test/real-Codex-discovery/uninstall contract on pushes and pull requests.
 
 ## Status
 
