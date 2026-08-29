@@ -12,6 +12,21 @@ $uiLockPath = Join-Path $RepoRoot 'ui-skills.lock.json'
 if (-not (Test-Path -LiteralPath $uiLockPath)) { throw "UI skills lock file not found: $uiLockPath" }
 $uiLock = Get-Content -LiteralPath $uiLockPath -Raw | ConvertFrom-Json
 
+if ($env:OS -eq 'Windows_NT') {
+    $windowsPowerShell = Get-Command powershell.exe -ErrorAction Stop
+    $ps51Version = (& $windowsPowerShell.Source -NoProfile -Command '$PSVersionTable.PSVersion.ToString()') -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $ps51Version.Trim() -notmatch '^5\.1\.') {
+        throw "Expected Windows PowerShell 5.1 for Manager launcher qualification, found: $($ps51Version.Trim())"
+    }
+
+    $managerPath = Join-Path $RepoRoot 'manager\HmsSuperpowersManager.ps1'
+    & $windowsPowerShell.Source -NoProfile -ExecutionPolicy Bypass -File $managerPath -SelfTest
+    if ($LASTEXITCODE -ne 0) {
+        throw "Windows PowerShell 5.1 Manager self-test failed with exit code $LASTEXITCODE."
+    }
+    Write-Host "PASS: HMS Skills Manager self-test qualified on Windows PowerShell $($ps51Version.Trim())."
+}
+
 $requiredHmsSkills = @(
     'hms-superpowers',
     'hms-authority-loader',
