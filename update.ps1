@@ -66,7 +66,9 @@ function Sync-PinnedRepo {
     & git -C $Path fetch --tags --prune origin
     if ($LASTEXITCODE -ne 0) { throw "git fetch failed for $Path" }
     & git -C $Path cat-file -e "$Commit^{commit}" 2>$null
-    if ($LASTEXITCODE -ne 0) { throw "Pinned commit is unavailable in $Path: $Commit" }
+    if ($LASTEXITCODE -ne 0) {
+        throw ('Pinned commit is unavailable in {0}: {1}' -f $Path, $Commit)
+    }
     & git -C $Path checkout --detach $Commit
     if ($LASTEXITCODE -ne 0) { throw "git checkout of pinned commit failed for $Path" }
 
