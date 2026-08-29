@@ -2,7 +2,8 @@
 param(
     [string]$InstallRoot = (Join-Path $env:USERPROFILE '.codex\hms-skills-codex'),
     [switch]$RemoveClones,
-    [switch]$IncludeSuperpowers
+    [switch]$IncludeSuperpowers,
+    [switch]$IncludeUiSkills
 )
 
 Set-StrictMode -Version Latest
@@ -10,11 +11,19 @@ $ErrorActionPreference = 'Stop'
 
 $HmsRemote = 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
 $SuperpowersRemote = 'https://github.com/obra/superpowers.git'
+$TasteRemote = 'https://github.com/Leonxlnx/taste-skill.git'
+$ImpeccableRemote = 'https://github.com/pbakaus/impeccable.git'
+
 $skillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
 $hmsLink = Join-Path $skillsRoot 'hms'
 $superpowersLink = Join-Path $skillsRoot 'superpowers'
+$tasteLink = Join-Path $skillsRoot 'gpt-taste'
+$impeccableLink = Join-Path $skillsRoot 'impeccable'
+
 $hmsClone = $InstallRoot
 $superpowersClone = Join-Path $env:USERPROFILE '.codex\superpowers'
+$tasteClone = Join-Path $env:USERPROFILE '.codex\taste-skill'
+$impeccableClone = Join-Path $env:USERPROFILE '.codex\impeccable'
 
 function ConvertTo-NormalizedRemote {
     param([Parameter(Mandatory)][string]$Remote)
@@ -27,12 +36,10 @@ function ConvertTo-NormalizedRemote {
 
 function Assert-SafeRemovalPath {
     param([Parameter(Mandatory)][string]$Path)
-
     $full = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
     $root = [IO.Path]::GetPathRoot($full).TrimEnd('\', '/')
     $userRoot = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\', '/')
     $codexRoot = [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.codex')).TrimEnd('\', '/')
-
     if ([string]::IsNullOrWhiteSpace($full) -or $full -eq $root -or $full -eq $userRoot -or $full -eq $codexRoot) {
         throw "Refusing unsafe recursive removal target: $Path"
     }
@@ -47,13 +54,10 @@ function Assert-CloneIdentity {
 
     if (-not (Test-Path -LiteralPath $Path)) { return }
     Assert-SafeRemovalPath -Path $Path
-    if (-not (Test-Path -LiteralPath (Join-Path $Path '.git'))) {
-        throw "Refusing to remove non-Git clone path: $Path"
-    }
+    if (-not (Test-Path -LiteralPath (Join-Path $Path '.git'))) { throw "Refusing to remove non-Git clone path: $Path" }
     if (-not (Test-Path -LiteralPath (Join-Path $Path $MarkerRelativePath))) {
         throw "Refusing to remove clone without expected marker '$MarkerRelativePath': $Path"
     }
-
     $origin = & git -C $Path remote get-url origin
     if ($LASTEXITCODE -ne 0) { throw "git remote get-url origin failed for $Path" }
     if ((ConvertTo-NormalizedRemote $origin) -ne (ConvertTo-NormalizedRemote $ExpectedRemote)) {
@@ -67,39 +71,32 @@ function Assert-LinkTarget {
         [Parameter(Mandatory)][string]$ExpectedTarget
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    if (-not (Test-Path -LiteralPath $ExpectedTarget)) {
-        throw "Expected junction target does not exist: $ExpectedTarget"
-    }
-
-    $item = Get-Item -LiteralPath $Path -Force
-    if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        throw "Refusing to remove non-link path: $Path"
-    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+    if (-not (Test-Path -LiteralPath $ExpectedTarget)) { throw "Expected junction target does not exist: $ExpectedTarget" }
+    if (-not [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Refusing to remove non-link path: $Path" }
 
     $resolvedExpected = (Resolve-Path -LiteralPath $ExpectedTarget).Path
     $matches = $false
     foreach ($candidate in @($item.Target)) {
         if (-not $candidate) { continue }
         try {
-            if ((Resolve-Path -LiteralPath $candidate).Path -eq $resolvedExpected) {
+            if ((Resolve-Path -LiteralPath $candidate).Path -ieq $resolvedExpected) {
                 $matches = $true
                 break
             }
         }
         catch { }
     }
-    if (-not $matches) {
-        throw "Refusing to remove junction with unexpected target: $Path"
-    }
+    if (-not $matches) { throw "Refusing to remove junction with unexpected target: $Path" }
 }
 
 function Remove-VerifiedLink {
     param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if ($null -eq (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) { return }
     if ($PSCmdlet.ShouldProcess($Path, 'Remove skill junction')) {
         Remove-Item -LiteralPath $Path -Force
-        if (Test-Path -LiteralPath $Path) { throw "Junction removal did not complete: $Path" }
+        if ($null -ne (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) { throw "Junction removal did not complete: $Path" }
     }
 }
 
@@ -112,25 +109,41 @@ function Remove-VerifiedClone {
     }
 }
 
-# Preflight every selected target before the first mutation so an identity mismatch
-# cannot leave a partially uninstalled skill set.
+# Preflight every selected target before the first mutation.
 Assert-LinkTarget -Path $hmsLink -ExpectedTarget (Join-Path $hmsClone 'skills')
 if ($IncludeSuperpowers) {
     Assert-LinkTarget -Path $superpowersLink -ExpectedTarget (Join-Path $superpowersClone 'skills')
 }
+if ($IncludeUiSkills) {
+    Assert-LinkTarget -Path $tasteLink -ExpectedTarget (Join-Path $tasteClone 'skills\gpt-tasteskill')
+    Assert-LinkTarget -Path $impeccableLink -ExpectedTarget (Join-Path $impeccableClone '.agents\skills\impeccable')
+}
+
 if ($RemoveClones) {
     Assert-CloneIdentity -Path $hmsClone -ExpectedRemote $HmsRemote -MarkerRelativePath 'skills\hms-superpowers\SKILL.md'
     if ($IncludeSuperpowers) {
         Assert-CloneIdentity -Path $superpowersClone -ExpectedRemote $SuperpowersRemote -MarkerRelativePath 'skills\brainstorming\SKILL.md'
     }
+    if ($IncludeUiSkills) {
+        Assert-CloneIdentity -Path $tasteClone -ExpectedRemote $TasteRemote -MarkerRelativePath 'skills\gpt-tasteskill\SKILL.md'
+        Assert-CloneIdentity -Path $impeccableClone -ExpectedRemote $ImpeccableRemote -MarkerRelativePath '.agents\skills\impeccable\SKILL.md'
+    }
 }
 
 Remove-VerifiedLink -Path $hmsLink
 if ($IncludeSuperpowers) { Remove-VerifiedLink -Path $superpowersLink }
+if ($IncludeUiSkills) {
+    Remove-VerifiedLink -Path $tasteLink
+    Remove-VerifiedLink -Path $impeccableLink
+}
 
 if ($RemoveClones) {
     Remove-VerifiedClone -Path $hmsClone
     if ($IncludeSuperpowers) { Remove-VerifiedClone -Path $superpowersClone }
+    if ($IncludeUiSkills) {
+        Remove-VerifiedClone -Path $tasteClone
+        Remove-VerifiedClone -Path $impeccableClone
+    }
 }
 
 Write-Host 'Requested HMS Skills Codex uninstall actions completed.'
