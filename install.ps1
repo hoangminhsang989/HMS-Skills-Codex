@@ -51,6 +51,27 @@ function Get-CurrentBranch {
     throw "git symbolic-ref failed for $Path with exit code $exitCode"
 }
 
+function Assert-BranchMatchesFetchedRef {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$RemoteRef
+    )
+
+    $localHead = & git -C $Path rev-parse HEAD
+    if ($LASTEXITCODE -ne 0) { throw "git rev-parse HEAD failed for $Path" }
+    $fetchedHead = & git -C $Path rev-parse $RemoteRef
+    if ($LASTEXITCODE -ne 0) { throw "git rev-parse failed for fetched ref $RemoteRef in $Path" }
+
+    $localHead = $localHead.Trim().ToLowerInvariant()
+    $fetchedHead = $fetchedHead.Trim().ToLowerInvariant()
+    if ($localHead -notmatch '^[0-9a-f]{40}$' -or $fetchedHead -notmatch '^[0-9a-f]{40}$') {
+        throw "Unable to prove canonical branch identities for $Path"
+    }
+    if ($localHead -ne $fetchedHead) {
+        throw "HMS branch identity mismatch for $Path. Local HEAD $localHead does not equal verified fetched ref $RemoteRef at $fetchedHead."
+    }
+}
+
 function Sync-Repository {
     param(
         [Parameter(Mandatory)][string]$Remote,
@@ -74,6 +95,7 @@ function Sync-Repository {
             if ($LASTEXITCODE -ne 0) { throw "git fetch from verified origin failed for $Path branch $branch" }
             & git -C $Path merge --ff-only $remoteRef
             if ($LASTEXITCODE -ne 0) { throw "git merge --ff-only failed for $Path from $remoteRef" }
+            Assert-BranchMatchesFetchedRef -Path $Path -RemoteRef $remoteRef
         }
         else {
             $detachedHead = (& git -C $Path rev-parse HEAD).Trim()
