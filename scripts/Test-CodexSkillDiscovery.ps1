@@ -20,7 +20,7 @@ $requiredHmsSkills = @(
     'hms-release-gate',
     'hms-handoff'
 )
-$requiredUpstreamSkills = @('brainstorming')
+$requiredUpstreamSkills = @('superpowers:brainstorming')
 
 $node = Get-Command node -ErrorAction Stop
 $npmRoot = (& npm root -g).Trim()
@@ -147,7 +147,7 @@ try {
         throw "Expected exactly one discovered hms-superpowers skill, found $($orchestrator.Count)."
     }
 
-    Write-Host "PASS: Codex app-server skills/list discovered all $($requiredHmsSkills.Count) HMS skills and pinned Superpowers."
+    Write-Host "PASS: Codex app-server skills/list discovered all $($requiredHmsSkills.Count) HMS skills and pinned Superpowers namespace."
 }
 finally {
     try { $process.StandardInput.Close() } catch { }
