@@ -9,9 +9,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+if ($EnsureDiscovery -or $EnableIfNew) {
+    throw 'Direct UI-advisor discovery is disabled by the unified-skill architecture. Reconcile source only, then rebuild $hms-superpowers.'
+}
+
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $LockPath = Join-Path $RepoRoot 'ui-skills.lock.json'
-$SkillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
 $CanonicalTasteRemote = 'https://github.com/Leonxlnx/taste-skill.git'
 $CanonicalImpeccableRemote = 'https://github.com/pbakaus/impeccable.git'
 
@@ -106,27 +109,6 @@ function Assert-SkillEntryPoint {
     }
 }
 
-function Ensure-Junction {
-    param(
-        [Parameter(Mandatory)][string]$Link,
-        [Parameter(Mandatory)][string]$Target
-    )
-
-    if (-not (Test-Path -LiteralPath $Target)) { throw "Junction target does not exist: $Target" }
-    $item = Get-Item -LiteralPath $Link -Force -ErrorAction SilentlyContinue
-    if ($null -ne $item) {
-        if (-not [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Refusing to replace existing non-link path: $Link" }
-        $expected = (Resolve-Path -LiteralPath $Target).Path
-        foreach ($candidate in @($item.Target)) {
-            if (-not $candidate) { continue }
-            try { if ((Resolve-Path -LiteralPath $candidate).Path -ieq $expected) { return } } catch { }
-        }
-        throw "Refusing to replace existing junction with a different target: $Link"
-    }
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Link) | Out-Null
-    New-Item -ItemType Junction -Path $Link -Target $Target | Out-Null
-}
-
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }
 $lock = Read-ValidatedUiSkillsLock
 
@@ -135,7 +117,6 @@ if (-not $SkipTaste) {
     $specs += [pscustomobject]@{
         Name = 'GPT Taste'
         Root = (Join-Path $env:USERPROFILE '.codex\taste-skill')
-        Link = (Join-Path $SkillsRoot 'gpt-taste')
         Repository = [string]$lock.taste.repository
         Commit = [string]$lock.taste.commit
         SkillPath = [string]$lock.taste.skill_path
@@ -146,7 +127,6 @@ if (-not $SkipImpeccable) {
     $specs += [pscustomobject]@{
         Name = 'Impeccable'
         Root = (Join-Path $env:USERPROFILE '.codex\impeccable')
-        Link = (Join-Path $SkillsRoot 'impeccable')
         Repository = [string]$lock.impeccable.repository
         Commit = [string]$lock.impeccable.commit
         SkillPath = [string]$lock.impeccable.skill_path
@@ -155,13 +135,9 @@ if (-not $SkipImpeccable) {
 }
 
 foreach ($spec in $specs) {
-    $wasInstalled = Test-Path -LiteralPath $spec.Root
     Sync-PinnedRepository -Remote $spec.Repository -Path $spec.Root -Commit $spec.Commit
     Assert-SkillEntryPoint -RepoPath $spec.Root -SkillPath $spec.SkillPath -ExpectedName $spec.SkillName
-    if ($EnsureDiscovery -or ($EnableIfNew -and -not $wasInstalled)) {
-        Ensure-Junction -Link $spec.Link -Target (Join-Path $spec.Root $spec.SkillPath)
-    }
     Write-Host "$($spec.Name) pin: $($spec.Commit)"
 }
 
-Write-Host 'Pinned UI skills reconciliation PASS.'
+Write-Host 'Pinned UI skill sources reconciliation PASS. Direct discovery remains disabled; use the HMS composite compiler.'
