@@ -7,6 +7,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$managerScript = Join-Path $repoRoot 'manager\HmsSuperpowersManager.ps1'
+if (-not (Test-Path -LiteralPath $managerScript)) {
+    throw "HMS Superpowers Manager script not found: $managerScript"
+}
+& $managerScript -SelfTest
+
 $requiredHmsSkills = @(
     'hms-superpowers',
     'hms-authority-loader',
