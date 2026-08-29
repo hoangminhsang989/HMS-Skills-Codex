@@ -17,12 +17,13 @@ $errors = [System.Collections.Generic.List[string]]::new()
 
 foreach ($file in $skillFiles) {
     $text = Get-Content -LiteralPath $file.FullName -Raw
-    if ($text -notmatch '(?s)^---\s*\r?\n(.*?)\r?\n---\s*\r?\n') {
+    $frontmatterMatch = [regex]::Match($text, '(?s)^---\s*\r?\n(.*?)\r?\n---\s*\r?\n')
+    if (-not $frontmatterMatch.Success) {
         $errors.Add("Missing YAML frontmatter: $($file.FullName)")
         continue
     }
 
-    $frontmatter = $Matches[1]
+    $frontmatter = $frontmatterMatch.Groups[1].Value
     $nameMatch = [regex]::Match($frontmatter, '(?m)^name:\s*([a-z0-9-]+)\s*$')
     $descMatch = [regex]::Match($frontmatter, '(?m)^description:\s*(.+?)\s*$')
 
@@ -72,9 +73,8 @@ foreach ($requiredName in $required) {
 }
 
 if ($errors.Count -gt 0) {
-    foreach ($errorText in $errors) { Write-Error $errorText }
-    exit 1
+    $message = "HMS skill validation failed:`n - " + ($errors -join "`n - ")
+    throw $message
 }
 
 Write-Host "PASS: validated $($skillFiles.Count) HMS skills."
-exit 0

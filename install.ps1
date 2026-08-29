@@ -85,7 +85,6 @@ if (-not $SkipSuperpowers) {
 
 $validator = Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1'
 & $validator
-if ($LASTEXITCODE -ne 0) { throw 'HMS skill validation failed.' }
 
 Write-Host 'HMS Skills Codex installation PASS.'
 Write-Host "HMS skills: $HmsLink"
