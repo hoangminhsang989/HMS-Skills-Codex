@@ -17,9 +17,18 @@ Preserve the global HMS authority order first. Within an authorized UI scope, us
 4. project `DESIGN.md`;
 5. approved design tokens and component mapping;
 6. current production UI as implementation evidence;
-7. upstream brainstorming, framework defaults, or agent visual preference.
+7. optional design-advisor skills such as `gpt-taste` and `impeccable`;
+8. upstream brainstorming, framework defaults, or agent visual preference.
 
 A lower source may fill a genuinely unspecified detail, but it must not silently override a higher source.
+
+## Optional design-advisor skills
+
+`gpt-taste` and `impeccable` may be used to improve composition, typography, hierarchy, interaction quality, motion, anti-pattern detection, accessibility, and polish when their advice fits the authorized product.
+
+They are **advisors, not authority**. Their generic style preferences, mandatory-looking defaults, layout recipes, motion rules, font preferences, page structures, or redesign instincts must be ignored whenever they conflict with owner instruction, the frozen HMS product definition, Penpot, `DESIGN.md`, approved tokens/component mapping, platform constraints, or existing behavior outside scope.
+
+For desktop engineering/productivity UI, do not import marketing-site conventions merely because a design-advisor skill recommends them. For web surfaces, do not apply animation, AIDA, oversized spacing, randomized layout, or dependency additions unless those choices are compatible with the authorized design and implementation scope.
 
 ## Discovery-first procedure
 
@@ -42,10 +51,10 @@ When Penpot is the declared canonical visual authority:
 - read the relevant Penpot file/page/frame/component before material visual implementation;
 - preserve approved component structure, tokens, spacing, typography, assets, and interaction states;
 - treat exported images or screenshots as evidence of the Penpot state, not as a replacement for the canonical editable design;
-- do not redesign an approved Penpot screen merely because an upstream skill or model prefers another style;
+- do not redesign an approved Penpot screen merely because an upstream or optional advisor skill prefers another style;
 - if Penpot access is required but unavailable, mark the UI authority as unavailable and stop the dependent mutation unless a higher authority explicitly permits a fallback.
 
-If no approved design exists and the owner asks for a new design, upstream brainstorming may be used for unresolved choices. Once approved, record the result in the project's canonical design authority before treating it as frozen implementation input.
+If no approved design exists and the owner asks for a new design, upstream brainstorming or optional design-advisor skills may be used for unresolved choices. Once approved, record the result in the project's canonical design authority before treating it as frozen implementation input.
 
 ## DESIGN.md, tokens, and component mapping
 
