@@ -156,25 +156,39 @@ function Assert-RegularCodeGraphBundle {
     if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$Label must not be a reparse point: $Path" }
 }
 
+function Add-CodeGraphBundleTreeRecords {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$LogicalPrefix,
+        [Parameter(Mandatory)]$Records
+    )
+    foreach ($item in @(Get-ChildItem -LiteralPath $Directory -Force -ErrorAction Stop)) {
+        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "CodeGraph bundle tree contains a reparse point: $($item.FullName)" }
+        $logical = if ([string]::IsNullOrEmpty($LogicalPrefix)) { [string]$item.Name } else { $LogicalPrefix + "/" + [string]$item.Name }
+        if ([bool]$item.PSIsContainer) {
+            Add-CodeGraphBundleTreeRecords -Directory $item.FullName -LogicalPrefix $logical -Records $Records
+            continue
+        }
+        if ([string]::IsNullOrEmpty($LogicalPrefix) -and [string]$item.Name -ceq $CodeGraphBundleMarkerName) { continue }
+        $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $Records.Add($logical + "`t" + $hash)
+    }
+}
+
 function Get-CodeGraphBundleTreeSha256 {
     param([Parameter(Mandatory)][string]$Path)
-    Assert-RegularCodeGraphBundle -Path $Path -Label 'CodeGraph bundle tree'
-    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\')
+    Assert-RegularCodeGraphBundle -Path $Path -Label "CodeGraph bundle tree"
+    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
     $records = New-Object System.Collections.Generic.List[string]
-    foreach ($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)) {
-        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "CodeGraph bundle tree contains a reparse point: $($item.FullName)" }
-        if ([bool]$item.PSIsContainer) { continue }
-        $relative = $item.FullName.Substring($root.Length).TrimStart('\').Replace('\','/')
-        if ([string]::Equals([IO.Path]::GetFullPath($item.FullName), [IO.Path]::GetFullPath((Join-Path $root $CodeGraphBundleMarkerName)), [StringComparison]::OrdinalIgnoreCase)) { continue }
-        $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-        $records.Add($relative + "`t" + $hash)
-    }
+    Add-CodeGraphBundleTreeRecords -Directory $root -LogicalPrefix "" -Records $records
     if ($records.Count -eq 0) { throw "CodeGraph bundle tree contains no authenticated files: $Path" }
-    $payload = [string]::Join("`n", @($records | Sort-Object))
+    $sorted = [string[]]@($records)
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    $payload = [string]::Join("`n", $sorted)
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
-        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant()
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace("-","").ToLowerInvariant()
     }
     finally { $sha.Dispose() }
 }
