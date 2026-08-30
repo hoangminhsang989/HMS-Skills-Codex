@@ -1,6 +1,9 @@
 [CmdletBinding()]
 param(
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [string]$TrustedRepoRoot,
+    [string]$TrustedHead,
+    [string]$TrustedBootstrapBlob
 )
 
 Set-StrictMode -Version Latest
@@ -9,10 +12,32 @@ $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 may decode UTF-8-without-BOM .ps1 files through the
 # active ANSI code page. Keep this public shim ASCII-only and decode reviewed
 # executable dependencies explicitly from verified byte snapshots.
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$head = ((& git -C $repoRoot rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
-if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') {
-    throw 'Model settings runtime trust boundary could not resolve a canonical HMS repository HEAD.'
+$trustedValues = @($TrustedRepoRoot,$TrustedHead,$TrustedBootstrapBlob)
+$trustedCount = @($trustedValues | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
+if ($trustedCount -notin @(0,3)) {
+    throw 'Model settings trusted bootstrap context is incomplete; repo root, HEAD, and bootstrap blob must be supplied together.'
+}
+$trustedBootstrap = $trustedCount -eq 3
+if ($trustedBootstrap) {
+    try { $repoRoot = (Resolve-Path -LiteralPath $TrustedRepoRoot -ErrorAction Stop).Path.TrimEnd('\') }
+    catch { throw "Model settings trusted repository root is invalid: $TrustedRepoRoot" }
+    $head = $TrustedHead.Trim().ToLowerInvariant()
+    if ($head -notmatch '^[0-9a-f]{40}$') { throw "Model settings trusted HEAD is invalid: $TrustedHead" }
+    $trustedBlob = $TrustedBootstrapBlob.Trim().ToLowerInvariant()
+    if ($trustedBlob -notmatch '^[0-9a-f]{40}$') { throw "Model settings trusted bootstrap blob is invalid: $TrustedBootstrapBlob" }
+    $expectedBootstrap = ((& git -C $repoRoot rev-parse "$head`:manager/HmsModelSettings.ps1" 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $expectedBootstrap -notmatch '^[0-9a-f]{40}$' -or $expectedBootstrap -cne $trustedBlob) {
+        throw 'Model settings trusted bootstrap context does not match the captured committed shim.'
+    }
+    $bootstrapType = ((& git -C $repoRoot cat-file -t $expectedBootstrap 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $bootstrapType -cne 'blob') { throw 'Model settings trusted bootstrap object is not a committed blob.' }
+}
+else {
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $head = ((& git -C $repoRoot rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') {
+        throw 'Model settings runtime trust boundary could not resolve a canonical HMS repository HEAD.'
+    }
 }
 
 function Get-LiteralGitBlobId {
@@ -42,7 +67,7 @@ function Read-ExactHeadFileBytes {
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Label is missing: $Path" }
-    if ([string]::IsNullOrWhiteSpace($RelativePath) -or $RelativePath.Contains('\\') -or $RelativePath.StartsWith('/') -or $RelativePath -match '^[A-Za-z]:') {
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or $RelativePath.Contains('\') -or $RelativePath.StartsWith('/') -or $RelativePath -match '^[A-Za-z]:') {
         throw "$Label repository-relative path is unsafe: $RelativePath"
     }
     foreach ($segment in @($RelativePath -split '/')) {
@@ -56,9 +81,6 @@ function Read-ExactHeadFileBytes {
 
     $stream = $null
     try {
-        # FileShare.Read blocks cooperating Windows writers/deleters during the snapshot.
-        # Security does not rely on that lock: the exact bytes read here are the same bytes
-        # hashed below and later decoded/executed, so pathname swaps after this read are inert.
         $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
         if ($stream.Length -gt [int]::MaxValue) { throw "$Label is too large to verify safely." }
         $bytes = New-Object byte[] ([int]$stream.Length)
@@ -81,10 +103,15 @@ function Read-ExactHeadFileBytes {
     return [pscustomobject]@{ Bytes=$bytes; ExpectedBlob=$expected; ActualBlob=$actual }
 }
 
-# Detect drift in the currently executing public shim. The implementation and
-# resolver are executed only from the exact byte snapshots returned below.
-$null = Read-ExactHeadFileBytes -Path $PSCommandPath -RelativePath 'manager/HmsModelSettings.ps1' -Label 'Model settings public shim'
-$implementationPath = Join-Path $PSScriptRoot 'HmsModelSettings.utf8.ps1'
+# Direct -File use authenticates its own pathname. When launched from the verified
+# Manager snapshot, the outer caller supplies the already authenticated bootstrap
+# blob and captured HEAD, so this ScriptBlock never needs to reopen its source path.
+if (-not $trustedBootstrap) {
+    if ([string]::IsNullOrWhiteSpace([string]$PSCommandPath)) { throw 'Model settings direct bootstrap has no file-backed path to authenticate.' }
+    $null = Read-ExactHeadFileBytes -Path $PSCommandPath -RelativePath 'manager/HmsModelSettings.ps1' -Label 'Model settings public shim'
+}
+
+$implementationPath = Join-Path $repoRoot 'manager\HmsModelSettings.utf8.ps1'
 $implementationRecord = Read-ExactHeadFileBytes -Path $implementationPath -RelativePath 'manager/HmsModelSettings.utf8.ps1' -Label 'Model settings UTF-8 implementation'
 $resolverPath = Join-Path $repoRoot 'scripts\Resolve-HmsModelRoute.ps1'
 $resolverRecord = Read-ExactHeadFileBytes -Path $resolverPath -RelativePath 'scripts/Resolve-HmsModelRoute.ps1' -Label 'Model route resolver'
@@ -125,9 +152,6 @@ $resolverReplacement = 'return & $__HmsVerifiedResolverScriptBlock_v1 -RiskClass
 $source = $source.Replace($resolverNeedle, $resolverReplacement)
 
 # Serialize the complete write/verify/rollback transaction across processes.
-# The reviewed UTF-8 implementation remains the authoritative write body; this
-# shim renames it and injects one fail-closed cross-process wrapper after the
-# top-level declarations so [CmdletBinding()]/param remain the first statements.
 $writeNeedle = 'function Write-ModelState {'
 $writeOccurrences = [regex]::Matches($source, [regex]::Escape($writeNeedle)).Count
 if ($writeOccurrences -ne 1) {
