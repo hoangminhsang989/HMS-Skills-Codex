@@ -92,6 +92,22 @@ public static class HmsOwnedTempNative
             Marshal.FreeHGlobal(buffer);
         }
     }
+
+    public static bool DeleteHmsOwnedDirectoryByHandle(SafeFileHandle handle, out int error)
+    {
+        IntPtr buffer = Marshal.AllocHGlobal(4);
+        try
+        {
+            Marshal.WriteInt32(buffer, 1); // FILE_DISPOSITION_INFO.DeleteFile = TRUE.
+            bool ok = SetFileInformationByHandle(handle, 4, buffer, 4); // FileDispositionInfo.
+            error = ok ? 0 : Marshal.GetLastWin32Error();
+            return ok;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
 }
 '@
 }
@@ -115,6 +131,7 @@ function Open-HmsOwnedDirectoryIdentityHandle {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][uint32]$ShareMode,
+        [uint32]$DesiredAccess = [uint32]0x00010000,
         [Parameter(Mandatory)][string]$Label
     )
 
@@ -124,7 +141,7 @@ function Open-HmsOwnedDirectoryIdentityHandle {
     # OPEN_REPARSE_POINT prevents silently following a replacement reparse point.
     $handle = [HmsOwnedTempNative]::CreateFileW(
         $Path,
-        [uint32]0x00010000,
+        $DesiredAccess,
         $ShareMode,
         [IntPtr]::Zero,
         [uint32]3,
@@ -160,7 +177,7 @@ function Get-HmsOwnedDirectoryIdentity {
         if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { throw "$Label non-Windows identity marker is missing: $Path" }
         return ('marker:' + ([IO.File]::ReadAllText($markerPath)).Trim())
     }
-    $opened = Open-HmsOwnedDirectoryIdentityHandle -Path $Path -ShareMode ([uint32]7) -Label $Label
+    $opened = Open-HmsOwnedDirectoryIdentityHandle -Path $Path -ShareMode ([uint32]7) -DesiredAccess ([uint32]0x00000080) -Label $Label
     try { return [string]$opened.Identity }
     finally { $opened.Handle.Dispose() }
 }
@@ -181,9 +198,10 @@ function New-HmsOwnedTempDirectory {
         return [pscustomobject]@{ Path=$path; Identity=('marker:' + $token); Guard=$null }
     }
 
-    # The handle is the durable object authority. A pathname can move or be replaced, but cleanup
-    # renames the exact object referenced by this DELETE-capable handle into its quarantine name.
-    $guarded = Open-HmsOwnedDirectoryIdentityHandle -Path $path -ShareMode ([uint32]7) -Label $Label
+    # Hold the root with DELETE access but without FILE_SHARE_DELETE for its entire lifetime.
+    # Non-cooperating processes cannot rename/replace the exact owned root while HMS is using it;
+    # cleanup itself renames and deletes that exact object through the same durable handle.
+    $guarded = Open-HmsOwnedDirectoryIdentityHandle -Path $path -ShareMode ([uint32]3) -Label $Label
     return [pscustomobject]@{ Path=$path; Identity=[string]$guarded.Identity; Guard=$guarded.Handle }
 }
 
@@ -212,17 +230,28 @@ function Remove-HmsOwnedTempDirectory {
         if ($postRenameIdentity -cne $expectedIdentity) { throw "$Label exact-object identity changed across handle rename." }
         $quarantineIdentity = Get-HmsOwnedDirectoryIdentity -Path $quarantine -Label "$Label quarantine"
         if ($quarantineIdentity -cne $expectedIdentity) { throw "$Label quarantine pathname does not reference the exact owned object." }
-        $Owned.Guard.Dispose(); $Owned.Guard=$null
-    }
-    else {
-        if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "$Label owned directory disappeared before cleanup: $path" }
-        $currentIdentity = Get-HmsOwnedDirectoryIdentity -Path $path -Label $Label
-        if ($currentIdentity -cne $expectedIdentity) { throw "$Label cleanup rejected a foreign pathname replacement. Expected identity $expectedIdentity, found ${currentIdentity}: $path" }
-        Rename-Item -LiteralPath $path -NewName (Split-Path -Leaf $quarantine) -ErrorAction Stop
-        $quarantineIdentity = Get-HmsOwnedDirectoryIdentity -Path $quarantine -Label "$Label quarantine"
-        if ($quarantineIdentity -cne $expectedIdentity) { throw "$Label quarantine identity changed across rename." }
+
+        # The original DELETE-capable guard deliberately remains live here with FILE_SHARE_DELETE denied.
+        # Recursive work may mutate children of this exact owned root, but another process cannot rename
+        # the root or substitute a foreign quarantine pathname between validation and deletion.
+        foreach ($child in @(Get-ChildItem -LiteralPath $quarantine -Force -ErrorAction Stop)) {
+            Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop
+        }
+        $deleteError = 0
+        if (-not [HmsOwnedTempNative]::DeleteHmsOwnedDirectoryByHandle($Owned.Guard,[ref]$deleteError)) {
+            throw "$Label exact-object directory delete-pending transition failed (Win32=$deleteError): $quarantine"
+        }
+        $Owned.Guard.Dispose(); $Owned.Guard = $null
+        if (Test-Path -LiteralPath $quarantine) { throw "$Label exact-object quarantine still exists after handle deletion: $quarantine" }
+        return
     }
 
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "$Label owned directory disappeared before cleanup: $path" }
+    $currentIdentity = Get-HmsOwnedDirectoryIdentity -Path $path -Label $Label
+    if ($currentIdentity -cne $expectedIdentity) { throw "$Label cleanup rejected a foreign pathname replacement. Expected identity $expectedIdentity, found ${currentIdentity}: $path" }
+    Rename-Item -LiteralPath $path -NewName (Split-Path -Leaf $quarantine) -ErrorAction Stop
+    $quarantineIdentity = Get-HmsOwnedDirectoryIdentity -Path $quarantine -Label "$Label quarantine"
+    if ($quarantineIdentity -cne $expectedIdentity) { throw "$Label quarantine identity changed across rename." }
     Remove-Item -LiteralPath $quarantine -Recurse -Force -ErrorAction Stop
     if (Test-Path -LiteralPath $quarantine) { throw "$Label quarantine still exists after cleanup: $quarantine" }
 }
@@ -248,6 +277,28 @@ function Get-ExpectedSupportBlob {
     $type = ((& git -C $repoRoot cat-file -t $value 2>$null) -join '').Trim().ToLowerInvariant()
     if ($LASTEXITCODE -ne 0 -or $type -cne 'blob') { throw "$Label committed support object is not a blob: $RelativePath" }
     return $value
+}
+
+function Open-VerifiedSupportReadGuard {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ExpectedBlob,
+        [Parameter(Mandatory)][string]$Label
+    )
+    $stream = $null
+    try {
+        # FileShare.Read allows execution/readers but denies mutation, rename, and replacement while
+        # the transformed runtime is using this exact authenticated support object.
+        $stream = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        $actual = ((& git -C $repoRoot hash-object --no-filters -- $Path 2>$null) -join '').Trim().ToLowerInvariant()
+        if ($LASTEXITCODE -ne 0 -or $actual -notmatch '^[0-9a-f]{40}$') { throw "$Label guarded support file could not be hashed." }
+        if ($actual -cne $ExpectedBlob) { throw "$Label guarded support bytes changed. Expected $ExpectedBlob, found $actual." }
+        return $stream
+    }
+    catch {
+        if ($null -ne $stream) { $stream.Dispose() }
+        throw
+    }
 }
 
 function Assert-NoHiddenIndexState {
@@ -416,6 +467,7 @@ if ($Superpowers) { Assert-NoHiddenIndexState -Path (Join-Path $env:USERPROFILE 
 $lifecycleOwnsBuildMutex = Test-ExactHeadLifecycleCaller
 $supportOwnedRoot = $null
 $supportRoot = $null
+$supportReadGuards = @()
 try {
     $expectedImplementation = Get-ExpectedSupportBlob -RelativePath $implementationRelative -Label 'Composite implementation'
     $expectedHelper = Get-ExpectedSupportBlob -RelativePath $helperRelative -Label 'Committed-copy helper'
@@ -424,7 +476,6 @@ try {
     $supportOwnedRoot = New-HmsOwnedTempDirectory -Prefix 'hms-builder-support-' -Label 'Composite builder support root'
     $supportRoot = [string]$supportOwnedRoot.Path
     $implementationPath = Join-Path $supportRoot 'Build-HmsCompositeSkill.impl.ps1'
-    $runtimeImplementationPath = Join-Path $supportRoot 'Build-HmsCompositeSkill.runtime.ps1'
     $committedCopyHelper = Join-Path $supportRoot 'Copy-HmsCommittedGitPath.ps1'
     $committedSuperLock = Join-Path $supportRoot 'superpowers.lock.json'
     $committedUiLock = Join-Path $supportRoot 'ui-skills.lock.json'
@@ -432,6 +483,10 @@ try {
     Write-SupportBlobExact -BlobSha $expectedHelper -RelativePath $helperRelative -Destination $committedCopyHelper -Label 'Committed-copy helper'
     Write-SupportBlobExact -BlobSha $expectedSuperLock -RelativePath $superLockRelative -Destination $committedSuperLock -Label 'Superpowers lock'
     Write-SupportBlobExact -BlobSha $expectedUiLock -RelativePath $uiLockRelative -Destination $committedUiLock -Label 'UI skills lock'
+    $supportReadGuards += Open-VerifiedSupportReadGuard -Path $implementationPath -ExpectedBlob $expectedImplementation -Label 'Composite implementation'
+    $supportReadGuards += Open-VerifiedSupportReadGuard -Path $committedCopyHelper -ExpectedBlob $expectedHelper -Label 'Committed-copy helper'
+    $supportReadGuards += Open-VerifiedSupportReadGuard -Path $committedSuperLock -ExpectedBlob $expectedSuperLock -Label 'Superpowers lock'
+    $supportReadGuards += Open-VerifiedSupportReadGuard -Path $committedUiLock -ExpectedBlob $expectedUiLock -Label 'UI skills lock'
 
     $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
     try { $source = [IO.File]::ReadAllText($implementationPath, $utf8Strict) }
@@ -521,17 +576,18 @@ try {
         $source = Replace-RegexRequiredWhen -Text $source -Pattern $implementationDisposePattern -Replacement '    if ($null -ne $buildMutex) { $buildMutex.Dispose() }' -Required $true -Label 'Lifecycle-owned implementation composite mutex disposal'
     }
 
-    # Execute transformed support as a real script file. Direct committed implementation file execution
-    # is the independently proven Windows liveness path; do not introduce a dynamic ScriptBlock boundary.
-    [IO.File]::WriteAllText($runtimeImplementationPath, $source, $utf8Strict)
+    # Parse and execute the exact transformed string already held in memory. There is no runtime
+    # pathname to reopen after validation, so a non-cooperating replacement cannot cross a parse/use gap.
     $runtimeTokens = $null
     $runtimeParseErrors = $null
-    [System.Management.Automation.Language.Parser]::ParseFile($runtimeImplementationPath,[ref]$runtimeTokens,[ref]$runtimeParseErrors) | Out-Null
+    [System.Management.Automation.Language.Parser]::ParseInput($source,[ref]$runtimeTokens,[ref]$runtimeParseErrors) | Out-Null
     if (@($runtimeParseErrors).Count -ne 0) {
-        throw "Composite runtime implementation failed to parse after deterministic trust-boundary binding: $((@($runtimeParseErrors) | ForEach-Object { $_.Message }) -join ' | ')"
+        throw "Composite in-memory runtime implementation failed to parse after deterministic trust-boundary binding: $((@($runtimeParseErrors) | ForEach-Object { $_.Message }) -join ' | ')"
     }
+    try { $runtimeImplementation = [ScriptBlock]::Create($source) }
+    catch { throw "Composite in-memory runtime ScriptBlock creation failed: $($_.Exception.Message)" }
 
-    & $runtimeImplementationPath -InstallRoot $InstallRoot -OutputRoot $OutputRoot -SkillsRoot $SkillsRoot -Hms $Hms -Superpowers $Superpowers -Taste $Taste -Impeccable $Impeccable
+    & $runtimeImplementation -InstallRoot $InstallRoot -OutputRoot $OutputRoot -SkillsRoot $SkillsRoot -Hms $Hms -Superpowers $Superpowers -Taste $Taste -Impeccable $Impeccable
 
     $generatedSkill = Join-Path (Join-Path $OutputRoot 'hms-superpowers') 'SKILL.md'
     if (-not (Test-Path -LiteralPath $generatedSkill)) { throw "Generated composite SKILL.md is missing after build: $generatedSkill" }
@@ -545,6 +601,9 @@ try {
     Write-Host "PASS: public bootstrap, file-executed runtime implementation, committed-copy helper, and lock inputs are bound to HMS HEAD $head; support bytes are isolated exact-HEAD archive transports with literal blob verification, runtime ownership is single-lock serialized, and authority precedence is pinned below HMS checkpoint/safety/model-floor gates."
 }
 finally {
+    foreach ($guard in @($supportReadGuards)) {
+        if ($null -ne $guard) { try { $guard.Dispose() } catch { } }
+    }
     if ($null -ne $supportOwnedRoot) {
         Remove-HmsOwnedTempDirectory -Owned $supportOwnedRoot -Label 'Composite builder support root'
     }

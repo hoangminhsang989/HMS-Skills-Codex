@@ -22,6 +22,8 @@ foreach ($relative in @('scripts\Build-HmsCompositeSkill.ps1','scripts\Copy-HmsC
         'function Remove-HmsOwnedTempDirectory',
         'SetFileInformationByHandle',
         'RenameHmsOwnedDirectoryByHandle',
+        'DeleteHmsOwnedDirectoryByHandle',
+        'Open-HmsOwnedDirectoryIdentityHandle -Path $path -ShareMode ([uint32]3)',
         '[uint32]0x00010000',
         'minimumStructSize = IntPtr.Size == 8 ? 24 : 16',
         'nameOffset + nameBytes.Length + 2',
@@ -52,48 +54,46 @@ $helperPath = Join-Path $env:TEMP ('hms-owned-temp-helper-' + [guid]::NewGuid().
 [IO.File]::WriteAllText($helperPath,$source.Substring($start,$end-$start),(New-Object Text.UTF8Encoding($false)))
 . $helperPath
 
-# Case A: a non-cooperating process renames the exact object and puts foreign data at the old pathname.
-# Cleanup must follow the exact live handle, delete only the original object, and preserve the replacement.
+# Case A: the durable root handle denies FILE_SHARE_DELETE for the entire active lifetime.
+# A non-cooperating process must be unable to rename/replace the exact root before cleanup.
 $ownedA = New-HmsOwnedTempDirectory -Prefix 'hms-owned-temp-active-' -Label 'exact-handle regression'
 $originalA = [string]$ownedA.Path
 $movedA = $originalA + '-moved-by-foreign-process'
-$foreignSentinelA = Join-Path $originalA 'FOREIGN-PRESERVE.txt'
 $jobA = $null
 try {
     if ($ownedA.Guard.IsClosed -or $ownedA.Guard.IsInvalid) { throw 'Production exact-object handle is not live before race.' }
     $jobA = Start-Job -ScriptBlock {
         param($Original,$Moved)
         $ErrorActionPreference='Stop'
-        try {
-            Rename-Item -LiteralPath $Original -NewName (Split-Path -Leaf $Moved) -ErrorAction Stop
-            [pscustomobject]@{ Renamed=$true; Error='' }
-        }
-        catch {
-            [pscustomobject]@{ Renamed=$false; Error=$_.Exception.Message }
-        }
+        try { Rename-Item -LiteralPath $Original -NewName (Split-Path -Leaf $Moved) -ErrorAction Stop; [pscustomobject]@{Renamed=$true;Error=''} }
+        catch { [pscustomobject]@{Renamed=$false;Error=$_.Exception.Message} }
     } -ArgumentList $originalA,$movedA
     $null = Wait-Job -Job $jobA -Timeout 20
     if ($jobA.State -ne 'Completed') { throw "Cross-process rename probe did not complete. State=$($jobA.State)" }
     $probeA = Receive-Job -Job $jobA -ErrorAction Stop
-    if (-not [bool]$probeA.Renamed) { throw "Threat-model setup could not rename the owned root from a separate process: $($probeA.Error)" }
-    if (Test-Path -LiteralPath $originalA) { throw 'Original pathname unexpectedly remained occupied after hostile rename setup.' }
-    if (-not (Test-Path -LiteralPath $movedA -PathType Container)) { throw 'Hostile rename setup lost the exact owned directory.' }
-
-    New-Item -ItemType Directory -Path $originalA -ErrorAction Stop | Out-Null
-    [IO.File]::WriteAllText($foreignSentinelA,'foreign replacement must survive',(New-Object Text.UTF8Encoding($false)))
-
+    if ([bool]$probeA.Renamed) { throw 'Foreign process renamed the owned root despite the no-FILE_SHARE_DELETE guard.' }
+    if (-not (Test-Path -LiteralPath $originalA -PathType Container)) { throw 'Owned root disappeared while exact guard was active.' }
+    if (Test-Path -LiteralPath $movedA) { throw 'Hostile rename unexpectedly created a moved owned-root pathname.' }
     Remove-HmsOwnedTempDirectory -Owned $ownedA -Label 'exact-handle regression'
-    if (-not (Test-Path -LiteralPath $foreignSentinelA -PathType Leaf)) { throw 'Exact-handle cleanup deleted the foreign replacement at the original pathname.' }
-    if (Test-Path -LiteralPath $movedA) { throw 'Exact owned object remained at its adversarially moved pathname after cleanup.' }
-    $leftA = @(Get-ChildItem -LiteralPath (Split-Path -Parent $originalA) -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.hms-owned-temp-quarantine-*' })
-    if ($leftA.Count -ne 0) { throw 'Exact-handle cleanup left quarantine residue.' }
+    if (Test-Path -LiteralPath $originalA) { throw 'Exact owned root remained after handle-bound cleanup.' }
 }
 finally {
     if ($null -ne $jobA) { Remove-Job -Job $jobA -Force -ErrorAction SilentlyContinue }
     if ($null -ne $ownedA.Guard) { $ownedA.Guard.Dispose(); $ownedA.Guard=$null }
     foreach ($p in @($originalA,$movedA)) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } }
 }
-Write-Host 'PASS: exact-handle cleanup deleted the exact original object and preserved a foreign original-path replacement.'
+Write-Host 'PASS: active owned-temp root denies hostile rename/replacement and is deleted through its exact handle.'
+
+$removeFunction = [regex]::Match($source,'(?s)function Remove-HmsOwnedTempDirectory \{.*?\n\}\n\n\n\$repoRoot').Value
+if ([string]::IsNullOrWhiteSpace($removeFunction)) { throw 'Could not isolate owned-temp removal function for destructive-order proof.' }
+$deletePos = $removeFunction.IndexOf('DeleteHmsOwnedDirectoryByHandle')
+$disposePos = $removeFunction.IndexOf('$Owned.Guard.Dispose()')
+$rootRemovePos = $removeFunction.IndexOf('Remove-Item -LiteralPath $quarantine -Recurse -Force')
+if ($deletePos -lt 0 -or $disposePos -lt 0 -or $deletePos -ge $disposePos) { throw 'Owned-temp exact handle is not retained through the root delete-pending transition.' }
+$windowsReturnPos = $removeFunction.IndexOf('        return',$disposePos)
+if ($windowsReturnPos -lt 0) { throw 'Windows owned-temp exact-handle branch has no terminal return before the non-Windows fallback.' }
+if ($rootRemovePos -ge 0 -and $rootRemovePos -lt $windowsReturnPos) { throw 'Windows owned-temp cleanup still contains pathname-recursive root deletion before its exact-handle return.' }
+Write-Host 'PASS: exact-object guard remains live until the directory handle enters delete-pending state.'
 
 # Case B: loss of exact-object authority must fail closed rather than fall back to pathname deletion.
 $ownedB = New-HmsOwnedTempDirectory -Prefix 'hms-owned-temp-lost-handle-' -Label 'lost-handle regression'

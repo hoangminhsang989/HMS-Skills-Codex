@@ -11,6 +11,149 @@ $ResolverPath = Join-Path $RepoRoot 'scripts\Resolve-HmsModelRoute.ps1'
 $SettingsRoot = Join-Path $env:USERPROFILE '.codex\hms-composite'
 $SettingsPath = Join-Path $SettingsRoot 'model-settings.json'
 
+if (-not ('HmsModelSettingsNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class HmsModelSettingsNative
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILETIME_PARTS { public uint Low; public uint High; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public FILETIME_PARTS CreationTime;
+        public FILETIME_PARTS LastAccessTime;
+        public FILETIME_PARTS LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr sa, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetFileInformationByHandle(SafeFileHandle hFile, out BY_HANDLE_FILE_INFORMATION info);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileInformationByHandle(SafeFileHandle hFile, int infoClass, IntPtr info, uint size);
+
+    public static SafeFileHandle OpenLockedModelSettingsFile(string path, out int error)
+    {
+        // GENERIC_READ | DELETE; share READ only. Existing content can be read by HMS, but no
+        // cooperating or non-cooperating writer can mutate/rename/replace this exact object.
+        SafeFileHandle h = CreateFileW(path, 0x80010000u, 0x00000001u, IntPtr.Zero, 3u, 0x00200000u, IntPtr.Zero);
+        error = h.IsInvalid ? Marshal.GetLastWin32Error() : 0;
+        return h;
+    }
+
+    public static bool RenameHmsModelSettingsFileByHandle(SafeFileHandle handle, string destination, out int error)
+    {
+        byte[] nameBytes = System.Text.Encoding.Unicode.GetBytes(destination);
+        int rootOffset = IntPtr.Size == 8 ? 8 : 4;
+        int lengthOffset = IntPtr.Size == 8 ? 16 : 8;
+        int nameOffset = IntPtr.Size == 8 ? 20 : 12;
+        int minimumStructSize = IntPtr.Size == 8 ? 24 : 16;
+        int size = Math.Max(minimumStructSize, nameOffset + nameBytes.Length + 2);
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try
+        {
+            for (int i = 0; i < size; i++) Marshal.WriteByte(buffer, i, 0);
+            Marshal.WriteByte(buffer, 0, 0); // ReplaceIfExists = FALSE.
+            Marshal.WriteIntPtr(buffer, rootOffset, IntPtr.Zero);
+            Marshal.WriteInt32(buffer, lengthOffset, nameBytes.Length);
+            Marshal.Copy(nameBytes, 0, IntPtr.Add(buffer, nameOffset), nameBytes.Length);
+            bool ok = SetFileInformationByHandle(handle, 3, buffer, (uint)size);
+            error = ok ? 0 : Marshal.GetLastWin32Error();
+            return ok;
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    public static bool DeleteHmsModelSettingsFileByHandle(SafeFileHandle handle, out int error)
+    {
+        IntPtr buffer = Marshal.AllocHGlobal(4);
+        try
+        {
+            Marshal.WriteInt32(buffer, 1);
+            bool ok = SetFileInformationByHandle(handle, 4, buffer, 4);
+            error = ok ? 0 : Marshal.GetLastWin32Error();
+            return ok;
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+    }
+}
+'@
+}
+
+function Get-HmsModelSettingsIdentityFromHandle {
+    param([Parameter(Mandatory)]$Handle,[Parameter(Mandatory)][string]$Label)
+    $info = New-Object 'HmsModelSettingsNative+BY_HANDLE_FILE_INFORMATION'
+    if (-not [HmsModelSettingsNative]::GetFileInformationByHandle($Handle,[ref]$info)) {
+        $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "$Label could not read exact settings-file identity (Win32=$code)."
+    }
+    if (($info.FileAttributes -band [uint32]0x10) -ne 0 -or ($info.FileAttributes -band [uint32]0x400) -ne 0) {
+        throw "$Label exact settings object must be a regular non-reparse file."
+    }
+    return ([string]$info.VolumeSerialNumber + ':' + [string]$info.FileIndexHigh + ':' + [string]$info.FileIndexLow)
+}
+
+function Open-HmsModelSettingsFileGuard {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label)
+    if ($env:OS -cne 'Windows_NT') { throw "$Label exact settings guard is Windows-specific: $Path" }
+    $errorCode = 0
+    $handle = [HmsModelSettingsNative]::OpenLockedModelSettingsFile($Path,[ref]$errorCode)
+    if ($null -eq $handle -or $handle.IsInvalid) {
+        if ($null -ne $handle) { $handle.Dispose() }
+        throw "$Label could not lock the exact settings file for read+DELETE without write/delete sharing (Win32=$errorCode): $Path"
+    }
+    try {
+        $identity = Get-HmsModelSettingsIdentityFromHandle -Handle $handle -Label $Label
+        return [pscustomobject]@{ Handle=$handle; Identity=$identity; Path=$Path }
+    }
+    catch { $handle.Dispose(); throw }
+}
+
+function Move-HmsModelSettingsFileGuard {
+    param(
+        [Parameter(Mandatory)]$Guard,
+        [Parameter(Mandatory)][string]$SourcePath,
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [Parameter(Mandatory)][string]$Label
+    )
+    if ($null -eq $Guard.Handle -or $Guard.Handle.IsClosed -or $Guard.Handle.IsInvalid) { throw "$Label exact settings guard is unavailable." }
+    $before = Get-HmsModelSettingsIdentityFromHandle -Handle $Guard.Handle -Label $Label
+    if ($before -cne [string]$Guard.Identity) { throw "$Label exact settings identity changed before handle rename." }
+    if (Test-Path -LiteralPath $DestinationPath) { throw "$Label destination became occupied before exact handle rename: $DestinationPath" }
+    $errorCode = 0
+    if (-not [HmsModelSettingsNative]::RenameHmsModelSettingsFileByHandle($Guard.Handle,$DestinationPath,[ref]$errorCode)) {
+        throw "$Label exact handle rename failed (Win32=$errorCode): $SourcePath -> $DestinationPath"
+    }
+    $after = Get-HmsModelSettingsIdentityFromHandle -Handle $Guard.Handle -Label "$Label post-rename"
+    if ($after -cne [string]$Guard.Identity) { throw "$Label exact settings identity changed across handle rename." }
+    $Guard.Path = $DestinationPath
+}
+
+function Remove-HmsModelSettingsFileGuard {
+    param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Label)
+    if ($null -eq $Guard.Handle -or $Guard.Handle.IsClosed -or $Guard.Handle.IsInvalid) { throw "$Label exact settings guard is unavailable for deletion." }
+    $identity = Get-HmsModelSettingsIdentityFromHandle -Handle $Guard.Handle -Label $Label
+    if ($identity -cne [string]$Guard.Identity) { throw "$Label exact settings identity changed before deletion." }
+    $errorCode = 0
+    if (-not [HmsModelSettingsNative]::DeleteHmsModelSettingsFileByHandle($Guard.Handle,[ref]$errorCode)) {
+        throw "$Label exact settings-file delete-pending transition failed (Win32=$errorCode): $($Guard.Path)"
+    }
+    $Guard.Handle.Dispose(); $Guard.Handle = $null
+}
+
 $ModelDefinitions = @(
     [pscustomobject]@{
         Key = 'luna'
@@ -91,7 +234,7 @@ function Assert-RegularSettingsFile {
     }
 }
 
-function Read-ModelState {
+function Read-ModelState-Unserialized {
     param([string]$Path = $SettingsPath)
 
     if (-not (Test-Path -LiteralPath $Path)) { return New-DefaultModelState }
@@ -116,6 +259,23 @@ function Read-ModelState {
     return $state
 }
 
+function Read-ModelState {
+    param([string]$Path = $SettingsPath)
+    $settingsMutexName = 'Local\HMS-Skills-Codex-ModelSettings-v1'
+    $settingsMutex = New-Object System.Threading.Mutex($false,$settingsMutexName)
+    $owned = $false
+    try {
+        try { $owned = $settingsMutex.WaitOne([TimeSpan]::FromSeconds(120)) }
+        catch [System.Threading.AbandonedMutexException] { $owned = $true }
+        if (-not $owned) { throw "Timed out waiting for model settings reader lock: $settingsMutexName" }
+        return Read-ModelState-Unserialized -Path $Path
+    }
+    finally {
+        if ($owned) { try { $settingsMutex.ReleaseMutex() } catch { } }
+        $settingsMutex.Dispose()
+    }
+}
+
 function Write-ModelState {
     param(
         [Parameter(Mandatory)]$State,
@@ -126,61 +286,88 @@ function Write-ModelState {
     $parent = Split-Path -Parent $Path
     New-Item -ItemType Directory -Force -Path $parent | Out-Null
 
-    $existingItem = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    $hadExisting = $null -ne $existingItem
-    if ($hadExisting) {
-        Assert-RegularSettingsFile -Path $Path
-        $null = Read-ModelState -Path $Path
-    }
-
     $settings = Convert-StateToSettingsObject -State $State
     $json = $settings | ConvertTo-Json -Depth 6
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     $temp = Join-Path $parent ('.model-settings-' + [guid]::NewGuid().ToString('N') + '.tmp')
-    $backup = Join-Path $parent ('.model-settings-' + [guid]::NewGuid().ToString('N') + '.bak')
-    $rollbackDiscard = Join-Path $parent ('.model-settings-' + [guid]::NewGuid().ToString('N') + '.rollback')
+    $previousReserved = Join-Path $parent ('.model-settings-' + [guid]::NewGuid().ToString('N') + '.previous')
+    $candidateDiscard = Join-Path $parent ('.model-settings-' + [guid]::NewGuid().ToString('N') + '.discard')
+    $existingGuard = $null
+    $candidateGuard = $null
+    $hadExisting = $false
+    $previousMoved = $false
+    $candidatePublished = $false
 
     try {
-        [IO.File]::WriteAllText($temp, $json, $utf8)
-        $null = Read-ModelState -Path $temp
+        if (Test-Path -LiteralPath $Path) {
+            $existingGuard = Open-HmsModelSettingsFileGuard -Path $Path -Label 'Existing model settings'
+            $null = Read-ModelState-Unserialized -Path $Path
+            $hadExisting = $true
+        }
+
+        [IO.File]::WriteAllText($temp,$json,$utf8)
+        $candidateGuard = Open-HmsModelSettingsFileGuard -Path $temp -Label 'Candidate model settings'
+        $actualCandidateText = [IO.File]::ReadAllText($temp,$utf8)
+        if ($actualCandidateText -cne $json) { throw 'Candidate model settings bytes changed before publication.' }
+        $null = Read-ModelState-Unserialized -Path $temp
 
         if ($hadExisting) {
-            # File.Replace is atomic on the same volume: readers see either the old
-            # canonical file or the new one, never an absent canonical path.
-            [IO.File]::Replace($temp, $Path, $backup, $true)
-        }
-        else {
-            # First creation has no prior persisted policy to preserve. Same-directory
-            # File.Move publishes the complete file in one namespace operation.
-            [IO.File]::Move($temp, $Path)
+            Move-HmsModelSettingsFileGuard -Guard $existingGuard -SourcePath $Path -DestinationPath $previousReserved -Label 'Previous model settings reservation'
+            $previousMoved = $true
         }
 
+        Move-HmsModelSettingsFileGuard -Guard $candidateGuard -SourcePath $temp -DestinationPath $Path -Label 'Candidate model settings publication'
+        $candidatePublished = $true
+
+        $verified = Read-ModelState-Unserialized -Path $Path
+        foreach ($key in @('luna','terra','sol')) {
+            if ($verified[$key] -ne $State[$key]) { throw "Model setting verification mismatch for '$key'." }
+        }
+
+        if ($hadExisting) {
+            Remove-HmsModelSettingsFileGuard -Guard $existingGuard -Label 'Previous model settings disposal'
+            $existingGuard = $null
+            $previousMoved = $false
+        }
+        $candidateGuard.Handle.Dispose(); $candidateGuard.Handle = $null; $candidateGuard = $null
+    }
+    catch {
+        $writeError = $_
+        $rollbackErrors = @()
         try {
-            $verified = Read-ModelState -Path $Path
-            foreach ($key in @('luna','terra','sol')) {
-                if ($verified[$key] -ne $State[$key]) { throw "Model setting verification mismatch for '$key'." }
+            if ($null -ne $candidateGuard) {
+                if ($candidatePublished) {
+                    Move-HmsModelSettingsFileGuard -Guard $candidateGuard -SourcePath $Path -DestinationPath $candidateDiscard -Label 'Candidate model settings rollback reservation'
+                }
+                Remove-HmsModelSettingsFileGuard -Guard $candidateGuard -Label 'Candidate model settings rollback disposal'
+                $candidateGuard = $null
+                $candidatePublished = $false
             }
         }
-        catch {
-            $verifyError = $_
-            if ($hadExisting -and (Test-Path -LiteralPath $backup)) {
-                if (Test-Path -LiteralPath $Path) {
-                    [IO.File]::Replace($backup, $Path, $rollbackDiscard, $true)
-                }
-                else {
-                    [IO.File]::Move($backup, $Path)
-                }
+        catch { $rollbackErrors += "Candidate rollback failed: $($_.Exception.Message)" }
+
+        if ($hadExisting -and $previousMoved -and $null -ne $existingGuard) {
+            try {
+                if (Test-Path -LiteralPath $Path) { throw "Canonical model settings pathname became occupied during rollback: $Path" }
+                Move-HmsModelSettingsFileGuard -Guard $existingGuard -SourcePath $previousReserved -DestinationPath $Path -Label 'Previous model settings restoration'
+                $null = Read-ModelState-Unserialized -Path $Path
+                $existingGuard.Handle.Dispose(); $existingGuard.Handle = $null; $existingGuard = $null
+                $previousMoved = $false
             }
-            elseif (-not $hadExisting -and (Test-Path -LiteralPath $Path)) {
-                Remove-Item -LiteralPath $Path -Force
-            }
-            throw $verifyError
+            catch { $rollbackErrors += "Previous settings restoration failed: $($_.Exception.Message)" }
         }
+
+        if ($rollbackErrors.Count -gt 0) {
+            throw "Model settings write failed and exact-object rollback was incomplete. Original: $($writeError.Exception.Message). Rollback: $($rollbackErrors -join ' | ')"
+        }
+        throw $writeError
     }
     finally {
-        foreach ($cleanup in @($temp,$backup,$rollbackDiscard)) {
-            if (Test-Path -LiteralPath $cleanup) { Remove-Item -LiteralPath $cleanup -Force }
+        foreach ($guard in @($candidateGuard,$existingGuard)) {
+            if ($null -ne $guard -and $null -ne $guard.Handle) { try { $guard.Handle.Dispose() } catch { } }
         }
+        # Never pathname-delete temp/reservation/discard artifacts here. If exact-handle authority was
+        # lost, residue is safer than deleting an unrelated replacement; normal success removes all owned artifacts.
     }
 }
 

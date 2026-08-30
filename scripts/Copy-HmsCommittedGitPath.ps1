@@ -88,6 +88,22 @@ public static class HmsOwnedTempNative
             Marshal.FreeHGlobal(buffer);
         }
     }
+
+    public static bool DeleteHmsOwnedDirectoryByHandle(SafeFileHandle handle, out int error)
+    {
+        IntPtr buffer = Marshal.AllocHGlobal(4);
+        try
+        {
+            Marshal.WriteInt32(buffer, 1); // FILE_DISPOSITION_INFO.DeleteFile = TRUE.
+            bool ok = SetFileInformationByHandle(handle, 4, buffer, 4); // FileDispositionInfo.
+            error = ok ? 0 : Marshal.GetLastWin32Error();
+            return ok;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
 }
 '@
 }
@@ -111,6 +127,7 @@ function Open-HmsOwnedDirectoryIdentityHandle {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][uint32]$ShareMode,
+        [uint32]$DesiredAccess = [uint32]0x00010000,
         [Parameter(Mandatory)][string]$Label
     )
 
@@ -120,7 +137,7 @@ function Open-HmsOwnedDirectoryIdentityHandle {
     # OPEN_REPARSE_POINT prevents silently following a replacement reparse point.
     $handle = [HmsOwnedTempNative]::CreateFileW(
         $Path,
-        [uint32]0x00010000,
+        $DesiredAccess,
         $ShareMode,
         [IntPtr]::Zero,
         [uint32]3,
@@ -156,7 +173,7 @@ function Get-HmsOwnedDirectoryIdentity {
         if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) { throw "$Label non-Windows identity marker is missing: $Path" }
         return ('marker:' + ([IO.File]::ReadAllText($markerPath)).Trim())
     }
-    $opened = Open-HmsOwnedDirectoryIdentityHandle -Path $Path -ShareMode ([uint32]7) -Label $Label
+    $opened = Open-HmsOwnedDirectoryIdentityHandle -Path $Path -ShareMode ([uint32]7) -DesiredAccess ([uint32]0x00000080) -Label $Label
     try { return [string]$opened.Identity }
     finally { $opened.Handle.Dispose() }
 }
@@ -177,9 +194,10 @@ function New-HmsOwnedTempDirectory {
         return [pscustomobject]@{ Path=$path; Identity=('marker:' + $token); Guard=$null }
     }
 
-    # The handle is the durable object authority. A pathname can move or be replaced, but cleanup
-    # renames the exact object referenced by this DELETE-capable handle into its quarantine name.
-    $guarded = Open-HmsOwnedDirectoryIdentityHandle -Path $path -ShareMode ([uint32]7) -Label $Label
+    # Hold the root with DELETE access but without FILE_SHARE_DELETE for its entire lifetime.
+    # Non-cooperating processes cannot rename/replace the exact owned root while HMS is using it;
+    # cleanup itself renames and deletes that exact object through the same durable handle.
+    $guarded = Open-HmsOwnedDirectoryIdentityHandle -Path $path -ShareMode ([uint32]3) -Label $Label
     return [pscustomobject]@{ Path=$path; Identity=[string]$guarded.Identity; Guard=$guarded.Handle }
 }
 
@@ -208,17 +226,28 @@ function Remove-HmsOwnedTempDirectory {
         if ($postRenameIdentity -cne $expectedIdentity) { throw "$Label exact-object identity changed across handle rename." }
         $quarantineIdentity = Get-HmsOwnedDirectoryIdentity -Path $quarantine -Label "$Label quarantine"
         if ($quarantineIdentity -cne $expectedIdentity) { throw "$Label quarantine pathname does not reference the exact owned object." }
-        $Owned.Guard.Dispose(); $Owned.Guard=$null
-    }
-    else {
-        if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "$Label owned directory disappeared before cleanup: $path" }
-        $currentIdentity = Get-HmsOwnedDirectoryIdentity -Path $path -Label $Label
-        if ($currentIdentity -cne $expectedIdentity) { throw "$Label cleanup rejected a foreign pathname replacement. Expected identity $expectedIdentity, found ${currentIdentity}: $path" }
-        Rename-Item -LiteralPath $path -NewName (Split-Path -Leaf $quarantine) -ErrorAction Stop
-        $quarantineIdentity = Get-HmsOwnedDirectoryIdentity -Path $quarantine -Label "$Label quarantine"
-        if ($quarantineIdentity -cne $expectedIdentity) { throw "$Label quarantine identity changed across rename." }
+
+        # The original DELETE-capable guard deliberately remains live here with FILE_SHARE_DELETE denied.
+        # Recursive work may mutate children of this exact owned root, but another process cannot rename
+        # the root or substitute a foreign quarantine pathname between validation and deletion.
+        foreach ($child in @(Get-ChildItem -LiteralPath $quarantine -Force -ErrorAction Stop)) {
+            Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop
+        }
+        $deleteError = 0
+        if (-not [HmsOwnedTempNative]::DeleteHmsOwnedDirectoryByHandle($Owned.Guard,[ref]$deleteError)) {
+            throw "$Label exact-object directory delete-pending transition failed (Win32=$deleteError): $quarantine"
+        }
+        $Owned.Guard.Dispose(); $Owned.Guard = $null
+        if (Test-Path -LiteralPath $quarantine) { throw "$Label exact-object quarantine still exists after handle deletion: $quarantine" }
+        return
     }
 
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "$Label owned directory disappeared before cleanup: $path" }
+    $currentIdentity = Get-HmsOwnedDirectoryIdentity -Path $path -Label $Label
+    if ($currentIdentity -cne $expectedIdentity) { throw "$Label cleanup rejected a foreign pathname replacement. Expected identity $expectedIdentity, found ${currentIdentity}: $path" }
+    Rename-Item -LiteralPath $path -NewName (Split-Path -Leaf $quarantine) -ErrorAction Stop
+    $quarantineIdentity = Get-HmsOwnedDirectoryIdentity -Path $quarantine -Label "$Label quarantine"
+    if ($quarantineIdentity -cne $expectedIdentity) { throw "$Label quarantine identity changed across rename." }
     Remove-Item -LiteralPath $quarantine -Recurse -Force -ErrorAction Stop
     if (Test-Path -LiteralPath $quarantine) { throw "$Label quarantine still exists after cleanup: $quarantine" }
 }

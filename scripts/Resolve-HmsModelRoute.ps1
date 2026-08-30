@@ -151,7 +151,19 @@ $floorTable = @{
     }
 }
 
-$settings = Read-Settings -Path $SettingsPath
+$settingsMutexName = 'Local\HMS-Skills-Codex-ModelSettings-v1'
+$settingsMutex = New-Object System.Threading.Mutex($false,$settingsMutexName)
+$settingsMutexOwned = $false
+try {
+    try { $settingsMutexOwned = $settingsMutex.WaitOne([TimeSpan]::FromSeconds(120)) }
+    catch [System.Threading.AbandonedMutexException] { $settingsMutexOwned = $true }
+    if (-not $settingsMutexOwned) { throw "Timed out waiting for model settings reader lock: $settingsMutexName" }
+    $settings = Read-Settings -Path $SettingsPath
+}
+finally {
+    if ($settingsMutexOwned) { try { $settingsMutex.ReleaseMutex() } catch { } }
+    $settingsMutex.Dispose()
+}
 $route = $floorTable[$RequiredFloor]
 $enabled = @()
 foreach ($name in @('luna','terra','sol')) {
