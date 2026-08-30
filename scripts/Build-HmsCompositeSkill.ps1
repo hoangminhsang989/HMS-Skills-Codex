@@ -171,16 +171,18 @@ try {
         return $Text.Replace($Needle, $Replacement)
     }
 
-    function Replace-RegexAtMostOnce {
+    function Replace-RegexRequiredWhen {
         param(
             [Parameter(Mandatory)][string]$Text,
             [Parameter(Mandatory)][string]$Pattern,
             [Parameter(Mandatory)][string]$Replacement,
+            [Parameter(Mandatory)][bool]$Required,
             [Parameter(Mandatory)][string]$Label
         )
         $regex = New-Object System.Text.RegularExpressions.Regex($Pattern,[System.Text.RegularExpressions.RegexOptions]::Multiline)
         $count = $regex.Matches($Text).Count
-        if ($count -gt 1) { throw "$Label bootstrap contract mismatch: expected at most one occurrence, found $count." }
+        if ($Required -and $count -ne 1) { throw "$Label bootstrap contract mismatch: expected exactly one occurrence, found $count." }
+        if (-not $Required -and $count -gt 1) { throw "$Label bootstrap contract mismatch: expected at most one occurrence, found $count." }
         if ($count -eq 0) { return $Text }
         return $regex.Replace($Text, $Replacement, 1)
     }
@@ -222,13 +224,20 @@ try {
     $uiSequence = 'Apply only enabled work modules sequentially after the applicable higher HMS checkpoint, fail-closed/safety, and required-model-floor gates are satisfied. Taste owns unresolved direction when enabled; Impeccable owns audit/polish when enabled; Superpowers owns implementation when enabled; HMS owns evidence/release when enabled.'
     $source = Replace-ExactlyOnce -Text $source -Needle $legacyUiSequence -Replacement $uiSequence -Label 'UI authority sequence'
 
-    # The public wrapper or exact install/update lifecycle owns the one cross-process lock.
-    # The committed implementation remains independently lock-capable when invoked directly,
-    # but its dynamic wrapper execution must never recursively acquire the same thread-affine Mutex.
+    # One owner per execution path: lifecycle -> wrapper inherits; direct wrapper -> wrapper owns;
+    # direct implementation -> implementation owns. Dynamic wrapper execution strips exactly one
+    # committed implementation lock block whenever that production lock marker is present.
+    $dynamicLockMarker = '$buildMutex = New-Object System.Threading.Mutex($false, $BuildMutexName)'
+    $dynamicLockRequired = $source.Contains($dynamicLockMarker)
     $implementationLockPattern = '(?m)^\$buildMutex = New-Object System\.Threading\.Mutex\(\$false, \$BuildMutexName\)\r?\n\$mutexOwned = \$false\r?\n\$stage = \$null\r?\ntry \{\r?\n    try \{\r?\n        \$mutexOwned = \$buildMutex\.WaitOne\(\[TimeSpan\]::FromSeconds\(120\)\)\r?\n    \}\r?\n    catch \[System\.Threading\.AbandonedMutexException\] \{\r?\n        \$mutexOwned = \$true\r?\n    \}\r?\n    if \(-not \$mutexOwned\) \{ throw "Timed out waiting for composite build lock: \$BuildMutexName" \}\r?\n'
+    # PowerShell single-quoted regex strings do not consume backslashes; normalize the pattern to
+    # the one-backslash .NET regex escapes required to match literal '$', '.', '(', '[', and braces.
+    $implementationLockPattern = $implementationLockPattern.Replace('\\','\')
     $implementationLockReplacement = '$buildMutex = $null' + "`n" + '$mutexOwned = $false' + "`n" + '$stage = $null' + "`n" + 'try {' + "`n"
-    $source = Replace-RegexAtMostOnce -Text $source -Pattern $implementationLockPattern -Replacement $implementationLockReplacement -Label 'Dynamic implementation composite mutex acquisition'
-    $source = Replace-RegexAtMostOnce -Text $source -Pattern '(?m)^    \$buildMutex\.Dispose\(\)\r?$' -Replacement '    if ($null -ne $buildMutex) { $buildMutex.Dispose() }' -Label 'Dynamic implementation composite mutex disposal'
+    $source = Replace-RegexRequiredWhen -Text $source -Pattern $implementationLockPattern -Replacement $implementationLockReplacement -Required $dynamicLockRequired -Label 'Dynamic implementation composite mutex acquisition'
+
+    $implementationDisposePattern = '(?m)^    \$buildMutex\.Dispose\(\)\r?$'.Replace('\\','\')
+    $source = Replace-RegexRequiredWhen -Text $source -Pattern $implementationDisposePattern -Replacement '    if ($null -ne $buildMutex) { $buildMutex.Dispose() }' -Required $dynamicLockRequired -Label 'Dynamic implementation composite mutex disposal'
 
     try { $implementation = [ScriptBlock]::Create($source) }
     catch { throw "Composite build implementation failed to parse after deterministic trust-boundary binding: $($_.Exception.Message)" }
