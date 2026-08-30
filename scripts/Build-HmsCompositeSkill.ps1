@@ -37,52 +37,66 @@ function Get-ExpectedSupportBlob {
 function Write-SupportBlobExact {
     param(
         [Parameter(Mandatory)][string]$BlobSha,
+        [Parameter(Mandatory)][string]$RelativePath,
         [Parameter(Mandatory)][string]$Destination,
         [Parameter(Mandatory)][string]$Label
     )
     if ($BlobSha -notmatch '^[0-9a-f]{40}$') { throw "$Label support blob SHA is invalid: $BlobSha" }
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or $RelativePath.Contains('\') -or $RelativePath.StartsWith('/') -or $RelativePath -match '^[A-Za-z]:') {
+        throw "$Label support path is not a canonical repository-relative Git path: $RelativePath"
+    }
+    foreach ($segment in @($RelativePath -split '/')) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -eq '.' -or $segment -eq '..') {
+            throw "$Label support path contains an unsafe segment: $RelativePath"
+        }
+    }
+
     $parent = Split-Path -Parent $Destination
     if (-not [string]::IsNullOrWhiteSpace($parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
     if (Test-Path -LiteralPath $Destination) { throw "$Label support destination already exists: $Destination" }
 
     $gitExe = [string](Get-Command git -ErrorAction Stop).Source
     if ([string]::IsNullOrWhiteSpace($gitExe)) { throw "$Label could not resolve git executable." }
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $gitExe
-    $psi.WorkingDirectory = $repoRoot
-    $psi.Arguments = "cat-file blob $BlobSha"
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
+    $archivePath = "$Destination.hms-support.zip"
+    if (Test-Path -LiteralPath $archivePath) { throw "$Label support archive destination already exists: $archivePath" }
 
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $psi
-    $stream = $null
     try {
-        if (-not $process.Start()) { throw "$Label git cat-file process failed to start." }
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        $stream = New-Object System.IO.FileStream($Destination,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
-        $process.StandardOutput.BaseStream.CopyTo($stream)
-        $stream.Flush()
-        $stream.Dispose(); $stream = $null
-        $process.WaitForExit()
-        $stderr = $stderrTask.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0) {
-            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-            throw "$Label git cat-file failed with exit code $($process.ExitCode): $stderr"
+        & $gitExe -C $repoRoot -c core.autocrlf=false -c core.eol=lf archive --format=zip "--output=$archivePath" $head -- $RelativePath 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
+            throw "$Label exact-HEAD archive materialization failed for: $RelativePath"
+        }
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
+        try {
+            $matches = @($archive.Entries | Where-Object { $_.FullName -ceq $RelativePath })
+            if ($matches.Count -ne 1) {
+                throw "$Label exact-HEAD archive expected one entry '$RelativePath', found $($matches.Count)."
+            }
+            $input = $matches[0].Open()
+            $output = New-Object System.IO.FileStream($Destination,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+            try {
+                $input.CopyTo($output)
+                $output.Flush()
+            }
+            finally {
+                $output.Dispose()
+                $input.Dispose()
+            }
+        }
+        finally {
+            $archive.Dispose()
         }
     }
     finally {
-        if ($null -ne $stream) { $stream.Dispose() }
-        $process.Dispose()
+        if (Test-Path -LiteralPath $archivePath) { Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue }
     }
 
     $actual = ((& git -C $repoRoot hash-object --no-filters -- $Destination 2>$null) -join '').Trim().ToLowerInvariant()
     if ($LASTEXITCODE -ne 0 -or $actual -notmatch '^[0-9a-f]{40}$') { throw "$Label exact support materialization could not be hashed." }
     if ($actual -cne $BlobSha) {
         Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-        throw "$Label binary cat-file support materialization mismatch. Expected $BlobSha, found $actual."
+        throw "$Label exact-HEAD archive transport changed committed bytes. Expected $BlobSha, found $actual."
     }
 }
 
@@ -137,10 +151,10 @@ try {
     $committedCopyHelper = Join-Path $supportRoot 'Copy-HmsCommittedGitPath.ps1'
     $committedSuperLock = Join-Path $supportRoot 'superpowers.lock.json'
     $committedUiLock = Join-Path $supportRoot 'ui-skills.lock.json'
-    Write-SupportBlobExact -BlobSha $expectedImplementation -Destination $implementationPath -Label 'Composite implementation'
-    Write-SupportBlobExact -BlobSha $expectedHelper -Destination $committedCopyHelper -Label 'Committed-copy helper'
-    Write-SupportBlobExact -BlobSha $expectedSuperLock -Destination $committedSuperLock -Label 'Superpowers lock'
-    Write-SupportBlobExact -BlobSha $expectedUiLock -Destination $committedUiLock -Label 'UI skills lock'
+    Write-SupportBlobExact -BlobSha $expectedImplementation -RelativePath $implementationRelative -Destination $implementationPath -Label 'Composite implementation'
+    Write-SupportBlobExact -BlobSha $expectedHelper -RelativePath $helperRelative -Destination $committedCopyHelper -Label 'Committed-copy helper'
+    Write-SupportBlobExact -BlobSha $expectedSuperLock -RelativePath $superLockRelative -Destination $committedSuperLock -Label 'Superpowers lock'
+    Write-SupportBlobExact -BlobSha $expectedUiLock -RelativePath $uiLockRelative -Destination $committedUiLock -Label 'UI skills lock'
 
     $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
     try { $source = [IO.File]::ReadAllText($implementationPath, $utf8Strict) }
