@@ -1,0 +1,177 @@
+name: Validate HMS state and uninstall trust
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  windows-state-uninstall-trust:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Qualify strict module state serialized writers and clone quarantine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedSha = $env:CANDIDATE_SHA.ToLowerInvariant()
+          $workspaceHead = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $workspaceHead -ne $expectedSha) {
+            throw "Workflow checkout identity mismatch. Expected $expectedSha, found $workspaceHead"
+          }
+
+          $runnerHome = $env:USERPROFILE
+          $originalHome = $env:HOME
+          $originalCodexHome = $env:CODEX_HOME
+          try {
+            $env:HOME = $runnerHome
+            $env:CODEX_HOME = Join-Path $runnerHome '.codex'
+
+            $installPath = Join-Path $env:GITHUB_WORKSPACE 'install.ps1'
+            $updatePath = Join-Path $env:GITHUB_WORKSPACE 'update.ps1'
+            $uninstallPath = Join-Path $env:GITHUB_WORKSPACE 'uninstall.ps1'
+            $modelSettingsScript = Join-Path $env:GITHUB_WORKSPACE 'manager\HmsModelSettings.ps1'
+            $strictReader = Join-Path $env:GITHUB_WORKSPACE 'scripts\Read-HmsCompositeModuleState.ps1'
+
+            & $installPath -InstallRoot $env:GITHUB_WORKSPACE -SkipCodeGraph -SkipThreeLevelDelivery
+
+            $manifestPath = Join-Path $runnerHome '.codex\hms-composite\hms-superpowers\manifest.json'
+            if (-not (Test-Path -LiteralPath $manifestPath)) { throw 'Baseline composite manifest missing.' }
+            $manifestOriginal = [IO.File]::ReadAllText($manifestPath)
+
+            # P2 regression: a string that merely looks like false must never be coerced to enabled.
+            $malformed = @'
+{"schema_version":1,"managed_by":"HMS-Skills-Codex","artifact":"hms-superpowers-composite","modules":{"hms":true,"superpowers":true,"taste":"false","impeccable":true}}
+'@
+            [IO.File]::WriteAllText($manifestPath, $malformed, (New-Object System.Text.UTF8Encoding($false)))
+
+            $readerRejected = $false
+            try { $null = & $strictReader -ManifestPath $manifestPath }
+            catch { if ($_.Exception.Message -match "module 'taste' must be boolean") { $readerRejected = $true } else { throw } }
+            if (-not $readerRejected) { throw 'Strict composite reader accepted a string module toggle.' }
+
+            $updateRejected = $false
+            try { & $updatePath -InstallRoot $env:GITHUB_WORKSPACE -SkipCodeGraph -SkipThreeLevelDelivery }
+            catch { if ($_.Exception.Message -match "module 'taste' must be boolean") { $updateRejected = $true } else { throw } }
+            if (-not $updateRejected) { throw 'Updater accepted malformed composite module state.' }
+
+            $installRejected = $false
+            try { & $installPath -InstallRoot $env:GITHUB_WORKSPACE -SkipCodeGraph -SkipThreeLevelDelivery }
+            catch { if ($_.Exception.Message -match "module 'taste' must be boolean") { $installRejected = $true } else { throw } }
+            if (-not $installRejected) { throw 'Installer accepted malformed composite module state.' }
+
+            [IO.File]::WriteAllText($manifestPath, $manifestOriginal, (New-Object System.Text.UTF8Encoding($false)))
+            $restoredState = & $strictReader -ManifestPath $manifestPath
+            foreach ($key in @('hms','superpowers','taste','impeccable')) {
+              if ($restoredState.PSObject.Properties[$key].Value -isnot [bool]) { throw "Restored module state '$key' is not boolean." }
+            }
+            Write-Host 'PASS: malformed composite module state is rejected without boolean coercion by strict lifecycle readers.'
+
+            # P1 regression: a second writer process must not cross write/verify/rollback while the writer mutex is held.
+            $writerMutexName = 'Local\HMS-Skills-Codex-ModelSettings-v1'
+            $writerMutex = New-Object System.Threading.Mutex($false, $writerMutexName)
+            $writerMutexOwned = $false
+            $writerJob = $null
+            try {
+              $writerMutexOwned = $writerMutex.WaitOne([TimeSpan]::FromSeconds(30))
+              if (-not $writerMutexOwned) { throw 'Failed to acquire model settings writer mutex for qualification.' }
+              $writerJob = Start-Job -ScriptBlock {
+                param($ScriptPath)
+                $ErrorActionPreference = 'Stop'
+                & $ScriptPath -SelfTest
+              } -ArgumentList $modelSettingsScript
+              Start-Sleep -Seconds 3
+              if ($writerJob.State -notin @('Running','NotStarted')) {
+                $premature = (Receive-Job -Job $writerJob -Keep -ErrorAction SilentlyContinue) -join "`n"
+                throw "Model Settings writer crossed the mutex while it was externally held. State=$($writerJob.State) Output=$premature"
+              }
+              $writerMutex.ReleaseMutex()
+              $writerMutexOwned = $false
+              $null = Wait-Job -Job $writerJob -Timeout 90
+              if ($writerJob.State -ne 'Completed') {
+                $writerOutput = (Receive-Job -Job $writerJob -Keep -ErrorAction SilentlyContinue) -join "`n"
+                throw "Model Settings writer did not complete after mutex release. State=$($writerJob.State) Output=$writerOutput"
+              }
+              Receive-Job -Job $writerJob -ErrorAction Stop | Write-Host
+            }
+            finally {
+              if ($writerMutexOwned) { try { $writerMutex.ReleaseMutex() } catch { } }
+              $writerMutex.Dispose()
+              if ($null -ne $writerJob) { Remove-Job -Job $writerJob -Force -ErrorAction SilentlyContinue }
+            }
+            Write-Host 'PASS: Model Settings write/verify/rollback transaction is serialized by a cross-process mutex.'
+
+            # P1 regression: after a verified clone is renamed to a random quarantine path,
+            # a foreign directory that appears at the old pathname must survive uninstall.
+            $testHome = Join-Path ([IO.Path]::GetTempPath()) ('hms-uninstall-race-' + [guid]::NewGuid().ToString('N'))
+            $fakeClone = Join-Path $testHome '.codex\hms-skills-codex'
+            $foreignSentinel = Join-Path $fakeClone 'FOREIGN-DO-NOT-DELETE.txt'
+            $watcher = $null
+            try {
+              New-Item -ItemType Directory -Force -Path (Join-Path $fakeClone 'skills\hms-superpowers') | Out-Null
+              Set-Content -LiteralPath (Join-Path $fakeClone 'skills\hms-superpowers\SKILL.md') -Value 'test marker' -Encoding UTF8
+              & git -C $fakeClone init
+              if ($LASTEXITCODE -ne 0) { throw 'Failed to initialize fake HMS clone.' }
+              & git -C $fakeClone config user.email 'ci@example.invalid'
+              & git -C $fakeClone config user.name 'HMS CI'
+              & git -C $fakeClone add .
+              & git -C $fakeClone commit -m 'fake qualified clone'
+              if ($LASTEXITCODE -ne 0) { throw 'Failed to commit fake HMS clone.' }
+              & git -C $fakeClone remote add origin 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
+              if ($LASTEXITCODE -ne 0) { throw 'Failed to set fake HMS origin.' }
+
+              $watcher = Start-Job -ScriptBlock {
+                param($OriginalPath,$SentinelPath)
+                $deadline = [DateTime]::UtcNow.AddSeconds(30)
+                while ((Test-Path -LiteralPath $OriginalPath) -and [DateTime]::UtcNow -lt $deadline) {
+                  Start-Sleep -Milliseconds 5
+                }
+                if (Test-Path -LiteralPath $OriginalPath) { throw 'Clone pathname was never quarantined.' }
+                New-Item -ItemType Directory -Force -Path $OriginalPath | Out-Null
+                Set-Content -LiteralPath $SentinelPath -Value 'foreign replacement' -Encoding UTF8
+              } -ArgumentList $fakeClone,$foreignSentinel
+
+              $savedUserProfile = $env:USERPROFILE
+              $savedHome = $env:HOME
+              try {
+                $env:USERPROFILE = $testHome
+                $env:HOME = $testHome
+                & $uninstallPath -InstallRoot $fakeClone -RemoveClones
+              }
+              finally {
+                $env:USERPROFILE = $savedUserProfile
+                $env:HOME = $savedHome
+              }
+
+              $null = Wait-Job -Job $watcher -Timeout 30
+              if ($watcher.State -ne 'Completed') {
+                $watchOutput = (Receive-Job -Job $watcher -Keep -ErrorAction SilentlyContinue) -join "`n"
+                throw "Foreign replacement watcher failed. State=$($watcher.State) Output=$watchOutput"
+              }
+              Receive-Job -Job $watcher -ErrorAction Stop | Out-Null
+              if (-not (Test-Path -LiteralPath $foreignSentinel)) { throw 'Uninstall deleted the foreign replacement at the original clone pathname.' }
+              $quarantineLeftovers = @(Get-ChildItem -LiteralPath (Split-Path -Parent $fakeClone) -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.hms-clone-removing-*' })
+              if ($quarantineLeftovers.Count -ne 0) { throw 'Clone quarantine removal left managed clone quarantine residue.' }
+            }
+            finally {
+              if ($null -ne $watcher) { Remove-Job -Job $watcher -Force -ErrorAction SilentlyContinue }
+              if (Test-Path -LiteralPath $testHome) { Remove-Item -LiteralPath $testHome -Recurse -Force }
+            }
+            Write-Host 'PASS: clone deletion quarantines and revalidates the managed clone while preserving a foreign replacement pathname.'
+
+            Write-Host 'PASS: exact-SHA strict module state, serialized model writers, and clone destructive-boundary trust regressions qualified.'
+          }
+          finally {
+            $env:HOME = $originalHome
+            $env:CODEX_HOME = $originalCodexHome
+          }
