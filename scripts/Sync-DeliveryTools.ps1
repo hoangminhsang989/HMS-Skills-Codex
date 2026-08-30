@@ -159,7 +159,7 @@ function Assert-RegularCodeGraphBundle {
 function Add-CodeGraphBundleTreeRecords {
     param(
         [Parameter(Mandatory)][string]$Directory,
-        [Parameter(Mandatory)][string]$LogicalPrefix,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$LogicalPrefix,
         [Parameter(Mandatory)]$Records
     )
     foreach ($item in @(Get-ChildItem -LiteralPath $Directory -Force -ErrorAction Stop)) {
