@@ -37,7 +37,7 @@ jobs:
             }
             return $m
           }
-          function Diff([string]$Label,$A,$B){
+          function Show-TreeDiff([string]$Label,$A,$B){
             Write-Host "=== $Label ==="
             $keys=@($A.Keys)+@($B.Keys)|Sort-Object -Unique
             $count=0
@@ -68,8 +68,8 @@ jobs:
             $s2=Snapshot $flat
             Start-Sleep -Seconds 3
             $s3=Snapshot $flat
-            Diff 'extract -> after-version' $s0 $s1
-            Diff 'after-version -> after-marker' $s1 $s2
-            Diff 'after-marker -> after-delay' $s2 $s3
+            Show-TreeDiff 'extract -> after-version' $s0 $s1
+            Show-TreeDiff 'after-version -> after-marker' $s1 $s2
+            Show-TreeDiff 'after-marker -> after-delay' $s2 $s3
             Write-Host "MARKER_NAME=$([IO.Path]::GetFileName($marker))"
           } finally {Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue}
