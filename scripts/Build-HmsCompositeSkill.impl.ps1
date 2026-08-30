@@ -290,7 +290,8 @@ function Assert-OwnedCompositeIdentity {
 function Reserve-OwnedCompositeRollbackBackup {
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$ExpectedTreeSha256
+        [Parameter(Mandatory)][string]$ExpectedTreeSha256,
+        [ref]$ReservedPathRef
     )
     Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
     $parent = Split-Path -Parent $Path
@@ -298,6 +299,7 @@ function Reserve-OwnedCompositeRollbackBackup {
     $reserved = Join-Path $parent $leaf
     if (Test-Path -LiteralPath $reserved) { throw "Composite rollback reservation path already exists: $reserved" }
     Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    if ($null -ne $ReservedPathRef) { $ReservedPathRef.Value = $reserved }
     Assert-OwnedCompositeIdentity -Path $reserved -ExpectedTreeSha256 $ExpectedTreeSha256
     return $reserved
 }
@@ -732,7 +734,7 @@ try {
             Assert-OwnedCompositeIdentity -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha
             # Immediately move the exact previous bundle off the predictable backup pathname.
             # Rollback and successful disposal use only this random identity-verified reservation.
-            $reservedBackup = Reserve-OwnedCompositeRollbackBackup -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha
+            $reservedBackup = Reserve-OwnedCompositeRollbackBackup -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha -ReservedPathRef ([ref]$reservedBackup)
         }
 
         if ($env:HMS_TEST_FAIL_STAGE_ACTIVATION -ceq '1') {
