@@ -17,6 +17,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $LockPath = Join-Path $RepoRoot 'ui-skills.lock.json'
 $CanonicalTasteRemote = 'https://github.com/Leonxlnx/taste-skill.git'
 $CanonicalImpeccableRemote = 'https://github.com/pbakaus/impeccable.git'
+$BuildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
 
 function ConvertTo-NormalizedRemote {
     param([Parameter(Mandatory)][string]$Remote)
@@ -109,35 +110,53 @@ function Assert-SkillEntryPoint {
     }
 }
 
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }
-$lock = Read-ValidatedUiSkillsLock
-
-$specs = @()
-if (-not $SkipTaste) {
-    $specs += [pscustomobject]@{
-        Name = 'GPT Taste'
-        Root = (Join-Path $env:USERPROFILE '.codex\taste-skill')
-        Repository = [string]$lock.taste.repository
-        Commit = [string]$lock.taste.commit
-        SkillPath = [string]$lock.taste.skill_path
-        SkillName = [string]$lock.taste.skill_name
+$buildMutex = New-Object System.Threading.Mutex($false, $BuildMutexName)
+$mutexOwned = $false
+try {
+    try {
+        $mutexOwned = $buildMutex.WaitOne([TimeSpan]::FromSeconds(120))
     }
-}
-if (-not $SkipImpeccable) {
-    $specs += [pscustomobject]@{
-        Name = 'Impeccable'
-        Root = (Join-Path $env:USERPROFILE '.codex\impeccable')
-        Repository = [string]$lock.impeccable.repository
-        Commit = [string]$lock.impeccable.commit
-        SkillPath = [string]$lock.impeccable.skill_path
-        SkillName = [string]$lock.impeccable.skill_name
+    catch [System.Threading.AbandonedMutexException] {
+        $mutexOwned = $true
     }
-}
+    if (-not $mutexOwned) { throw "Timed out waiting for composite build lock: $BuildMutexName" }
 
-foreach ($spec in $specs) {
-    Sync-PinnedRepository -Remote $spec.Repository -Path $spec.Root -Commit $spec.Commit
-    Assert-SkillEntryPoint -RepoPath $spec.Root -SkillPath $spec.SkillPath -ExpectedName $spec.SkillName
-    Write-Host "$($spec.Name) pin: $($spec.Commit)"
-}
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }
+    $lock = Read-ValidatedUiSkillsLock
 
-Write-Host 'Pinned UI skill sources reconciliation PASS. Direct discovery remains disabled; use the HMS composite compiler.'
+    $specs = @()
+    if (-not $SkipTaste) {
+        $specs += [pscustomobject]@{
+            Name = 'GPT Taste'
+            Root = (Join-Path $env:USERPROFILE '.codex\taste-skill')
+            Repository = [string]$lock.taste.repository
+            Commit = [string]$lock.taste.commit
+            SkillPath = [string]$lock.taste.skill_path
+            SkillName = [string]$lock.taste.skill_name
+        }
+    }
+    if (-not $SkipImpeccable) {
+        $specs += [pscustomobject]@{
+            Name = 'Impeccable'
+            Root = (Join-Path $env:USERPROFILE '.codex\impeccable')
+            Repository = [string]$lock.impeccable.repository
+            Commit = [string]$lock.impeccable.commit
+            SkillPath = [string]$lock.impeccable.skill_path
+            SkillName = [string]$lock.impeccable.skill_name
+        }
+    }
+
+    foreach ($spec in $specs) {
+        Sync-PinnedRepository -Remote $spec.Repository -Path $spec.Root -Commit $spec.Commit
+        Assert-SkillEntryPoint -RepoPath $spec.Root -SkillPath $spec.SkillPath -ExpectedName $spec.SkillName
+        Write-Host "$($spec.Name) pin: $($spec.Commit)"
+    }
+
+    Write-Host 'Pinned UI skill sources reconciliation PASS. Direct discovery remains disabled; use the HMS composite compiler.'
+}
+finally {
+    if ($mutexOwned) {
+        try { $buildMutex.ReleaseMutex() } catch { }
+    }
+    $buildMutex.Dispose()
+}
