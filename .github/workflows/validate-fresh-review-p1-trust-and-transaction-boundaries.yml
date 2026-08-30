@@ -19,7 +19,7 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           $message = ((& git log -1 --format=%s) -join '').Trim()
-          if($message -cne 'chore: invoke registered review 486 P1 remediation v5') {
+          if($message -cne 'chore: invoke registered review 486 P1 remediation v6') {
             Write-Host "No remediation action for head message: $message"
             exit 0
           }
@@ -39,6 +39,13 @@ jobs:
           $patchIndex = $body.IndexOf($oldPatch)
           if($patchIndex -lt 0) { throw 'Could not locate staged CodeGraph whole-function replacement.' }
           $body[$patchIndex] = $newPatch
+
+          $manifestPatch = "sync=replace_once(sync,old_manifest,new_manifest,'atomic manifest publication')"
+          $manifestReplacement = "start=sync.index('                `$manifest = [ordered]@{'); end=sync.index('                if (`$null -ne `$backup -and (Test-Path -LiteralPath `$backup)) {',start); sync=sync[:start]+new_manifest+sync[end:]"
+          $manifestIndex = $body.IndexOf($manifestPatch)
+          if($manifestIndex -lt 0) { throw 'Could not locate staged manifest publication replacement.' }
+          $body[$manifestIndex] = $manifestReplacement
+
           $pythonEnd = $body.IndexOf("'@ | python -")
           if($pythonEnd -lt 0) { throw 'Could not locate staged Python patch invocation.' }
           $body.Insert($pythonEnd+1,"if(`$LASTEXITCODE -ne 0){throw 'Python remediation patch failed'}")
