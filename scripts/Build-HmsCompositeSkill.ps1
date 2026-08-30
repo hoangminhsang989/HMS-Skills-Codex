@@ -250,11 +250,11 @@ try {
 
     $escapedHelper = $committedCopyHelper.Replace("'", "''")
     $directoryCopyNeedle = '    Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force'
-    $directoryCopyReplacement = "    & '$escapedHelper' -Source `$Source -Destination `$Destination"
+    $directoryCopyReplacement = "    & '$escapedHelper' -Source `$Source -Destination `$Destination -ExpectedHead `$ExpectedHead"
     $source = Replace-ExactlyOnce -Text $source -Needle $directoryCopyNeedle -Replacement $directoryCopyReplacement -Label 'Committed skill-tree copy'
 
     $resolverCopyNeedle = "    Copy-Item -LiteralPath `$ModelResolverSource -Destination (Join-Path `$modelDispatcherDestination 'Resolve-HmsModelRoute.ps1') -Force"
-    $resolverCopyReplacement = "    & '$escapedHelper' -Source `$ModelResolverSource -Destination (Join-Path `$modelDispatcherDestination 'Resolve-HmsModelRoute.ps1')"
+    $resolverCopyReplacement = "    & '$escapedHelper' -Source `$ModelResolverSource -Destination (Join-Path `$modelDispatcherDestination 'Resolve-HmsModelRoute.ps1') -ExpectedHead ([string]`$sourceHeadsBefore['hms'])"
     $source = Replace-ExactlyOnce -Text $source -Needle $resolverCopyNeedle -Replacement $resolverCopyReplacement -Label 'Committed model-resolver copy'
 
     $escapedSuperLock = $committedSuperLock.Replace("'", "''")

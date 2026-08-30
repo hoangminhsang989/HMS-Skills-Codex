@@ -314,7 +314,7 @@ function Remove-OwnedCompositeStageQuarantine {
 }
 
 function Copy-SkillModule {
-    param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Destination)
+    param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Destination,[Parameter(Mandatory)][string]$ExpectedHead)
     if (-not (Test-Path -LiteralPath (Join-Path $Source 'SKILL.md'))) { throw "Skill source does not contain SKILL.md: $Source" }
     Assert-CopyTreeContainsCommittedBytesOnly -Source $Source
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
@@ -329,6 +329,7 @@ function Copy-SkillCollection {
         [Parameter(Mandatory)][string]$SkillsDirectory,
         [Parameter(Mandatory)][string]$DestinationRoot,
         [Parameter(Mandatory)][string]$ModulePrefix,
+        [Parameter(Mandatory)][string]$ExpectedHead,
         [string[]]$ExcludeNames = @()
     )
     if (-not (Test-Path -LiteralPath $SkillsDirectory)) { throw "Skill collection is missing: $SkillsDirectory" }
@@ -345,8 +346,10 @@ function Copy-SkillCollection {
     elseif ($skillsRoot.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase)) { $pathSpec = $skillsRoot.Substring($repoPrefix.Length).Replace('\','/') }
     else { throw "Skill collection escaped its Git repository root: $SkillsDirectory" }
 
-    $collectionHead = Get-GitHeadOrNull -Path $repoRoot
-    if ($null -eq $collectionHead) { throw "Skill collection HEAD is not canonical: $SkillsDirectory" }
+    $collectionHead = $ExpectedHead.Trim().ToLowerInvariant()
+    if ($collectionHead -notmatch '^[0-9a-f]{40}$') { throw "Skill collection expected HEAD is not canonical: $ExpectedHead" }
+    $collectionHeadType = ((& git -C $repoRoot cat-file -t $collectionHead 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $collectionHeadType -cne 'commit') { throw "Skill collection expected commit is unavailable: $collectionHead" }
     $treePaths = @(& git -C $repoRoot ls-tree -r --name-only $collectionHead -- $pathSpec 2>$null)
     if ($LASTEXITCODE -ne 0) { throw "Committed skill collection tree could not be enumerated: $SkillsDirectory" }
     $treePrefix = if ($pathSpec -eq '.') { '' } else { $pathSpec.TrimEnd('/') + '/' }
@@ -365,7 +368,7 @@ function Copy-SkillCollection {
         if ($ExcludeNames -contains $name) { continue }
         $source = Join-Path $SkillsDirectory $name
         $destination = Join-Path $DestinationRoot $name
-        Copy-SkillModule -Source $source -Destination $destination
+        Copy-SkillModule -Source $source -Destination $destination -ExpectedHead $collectionHead
         $copied += ($ModulePrefix + '/' + $name + '/MODULE.md')
     }
     if ($copied.Count -eq 0) { throw "No committed skill modules were found under: $SkillsDirectory" }
@@ -549,20 +552,20 @@ try {
     $hmsRefs = @(); $superRefs = @(); $tasteRef = $null; $impeccableRef = $null
 
     $modelRouterDestination = Join-Path $refsRoot 'model-router'
-    Copy-SkillModule -Source $ModelRouterSource -Destination $modelRouterDestination
+    Copy-SkillModule -Source $ModelRouterSource -Destination $modelRouterDestination -ExpectedHead ([string]$sourceHeadsBefore['hms'])
     $modelRouterRef = 'references/model-router/MODULE.md'
 
     $modelDispatcherDestination = Join-Path $refsRoot 'model-dispatcher'
-    Copy-SkillModule -Source $ModelDispatcherSource -Destination $modelDispatcherDestination
+    Copy-SkillModule -Source $ModelDispatcherSource -Destination $modelDispatcherDestination -ExpectedHead ([string]$sourceHeadsBefore['hms'])
     Copy-Item -LiteralPath $ModelResolverSource -Destination (Join-Path $modelDispatcherDestination 'Resolve-HmsModelRoute.ps1') -Force
     $modelDispatcherRef = 'references/model-dispatcher/MODULE.md'
 
     if ($Hms) {
-        $hmsRefs = @(Copy-SkillCollection -SkillsDirectory (Join-Path $InstallRoot 'skills') -DestinationRoot (Join-Path $refsRoot 'hms') -ModulePrefix 'references/hms' -ExcludeNames @('hms-model-router','hms-model-dispatcher'))
+        $hmsRefs = @(Copy-SkillCollection -SkillsDirectory (Join-Path $InstallRoot 'skills') -DestinationRoot (Join-Path $refsRoot 'hms') -ModulePrefix 'references/hms' -ExpectedHead ([string]$sourceHeadsBefore['hms']) -ExcludeNames @('hms-model-router','hms-model-dispatcher'))
     }
-    if ($Superpowers) { $superRefs = @(Copy-SkillCollection -SkillsDirectory (Join-Path $SuperpowersRoot 'skills') -DestinationRoot (Join-Path $refsRoot 'superpowers') -ModulePrefix 'references/superpowers') }
-    if ($Taste) { Copy-SkillModule -Source $tasteSource -Destination (Join-Path $refsRoot 'taste'); $tasteRef = 'references/taste/MODULE.md' }
-    if ($Impeccable) { Copy-SkillModule -Source $impeccableSource -Destination (Join-Path $refsRoot 'impeccable'); $impeccableRef = 'references/impeccable/MODULE.md' }
+    if ($Superpowers) { $superRefs = @(Copy-SkillCollection -SkillsDirectory (Join-Path $SuperpowersRoot 'skills') -DestinationRoot (Join-Path $refsRoot 'superpowers') -ModulePrefix 'references/superpowers' -ExpectedHead ([string]$sourceHeadsBefore['superpowers'])) }
+    if ($Taste) { Copy-SkillModule -Source $tasteSource -Destination (Join-Path $refsRoot 'taste') -ExpectedHead ([string]$sourceHeadsBefore['taste']); $tasteRef = 'references/taste/MODULE.md' }
+    if ($Impeccable) { Copy-SkillModule -Source $impeccableSource -Destination (Join-Path $refsRoot 'impeccable') -ExpectedHead ([string]$sourceHeadsBefore['impeccable']); $impeccableRef = 'references/impeccable/MODULE.md' }
 
     $sourceHeadsAfter = Assert-SelectedSourceIdentities -SuperLock $superLock -UiLock $uiLock
     Assert-SourceSnapshotsEqual -Before $sourceHeadsBefore -After $sourceHeadsAfter

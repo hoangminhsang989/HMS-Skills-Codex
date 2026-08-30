@@ -17,6 +17,7 @@ $ThreeLevelRoot = Join-Path $env:USERPROFILE '.codex\three-level-delivery'
 $CodeGraphManifest = Join-Path $CodeGraphRoot 'hms-codegraph-install.json'
 $ManagedBy = 'HMS-Skills-Codex'
 $CodeGraphBundleMarkerName = '.hms-codegraph-bundle.json'
+$CodeGraphTempMarkerName = '.hms-codegraph-temp.json'
 
 function ConvertTo-NormalizedRemote {
     param([Parameter(Mandatory)][string]$Remote)
@@ -208,23 +209,108 @@ function Remove-CodeGraphTransactionBundle {
     $leaf = '.hms-codegraph-deleting-' + [guid]::NewGuid().ToString('N')
     $quarantine = Join-Path $parent $leaf
     Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    $deleteStarted = $false
     try {
         Assert-CodeGraphTransactionBundle -Path $quarantine -Identity $Identity
+        $deleteStarted = $true
         Remove-Item -LiteralPath $quarantine -Recurse -Force
         if (Test-Path -LiteralPath $quarantine) { throw "CodeGraph transaction quarantine removal did not complete: $quarantine" }
     }
     catch {
-        # Never restore a partially deleted bundle as trusted. Before destructive deletion,
-        # a failed boundary check can be restored only when the original pathname is still free.
-        if (Test-Path -LiteralPath $quarantine) {
-            if (-not (Test-Path -LiteralPath $Path)) {
-                try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
-            }
+        $e = $_
+        if (-not $deleteStarted -and (Test-Path -LiteralPath $quarantine) -and -not (Test-Path -LiteralPath $Path)) {
+  try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
         }
-        throw
+        elseif ($deleteStarted -and (Test-Path -LiteralPath $quarantine)) {
+  throw "CodeGraph transaction deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+        }
+        throw $e
     }
 }
 
+function Write-CodeGraphTempMarker {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$TransactionId)
+    Assert-RegularCodeGraphBundle -Path $Path -Label 'CodeGraph temporary root'
+    [ordered]@{ schema_version=1; managed_by=$ManagedBy; artifact='hms-codegraph-transaction-temp'; transaction_id=$TransactionId } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Path $CodeGraphTempMarkerName) -Encoding UTF8
+}
+
+function Assert-CodeGraphTempRoot {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$TransactionId)
+    Assert-RegularCodeGraphBundle -Path $Path -Label 'CodeGraph temporary root'
+    $markerPath = Join-Path $Path $CodeGraphTempMarkerName
+    $markerItem = Get-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+    if ($null -eq $markerItem -or [bool]$markerItem.PSIsContainer -or [bool]($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "CodeGraph temporary-root marker is missing or not a regular file: $Path"
+    }
+    try { $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json }
+    catch { throw "CodeGraph temporary-root marker is invalid JSON: $Path" }
+    if ([string]$marker.managed_by -cne $ManagedBy -or [string]$marker.artifact -cne 'hms-codegraph-transaction-temp' -or [string]$marker.transaction_id -cne $TransactionId) {
+        throw "CodeGraph temporary-root marker ownership mismatch: $Path"
+    }
+}
+
+function Remove-CodeGraphTempRoot {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$TransactionId)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-CodeGraphTempRoot -Path $Path -TransactionId $TransactionId
+    $parent = Split-Path -Parent $Path
+    $leaf = '.hms-codegraph-temp-removing-' + [guid]::NewGuid().ToString('N')
+    $quarantine = Join-Path $parent $leaf
+    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    $deleteStarted = $false
+    try {
+        Assert-CodeGraphTempRoot -Path $quarantine -TransactionId $TransactionId
+        $deleteStarted = $true
+        Remove-Item -LiteralPath $quarantine -Recurse -Force
+        if (Test-Path -LiteralPath $quarantine) { throw "CodeGraph temporary quarantine removal did not complete: $quarantine" }
+    }
+    catch {
+        $e = $_
+        if (-not $deleteStarted -and (Test-Path -LiteralPath $quarantine) -and -not (Test-Path -LiteralPath $Path)) {
+  try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
+        }
+        elseif ($deleteStarted -and (Test-Path -LiteralPath $quarantine)) {
+  throw "CodeGraph temporary deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+        }
+        throw $e
+    }
+}
+
+function Restore-CodeGraphManifestAfterFailure {
+    param(
+        [Parameter(Mandatory)]$CandidateManifest,
+        [byte[]]$PreviousBytes,
+        [Parameter(Mandatory)][bool]$HadPrevious
+    )
+    $item = Get-Item -LiteralPath $CodeGraphManifest -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item -or [bool]$item.PSIsContainer -or [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'CodeGraph candidate manifest is missing or not a regular file during rollback.'
+    }
+    try { $currentManifest = Get-Content -LiteralPath $CodeGraphManifest -Raw | ConvertFrom-Json }
+    catch { throw "CodeGraph candidate manifest is invalid during rollback: $($_.Exception.Message)" }
+    foreach ($field in @('managed_by','version','tag','commit','asset','sha256')) {
+        if ([string]$currentManifest.$field -cne [string]$CandidateManifest[$field]) {
+  throw "CodeGraph candidate manifest changed before rollback for '$field'; refusing to overwrite it."
+        }
+    }
+    if ($HadPrevious) {
+        if ($null -eq $PreviousBytes) { throw 'CodeGraph rollback is missing previous manifest bytes.' }
+        $parent = Split-Path -Parent $CodeGraphManifest
+        $temp = Join-Path $parent ('.hms-codegraph-manifest-restore-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        $discard = Join-Path $parent ('.hms-codegraph-manifest-discard-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        try {
+  [IO.File]::WriteAllBytes($temp, $PreviousBytes)
+  [IO.File]::Replace($temp, $CodeGraphManifest, $discard, $true)
+        }
+        finally {
+  foreach ($cleanup in @($temp,$discard)) { if (Test-Path -LiteralPath $cleanup) { Remove-Item -LiteralPath $cleanup -Force -ErrorAction SilentlyContinue } }
+        }
+    }
+    else {
+        Remove-Item -LiteralPath $CodeGraphManifest -Force
+    }
+}
 function Assert-CodeGraphBundleAgainstManifest {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Manifest)
     Assert-RegularCodeGraphBundle -Path $Path -Label 'Existing HMS CodeGraph bundle'
@@ -240,6 +326,12 @@ function Sync-CodeGraphBundle {
     if ($env:OS -ne 'Windows_NT') { throw 'The HMS pinned CodeGraph bundle installer currently supports Windows only.' }
     $existingManifest = Read-ManagedCodeGraphManifest
     $wasInstalled = $null -ne $existingManifest
+    $existingManifestBytes = $null
+    if ($wasInstalled) {
+        $manifestItem = Get-Item -LiteralPath $CodeGraphManifest -Force -ErrorAction Stop
+        if ([bool]$manifestItem.PSIsContainer -or [bool]($manifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Managed CodeGraph manifest must be a regular file.' }
+        $existingManifestBytes = [IO.File]::ReadAllBytes($CodeGraphManifest)
+    }
     $arch = Get-CodeGraphArchitecture
     $asset = $Spec.windows_assets.$arch
     $assetName = [string]$asset.name
@@ -268,7 +360,12 @@ function Sync-CodeGraphBundle {
         $backup = $null
         $candidateIdentity = New-CodeGraphBundleIdentity -TransactionId $transactionId -Role 'candidate' -Version ([string]$Spec.version) -Tag ([string]$Spec.tag) -Commit ([string]$Spec.commit) -Asset $assetName -Sha256 $expectedSha
         $backupIdentity = $null
+        $manifestPublished = $false
+        $publishedManifest = $null
         try {
+            New-Item -ItemType Directory -Force -Path $temp | Out-Null
+            Write-CodeGraphTempMarker -Path $temp -TransactionId $transactionId
+            Assert-CodeGraphTempRoot -Path $temp -TransactionId $transactionId
             New-Item -ItemType Directory -Force -Path $extract | Out-Null
             $url = "https://github.com/colbymchenry/codegraph/releases/download/$([string]$Spec.tag)/$assetName"
             Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
@@ -304,17 +401,19 @@ function Sync-CodeGraphBundle {
                 Move-Item -LiteralPath $candidate -Destination $current
                 Assert-CodeGraphTransactionBundle -Path $current -Identity $candidateIdentity
                 Assert-CodeGraphVersion -CommandPath $command -ExpectedVersion ([string]$Spec.version)
-                $manifest = [ordered]@{
-                    managed_by = $ManagedBy
-                    version = [string]$Spec.version
-                    tag = [string]$Spec.tag
-                    commit = [string]$Spec.commit
-                    asset = $assetName
-                    sha256 = $expectedSha
-                }
-                $manifestTemp = "$CodeGraphManifest.tmp"
-                $manifest | ConvertTo-Json | Set-Content -LiteralPath $manifestTemp -Encoding UTF8
-                Move-Item -LiteralPath $manifestTemp -Destination $CodeGraphManifest -Force
+                $publishedManifest = [ordered]@{
+          managed_by = $ManagedBy
+          version = [string]$Spec.version
+          tag = [string]$Spec.tag
+          commit = [string]$Spec.commit
+          asset = $assetName
+          sha256 = $expectedSha
+      }
+      $manifestTemp = Join-Path $CodeGraphRoot ('.hms-codegraph-manifest-' + $transactionId + '.tmp')
+      $publishedManifest | ConvertTo-Json | Set-Content -LiteralPath $manifestTemp -Encoding UTF8
+      if ($wasInstalled) { [IO.File]::Replace($manifestTemp, $CodeGraphManifest, $null, $true) }
+      else { [IO.File]::Move($manifestTemp, $CodeGraphManifest) }
+      $manifestPublished = $true
                 if ($null -ne $backup -and (Test-Path -LiteralPath $backup)) {
                     Remove-CodeGraphTransactionBundle -Path $backup -Identity $backupIdentity
                 }
@@ -336,6 +435,10 @@ function Sync-CodeGraphBundle {
                     }
                 }
                 catch { $rollbackErrors += $_.Exception.Message }
+                try {
+                    if ($manifestPublished) { Restore-CodeGraphManifestAfterFailure -CandidateManifest $publishedManifest -PreviousBytes $existingManifestBytes -HadPrevious $wasInstalled }
+                }
+                catch { $rollbackErrors += $_.Exception.Message }
                 if ($rollbackErrors.Count -gt 0) {
                     throw "CodeGraph installation failed and rollback was incomplete. Original: $($installError.Exception.Message). Rollback: $($rollbackErrors -join ' | ')"
                 }
@@ -343,7 +446,7 @@ function Sync-CodeGraphBundle {
             }
         }
         finally {
-            if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
+            if (Test-Path -LiteralPath $temp) { Remove-CodeGraphTempRoot -Path $temp -TransactionId $transactionId }
         }
     }
 
