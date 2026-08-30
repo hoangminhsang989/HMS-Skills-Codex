@@ -48,7 +48,7 @@ jobs:
             throw "Unexpected Codex CLI version output: $actualVersion"
           }
 
-      - name: Verify unified install manager update discovery and uninstall contracts
+      - name: Verify unified install manager model-dispatch update discovery and uninstall contracts
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -74,6 +74,8 @@ jobs:
             $compositeLink = Join-Path $skillsRoot 'hms-superpowers'
             $compositeRoot = Join-Path $runnerHome '.codex\hms-composite\hms-superpowers'
             $manifestPath = Join-Path $compositeRoot 'manifest.json'
+            $modelSettingsPath = Join-Path $runnerHome '.codex\hms-composite\model-settings.json'
+            $modelDispatcherRoot = Join-Path $compositeRoot 'references\model-dispatcher'
             if (-not (Test-Path -LiteralPath $compositeLink)) { throw 'Unified hms-superpowers discovery Junction was not created.' }
             foreach ($legacy in @('hms','superpowers','gpt-taste','impeccable')) {
               if (Test-Path -LiteralPath (Join-Path $skillsRoot $legacy)) { throw "Legacy direct discovery leaked after unified install: $legacy" }
@@ -83,6 +85,11 @@ jobs:
             foreach ($key in @('hms','superpowers','taste','impeccable')) {
               if (-not [bool]$manifest.modules.$key) { throw "Default clean install did not enable module '$key'." }
             }
+            if ([string]$manifest.routing_contract.model_dispatcher -cne 'always-internal') { throw 'Composite manifest did not bind the dedicated model dispatcher.' }
+            if ([string]$manifest.routing_contract.model_fallback -cne 'upward-only') { throw 'Composite manifest model fallback contract mismatch.' }
+            if (-not (Test-Path -LiteralPath (Join-Path $modelDispatcherRoot 'MODULE.md'))) { throw 'Composite is missing the dedicated model-dispatcher MODULE.md.' }
+            if (-not (Test-Path -LiteralPath (Join-Path $modelDispatcherRoot 'Resolve-HmsModelRoute.ps1'))) { throw 'Composite is missing the bundled deterministic model resolver.' }
+
             $nestedSkillFiles = @(Get-ChildItem -LiteralPath $compositeRoot -Filter 'SKILL.md' -File -Recurse)
             if ($nestedSkillFiles.Count -ne 1) { throw "Composite contains $($nestedSkillFiles.Count) SKILL.md files; expected exactly one." }
 
@@ -96,6 +103,23 @@ jobs:
             if ($impeccableHead -ne [string]$uiLock.impeccable.commit) { throw 'Impeccable exact pin mismatch.' }
 
             & "$env:GITHUB_WORKSPACE\manager\HmsSuperpowersManager.ps1" -SelfTest
+
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\manager\HmsModelSettings.ps1" -SelfTest
+            if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell 5.1 model-settings self-test failed with exit code $LASTEXITCODE." }
+            Write-Host 'PASS: HMS Model Settings self-test qualified on Windows PowerShell 5.1.'
+
+            $modelSettings = [ordered]@{
+              schema_version = 1
+              managed_by = 'HMS-Skills-Codex'
+              artifact = 'hms-model-settings'
+              models = [ordered]@{ luna=$false; terra=$true; sol=$true }
+            }
+            $modelSettings | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $modelSettingsPath -Encoding UTF8
+            $fallbackBefore = & "$env:GITHUB_WORKSPACE\scripts\Resolve-HmsModelRoute.ps1" -RiskClass 'FAST_LOW_RISK / HIGH_VOLUME_MECHANICAL' -SettingsPath $modelSettingsPath
+            if ($fallbackBefore.status -cne 'ASSIGNED' -or $fallbackBefore.assigned_model -cne 'gpt-5.6-terra' -or -not [bool]$fallbackBefore.reassigned) {
+              throw 'Luna OFF did not reassign low-risk work to Terra before update.'
+            }
+
             & "$env:GITHUB_WORKSPACE\scripts\Test-CodexSkillDiscovery.ps1" -Cwd $env:GITHUB_WORKSPACE
 
             # Direct source discovery must be impossible through the old UI sync switches.
@@ -111,6 +135,7 @@ jobs:
             $beforeUpdate = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
             if ([bool]$beforeUpdate.modules.taste) { throw 'Failed to create Taste OFF composite state.' }
             if (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\taste')) { throw 'Taste reference remained after Taste OFF rebuild.' }
+            if (-not (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\model-dispatcher\MODULE.md'))) { throw 'Model dispatcher disappeared during module rebuild.' }
 
             & "$env:GITHUB_WORKSPACE\update.ps1" -InstallRoot $env:GITHUB_WORKSPACE
             $afterUpdate = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
@@ -119,24 +144,30 @@ jobs:
             foreach ($legacy in @('hms','superpowers','gpt-taste','impeccable')) {
               if (Test-Path -LiteralPath (Join-Path $skillsRoot $legacy)) { throw "Updater recreated legacy direct discovery: $legacy" }
             }
+            if (-not (Test-Path -LiteralPath $modelSettingsPath)) { throw 'Updater removed the model settings file.' }
+            $fallbackAfter = & "$env:GITHUB_WORKSPACE\scripts\Resolve-HmsModelRoute.ps1" -RiskClass 'FAST_LOW_RISK / HIGH_VOLUME_MECHANICAL' -SettingsPath $modelSettingsPath
+            if ($fallbackAfter.status -cne 'ASSIGNED' -or $fallbackAfter.assigned_model -cne 'gpt-5.6-terra' -or -not [bool]$fallbackAfter.reassigned) {
+              throw 'Updater did not preserve Luna OFF model reassignment state.'
+            }
 
-            # Restore all modules and prove real Codex discovery remains one entry point.
+            # Restore all work modules and prove real Codex discovery remains one entry point.
             & "$env:GITHUB_WORKSPACE\scripts\Build-HmsCompositeSkill.ps1" -InstallRoot $env:GITHUB_WORKSPACE -Hms $true -Superpowers $true -Taste $true -Impeccable $true
             & "$env:GITHUB_WORKSPACE\scripts\Test-CodexSkillDiscovery.ps1" -Cwd $env:GITHUB_WORKSPACE
 
-            # Uninstall without clone deletion removes discovery only and preserves pinned sources.
+            # Uninstall without clone deletion removes discovery only and preserves pinned sources/model settings.
             & "$env:GITHUB_WORKSPACE\uninstall.ps1" -InstallRoot $env:GITHUB_WORKSPACE -IncludeSuperpowers -IncludeUiSkills
             if (Test-Path -LiteralPath $compositeLink) { throw 'Composite discovery remained after uninstall.' }
             foreach ($source in @(
               (Join-Path $runnerHome '.codex\superpowers'),
               (Join-Path $runnerHome '.codex\taste-skill'),
               (Join-Path $runnerHome '.codex\impeccable'),
-              $compositeRoot
+              $compositeRoot,
+              $modelSettingsPath
             )) {
               if (-not (Test-Path -LiteralPath $source)) { throw "Non-destructive uninstall removed preserved source/state: $source" }
             }
 
-            Write-Host 'PASS: Windows exact-SHA unified single-skill install/update/Manager/Codex-discovery/uninstall contract completed.'
+            Write-Host 'PASS: Windows exact-SHA unified single-skill install/update/Manager/model-dispatch/Codex-discovery/uninstall contract completed.'
           }
           finally {
             $env:USERPROFILE = $runnerHome
