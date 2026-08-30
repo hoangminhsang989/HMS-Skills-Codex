@@ -14,6 +14,8 @@ $ErrorActionPreference = 'Stop'
 $HmsRemote = 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
 $CanonicalSuperpowersRemote = 'https://github.com/obra/superpowers.git'
 $SuperpowersRoot = Join-Path $env:USERPROFILE '.codex\superpowers'
+$TasteRoot = Join-Path $env:USERPROFILE '.codex\taste-skill'
+$ImpeccableRoot = Join-Path $env:USERPROFILE '.codex\impeccable'
 $CompositeManifest = Join-Path $env:USERPROFILE '.codex\hms-composite\hms-superpowers\manifest.json'
 $SkillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
 $BuildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
@@ -57,6 +59,15 @@ function Update-CleanRepo {
         $remoteHead = (& git -C $Path rev-parse $remoteRef).Trim().ToLowerInvariant()
         if ($head -ne $remoteHead) { throw "HMS branch identity mismatch for $Path." }
     }
+}
+
+function Assert-ExistingPinnedSourceClean {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (-not (Test-Path -LiteralPath (Join-Path $Path '.git'))) { throw "$Label source path exists but is not a Git checkout: $Path" }
+    $dirty = & git -C $Path status --porcelain
+    if ($LASTEXITCODE -ne 0) { throw "$Label clean-state preflight failed: $Path" }
+    if ($dirty) { throw "Refusing to reconcile non-clean pinned repository: $Path" }
 }
 
 function Read-SuperLock {
@@ -119,6 +130,10 @@ try {
     Update-CleanRepo -Path $InstallRoot -ExpectedRemote $HmsRemote
     & (Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1')
     & (Join-Path $InstallRoot 'scripts\Test-DeliveryTools.ps1')
+
+    # Fail fast on local UI-source drift before any unrelated external network reconciliation.
+    if (-not $SkipTaste) { Assert-ExistingPinnedSourceClean -Path $TasteRoot -Label 'GPT Taste' }
+    if (-not $SkipImpeccable) { Assert-ExistingPinnedSourceClean -Path $ImpeccableRoot -Label 'Impeccable' }
 
     if (-not $SkipSuperpowers) {
         $lock = Read-SuperLock
