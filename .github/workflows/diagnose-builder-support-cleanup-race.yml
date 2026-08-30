@@ -37,22 +37,8 @@ jobs:
           . $helperPath
 
           if (-not ('HmsHandlePathNative' -as [type])) {
-            Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-using Microsoft.Win32.SafeHandles;
-
-public static class HmsHandlePathNative
-{
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern uint GetFinalPathNameByHandleW(
-        SafeFileHandle hFile,
-        StringBuilder lpszFilePath,
-        uint cchFilePath,
-        uint dwFlags);
-}
-'@
+            $cs=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('dXNpbmcgU3lzdGVtOwp1c2luZyBTeXN0ZW0uUnVudGltZS5JbnRlcm9wU2VydmljZXM7CnVzaW5nIFN5c3RlbS5UZXh0Owp1c2luZyBNaWNyb3NvZnQuV2luMzIuU2FmZUhhbmRsZXM7CgpwdWJsaWMgc3RhdGljIGNsYXNzIEhtc0hhbmRsZVBhdGhOYXRpdmUKewogICAgW0RsbEltcG9ydCgia2VybmVsMzIuZGxsIiwgQ2hhclNldCA9IENoYXJTZXQuVW5pY29kZSwgU2V0TGFzdEVycm9yID0gdHJ1ZSldCiAgICBwdWJsaWMgc3RhdGljIGV4dGVybiB1aW50IEdldEZpbmFsUGF0aE5hbWVCeUhhbmRsZVcoCiAgICAgICAgU2FmZUZpbGVIYW5kbGUgaEZpbGUsCiAgICAgICAgU3RyaW5nQnVpbGRlciBscHN6RmlsZVBhdGgsCiAgICAgICAgdWludCBjY2hGaWxlUGF0aCwKICAgICAgICB1aW50IGR3RmxhZ3MpOwp9Cg=='))
+            Add-Type -TypeDefinition $cs
           }
 
           function Get-OracleHandlePath {
