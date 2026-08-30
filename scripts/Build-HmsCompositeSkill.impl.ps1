@@ -237,6 +237,124 @@ function Assert-OwnedCompositeRoot {
     if ([string]$manifest.managed_by -cne $ManagedBy -or [string]$manifest.artifact -cne $Artifact) { throw "Refusing to replace composite directory with unexpected ownership: $Path" }
 }
 
+function Get-OwnedCompositeTreeSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    Assert-OwnedCompositeRoot -Path $Path
+    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\')
+    $records = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)) {
+        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+  throw "Composite tree contains a reparse point: $($item.FullName)"
+        }
+        if ([bool]$item.PSIsContainer) { continue }
+        $relative = $item.FullName.Substring($root.Length).TrimStart('\').Replace('\','/')
+        $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $records.Add($relative + "`t" + $hash)
+    }
+    if ($records.Count -eq 0) { throw "Composite tree contains no authenticated files: $Path" }
+    $payload = [string]::Join("`n", @($records | Sort-Object))
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant()
+    }
+    finally { $sha.Dispose() }
+}
+
+function Assert-OwnedCompositeIdentity {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ExpectedTreeSha256
+    )
+    if ($ExpectedTreeSha256 -notmatch '^[0-9a-f]{64}$') { throw "Composite expected tree SHA-256 is invalid: $ExpectedTreeSha256" }
+    $actual = Get-OwnedCompositeTreeSha256 -Path $Path
+    if ($actual -cne $ExpectedTreeSha256) {
+        throw "Composite tree identity mismatch. Expected $ExpectedTreeSha256, found $actual : $Path"
+    }
+}
+
+function Reserve-OwnedCompositeRollbackBackup {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ExpectedTreeSha256
+    )
+    Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
+    $parent = Split-Path -Parent $Path
+    $leaf = '.hms-composite-rollback-reserved-' + [guid]::NewGuid().ToString('N')
+    $reserved = Join-Path $parent $leaf
+    if (Test-Path -LiteralPath $reserved) { throw "Composite rollback reservation path already exists: $reserved" }
+    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    Assert-OwnedCompositeIdentity -Path $reserved -ExpectedTreeSha256 $ExpectedTreeSha256
+    return $reserved
+}
+
+function Restore-OwnedCompositeRollbackBackup {
+    param(
+        [string]$BackupPath,
+        [string]$ReservedPath,
+        [Parameter(Mandatory)][string]$FinalPath,
+        [Parameter(Mandatory)][string]$ExpectedTreeSha256
+    )
+    $source = $null
+    if (-not [string]::IsNullOrWhiteSpace($ReservedPath) -and (Test-Path -LiteralPath $ReservedPath)) {
+        Assert-OwnedCompositeIdentity -Path $ReservedPath -ExpectedTreeSha256 $ExpectedTreeSha256
+        $source = $ReservedPath
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($BackupPath) -and (Test-Path -LiteralPath $BackupPath)) {
+        Assert-OwnedCompositeIdentity -Path $BackupPath -ExpectedTreeSha256 $ExpectedTreeSha256
+        $source = Reserve-OwnedCompositeRollbackBackup -Path $BackupPath -ExpectedTreeSha256 $ExpectedTreeSha256
+    }
+    else {
+        throw 'Previous composite backup disappeared before rollback restoration.'
+    }
+
+    if (Test-Path -LiteralPath $FinalPath) {
+        throw "Cannot restore previous composite because FinalRoot is occupied: $FinalPath"
+    }
+    Rename-Item -LiteralPath $source -NewName (Split-Path -Leaf $FinalPath) -ErrorAction Stop
+    Assert-OwnedCompositeIdentity -Path $FinalPath -ExpectedTreeSha256 $ExpectedTreeSha256
+}
+
+function Remove-OwnedCompositeIdentityQuarantine {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ExpectedTreeSha256
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
+    $parent = Split-Path -Parent $Path
+    $leaf = '.hms-composite-deleting-' + [guid]::NewGuid().ToString('N')
+    $quarantine = Join-Path $parent $leaf
+    if (Test-Path -LiteralPath $quarantine) { throw "Composite identity quarantine path already exists: $quarantine" }
+    $deleteStarted = $false
+    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    try {
+        Assert-OwnedCompositeIdentity -Path $quarantine -ExpectedTreeSha256 $ExpectedTreeSha256
+        $deleteStarted = $true
+        Remove-Item -LiteralPath $quarantine -Recurse -Force
+        if (Test-Path -LiteralPath $quarantine) { throw "Composite identity quarantine removal did not complete: $quarantine" }
+    }
+    catch {
+        $e = $_
+        if (-not $deleteStarted) {
+  try {
+      if (-not (Test-Path -LiteralPath $Path) -and (Test-Path -LiteralPath $quarantine)) {
+          Assert-OwnedCompositeIdentity -Path $quarantine -ExpectedTreeSha256 $ExpectedTreeSha256
+          Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop
+          Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
+      }
+  }
+  catch {
+      throw "Composite identity quarantine validation failed and rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)"
+  }
+        }
+        elseif (Test-Path -LiteralPath $quarantine) {
+  throw "Composite identity deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+        }
+        throw $e
+    }
+}
+
 function Remove-OwnedCompositeQuarantine {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return }
@@ -581,18 +699,26 @@ try {
         }
     }
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stage 'manifest.json') -Encoding UTF8
+    $candidateCompositeTreeSha = Get-OwnedCompositeTreeSha256 -Path $stage
+    $previousCompositeTreeSha = $null
+    if (Test-Path -LiteralPath $FinalRoot) {
+        $previousCompositeTreeSha = Get-OwnedCompositeTreeSha256 -Path $FinalRoot
+    }
 
     $removedLegacy = @()
     $createdComposite = $false
     $oldMovedToBackup = $false
+    $reservedBackup = $null
     $newActivated = $false
     try {
         if (Test-Path -LiteralPath $FinalRoot) {
+            if ([string]::IsNullOrWhiteSpace([string]$previousCompositeTreeSha)) { throw 'Previous composite identity was not captured before activation.' }
             Rename-Item -LiteralPath $FinalRoot -NewName (Split-Path -Leaf $backup) -ErrorAction Stop
             $oldMovedToBackup = $true
-            # Revalidate the exact path that crossed the rename boundary before any further mutation.
-            # A foreign replacement raced into FinalRoot must be restored, never treated as HMS-owned backup.
-            Assert-OwnedCompositeRoot -Path $backup
+            Assert-OwnedCompositeIdentity -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha
+            # Immediately move the exact previous bundle off the predictable backup pathname.
+            # Rollback and successful disposal use only this random identity-verified reservation.
+            $reservedBackup = Reserve-OwnedCompositeRollbackBackup -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha
         }
 
         if ($env:HMS_TEST_FAIL_STAGE_ACTIVATION -ceq '1') {
@@ -640,9 +766,9 @@ try {
         try {
             if ($newActivated) {
                 if (Test-Path -LiteralPath $FinalRoot) {
-                    # Rollback is destructive too: quarantine and revalidate the activated root
-                    # instead of recursively deleting a previously checked pathname.
-                    Remove-OwnedCompositeQuarantine -Path $FinalRoot
+                    # Delete only the exact activated candidate tree. A foreign replacement at FinalRoot
+                    # fails identity validation and is never removed.
+                    Remove-OwnedCompositeIdentityQuarantine -Path $FinalRoot -ExpectedTreeSha256 $candidateCompositeTreeSha
                 }
             }
             elseif (Test-Path -LiteralPath $FinalRoot) {
@@ -650,8 +776,9 @@ try {
             }
 
             if ($oldMovedToBackup) {
-                if (-not (Test-Path -LiteralPath $backup)) { throw "Previous composite backup disappeared during rollback: $backup" }
-                Rename-Item -LiteralPath $backup -NewName (Split-Path -Leaf $FinalRoot) -ErrorAction Stop
+                if ([string]::IsNullOrWhiteSpace([string]$previousCompositeTreeSha)) { throw 'Previous composite rollback identity is unavailable.' }
+                Restore-OwnedCompositeRollbackBackup -BackupPath $backup -ReservedPath $reservedBackup -FinalPath $FinalRoot -ExpectedTreeSha256 $previousCompositeTreeSha
+                $reservedBackup = $null
             }
         }
         catch { $rollbackErrors += $_.Exception.Message }
@@ -662,7 +789,10 @@ try {
         throw $mutationError
     }
 
-    if (Test-Path -LiteralPath $backup) { Remove-OwnedCompositeQuarantine -Path $backup }
+    if (-not [string]::IsNullOrWhiteSpace([string]$reservedBackup) -and (Test-Path -LiteralPath $reservedBackup)) {
+        Remove-OwnedCompositeIdentityQuarantine -Path $reservedBackup -ExpectedTreeSha256 $previousCompositeTreeSha
+        $reservedBackup = $null
+    }
     $enabledText = if ($enabled.Count -eq 0) { 'none' } else { $enabled -join ', ' }
     Write-Host "PASS: compiled one Codex skill '$CompositeName' from enabled work modules: $enabledText; committed-only source trees, stable source snapshots, serialized activation, and rollback-qualified bundle swap verified."
     Write-Host "Composite bundle: $FinalRoot"
