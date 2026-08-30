@@ -1,0 +1,341 @@
+name: Remediate review 486 P1 findings
+
+on:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.2.0-ui-design-authority
+    paths:
+      - .github/workflows/remediate-review-486-p1.yml
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    if: github.event.head_commit.message == 'chore: stage review 486 P1 remediation'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: stage/hms-superpowers-v0.2.0-ui-design-authority
+          fetch-depth: 0
+      - name: Apply exact remediation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          @'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              n=text.count(old)
+              if n != 1:
+                  raise SystemExit(f"{label}: expected exactly one occurrence, found {n}")
+              return text.replace(old,new,1)
+
+          impl_path=Path('scripts/Build-HmsCompositeSkill.impl.ps1')
+          impl=impl_path.read_text(encoding='utf-8')
+          impl=replace_once(impl,
+          "    param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Destination)\n",
+          "    param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Destination,[Parameter(Mandatory)][string]$ExpectedHead)\n",
+          'Copy-SkillModule ExpectedHead')
+          impl=replace_once(impl,
+          "        [Parameter(Mandatory)][string]$ModulePrefix,\n        [string[]]$ExcludeNames = @()\n",
+          "        [Parameter(Mandatory)][string]$ModulePrefix,\n        [Parameter(Mandatory)][string]$ExpectedHead,\n        [string[]]$ExcludeNames = @()\n",
+          'Copy-SkillCollection ExpectedHead')
+          impl=replace_once(impl,
+          "    $collectionHead = Get-GitHeadOrNull -Path $repoRoot\n    if ($null -eq $collectionHead) { throw \"Skill collection HEAD is not canonical: $SkillsDirectory\" }\n",
+          "    $collectionHead = $ExpectedHead.Trim().ToLowerInvariant()\n    if ($collectionHead -notmatch '^[0-9a-f]{40}$') { throw \"Skill collection expected HEAD is not canonical: $ExpectedHead\" }\n    $collectionHeadType = ((& git -C $repoRoot cat-file -t $collectionHead 2>$null) -join '').Trim().ToLowerInvariant()\n    if ($LASTEXITCODE -ne 0 -or $collectionHeadType -cne 'commit') { throw \"Skill collection expected commit is unavailable: $collectionHead\" }\n",
+          'collection captured commit')
+          impl=replace_once(impl,
+          "        Copy-SkillModule -Source $source -Destination $destination\n",
+          "        Copy-SkillModule -Source $source -Destination $destination -ExpectedHead $collectionHead\n",
+          'collection child expected head')
+          replacements={
+          "    Copy-SkillModule -Source $ModelRouterSource -Destination $modelRouterDestination\n":"    Copy-SkillModule -Source $ModelRouterSource -Destination $modelRouterDestination -ExpectedHead ([string]$sourceHeadsBefore['hms'])\n",
+          "    Copy-SkillModule -Source $ModelDispatcherSource -Destination $modelDispatcherDestination\n":"    Copy-SkillModule -Source $ModelDispatcherSource -Destination $modelDispatcherDestination -ExpectedHead ([string]$sourceHeadsBefore['hms'])\n",
+          "        $hmsRefs = @(Copy-SkillCollection -SkillsDirectory (Join-Path $InstallRoot 'skills') -DestinationRoot (Join-Path $refsRoot 'hms') -ModulePrefix 'references/hms' -ExcludeNames @('hms-model-router','hms-model-dispatcher'))\n":"        $hmsRefs = @(Copy-SkillCollection -SkillsDirectory (Join-Path $InstallRoot 'skills') -DestinationRoot (Join-Path $refsRoot 'hms') -ModulePrefix 'references/hms' -ExpectedHead ([string]$sourceHeadsBefore['hms']) -ExcludeNames @('hms-model-router','hms-model-dispatcher'))\n",
+          "    if ($Superpowers) { $superRefs = @(Copy-SkillCollection -SkillsDirectory (Join-Path $SuperpowersRoot 'skills') -DestinationRoot (Join-Path $refsRoot 'superpowers') -ModulePrefix 'references/superpowers') }\n":"    if ($Superpowers) { $superRefs = @(Copy-SkillCollection -SkillsDirectory (Join-Path $SuperpowersRoot 'skills') -DestinationRoot (Join-Path $refsRoot 'superpowers') -ModulePrefix 'references/superpowers' -ExpectedHead ([string]$sourceHeadsBefore['superpowers'])) }\n",
+          "    if ($Taste) { Copy-SkillModule -Source $tasteSource -Destination (Join-Path $refsRoot 'taste'); $tasteRef = 'references/taste/MODULE.md' }\n":"    if ($Taste) { Copy-SkillModule -Source $tasteSource -Destination (Join-Path $refsRoot 'taste') -ExpectedHead ([string]$sourceHeadsBefore['taste']); $tasteRef = 'references/taste/MODULE.md' }\n",
+          "    if ($Impeccable) { Copy-SkillModule -Source $impeccableSource -Destination (Join-Path $refsRoot 'impeccable'); $impeccableRef = 'references/impeccable/MODULE.md' }\n":"    if ($Impeccable) { Copy-SkillModule -Source $impeccableSource -Destination (Join-Path $refsRoot 'impeccable') -ExpectedHead ([string]$sourceHeadsBefore['impeccable']); $impeccableRef = 'references/impeccable/MODULE.md' }\n"
+          }
+          for old,new in replacements.items(): impl=replace_once(impl,old,new,'source head call site')
+          impl_path.write_text(impl,encoding='utf-8',newline='\n')
+
+          wrapper_path=Path('scripts/Build-HmsCompositeSkill.ps1')
+          wrapper=wrapper_path.read_text(encoding='utf-8')
+          wrapper=replace_once(wrapper,
+          '    $directoryCopyReplacement = "    & \'$escapedHelper\' -Source `$Source -Destination `$Destination"\n',
+          '    $directoryCopyReplacement = "    & \'$escapedHelper\' -Source `$Source -Destination `$Destination -ExpectedHead `$ExpectedHead"\n',
+          'wrapper tree expected head')
+          wrapper=replace_once(wrapper,
+          '    $resolverCopyReplacement = "    & \'$escapedHelper\' -Source `$ModelResolverSource -Destination (Join-Path `$modelDispatcherDestination \'Resolve-HmsModelRoute.ps1\')"\n',
+          '    $resolverCopyReplacement = "    & \'$escapedHelper\' -Source `$ModelResolverSource -Destination (Join-Path `$modelDispatcherDestination \'Resolve-HmsModelRoute.ps1\') -ExpectedHead ([string]`$sourceHeadsBefore[\'hms\'])"\n',
+          'wrapper resolver expected head')
+          wrapper_path.write_text(wrapper,encoding='utf-8',newline='\n')
+
+          sync_path=Path('scripts/Sync-DeliveryTools.ps1')
+          sync=sync_path.read_text(encoding='utf-8')
+          sync=replace_once(sync,
+          "$CodeGraphBundleMarkerName = '.hms-codegraph-bundle.json'\n",
+          "$CodeGraphBundleMarkerName = '.hms-codegraph-bundle.json'\n$CodeGraphTempMarkerName = '.hms-codegraph-temp.json'\n",
+          'CodeGraph temp marker constant')
+
+          old_remove=r'''function Remove-CodeGraphTransactionBundle {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Identity)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-CodeGraphTransactionBundle -Path $Path -Identity $Identity
+    $parent = Split-Path -Parent $Path
+    $leaf = '.hms-codegraph-deleting-' + [guid]::NewGuid().ToString('N')
+    $quarantine = Join-Path $parent $leaf
+    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    try {
+        Assert-CodeGraphTransactionBundle -Path $quarantine -Identity $Identity
+        Remove-Item -LiteralPath $quarantine -Recurse -Force
+        if (Test-Path -LiteralPath $quarantine) { throw "CodeGraph transaction quarantine removal did not complete: $quarantine" }
+    }
+    catch {
+        # Never restore a partially deleted bundle as trusted. Before destructive deletion,
+        # a failed boundary check can be restored only when the original pathname is still free.
+        if (Test-Path -LiteralPath $quarantine) {
+            if (-not (Test-Path -LiteralPath $Path)) {
+                try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
+            }
+        }
+        throw
+    }
+}
+'''
+          new_remove=r'''function Remove-CodeGraphTransactionBundle {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Identity)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-CodeGraphTransactionBundle -Path $Path -Identity $Identity
+    $parent = Split-Path -Parent $Path
+    $leaf = '.hms-codegraph-deleting-' + [guid]::NewGuid().ToString('N')
+    $quarantine = Join-Path $parent $leaf
+    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    $deleteStarted = $false
+    try {
+        Assert-CodeGraphTransactionBundle -Path $quarantine -Identity $Identity
+        $deleteStarted = $true
+        Remove-Item -LiteralPath $quarantine -Recurse -Force
+        if (Test-Path -LiteralPath $quarantine) { throw "CodeGraph transaction quarantine removal did not complete: $quarantine" }
+    }
+    catch {
+        $e = $_
+        if (-not $deleteStarted -and (Test-Path -LiteralPath $quarantine) -and -not (Test-Path -LiteralPath $Path)) {
+            try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
+        }
+        elseif ($deleteStarted -and (Test-Path -LiteralPath $quarantine)) {
+            throw "CodeGraph transaction deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+        }
+        throw $e
+    }
+}
+
+function Write-CodeGraphTempMarker {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$TransactionId)
+    Assert-RegularCodeGraphBundle -Path $Path -Label 'CodeGraph temporary root'
+    [ordered]@{ schema_version=1; managed_by=$ManagedBy; artifact='hms-codegraph-transaction-temp'; transaction_id=$TransactionId } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Path $CodeGraphTempMarkerName) -Encoding UTF8
+}
+
+function Assert-CodeGraphTempRoot {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$TransactionId)
+    Assert-RegularCodeGraphBundle -Path $Path -Label 'CodeGraph temporary root'
+    $markerPath = Join-Path $Path $CodeGraphTempMarkerName
+    $markerItem = Get-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+    if ($null -eq $markerItem -or [bool]$markerItem.PSIsContainer -or [bool]($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "CodeGraph temporary-root marker is missing or not a regular file: $Path"
+    }
+    try { $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json }
+    catch { throw "CodeGraph temporary-root marker is invalid JSON: $Path" }
+    if ([string]$marker.managed_by -cne $ManagedBy -or [string]$marker.artifact -cne 'hms-codegraph-transaction-temp' -or [string]$marker.transaction_id -cne $TransactionId) {
+        throw "CodeGraph temporary-root marker ownership mismatch: $Path"
+    }
+}
+
+function Remove-CodeGraphTempRoot {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$TransactionId)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-CodeGraphTempRoot -Path $Path -TransactionId $TransactionId
+    $parent = Split-Path -Parent $Path
+    $leaf = '.hms-codegraph-temp-removing-' + [guid]::NewGuid().ToString('N')
+    $quarantine = Join-Path $parent $leaf
+    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    $deleteStarted = $false
+    try {
+        Assert-CodeGraphTempRoot -Path $quarantine -TransactionId $TransactionId
+        $deleteStarted = $true
+        Remove-Item -LiteralPath $quarantine -Recurse -Force
+        if (Test-Path -LiteralPath $quarantine) { throw "CodeGraph temporary quarantine removal did not complete: $quarantine" }
+    }
+    catch {
+        $e = $_
+        if (-not $deleteStarted -and (Test-Path -LiteralPath $quarantine) -and -not (Test-Path -LiteralPath $Path)) {
+            try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
+        }
+        elseif ($deleteStarted -and (Test-Path -LiteralPath $quarantine)) {
+            throw "CodeGraph temporary deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+        }
+        throw $e
+    }
+}
+
+function Restore-CodeGraphManifestAfterFailure {
+    param(
+        [Parameter(Mandatory)]$CandidateManifest,
+        [byte[]]$PreviousBytes,
+        [Parameter(Mandatory)][bool]$HadPrevious
+    )
+    $item = Get-Item -LiteralPath $CodeGraphManifest -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item -or [bool]$item.PSIsContainer -or [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'CodeGraph candidate manifest is missing or not a regular file during rollback.'
+    }
+    try { $currentManifest = Get-Content -LiteralPath $CodeGraphManifest -Raw | ConvertFrom-Json }
+    catch { throw "CodeGraph candidate manifest is invalid during rollback: $($_.Exception.Message)" }
+    foreach ($field in @('managed_by','version','tag','commit','asset','sha256')) {
+        if ([string]$currentManifest.$field -cne [string]$CandidateManifest[$field]) {
+            throw "CodeGraph candidate manifest changed before rollback for '$field'; refusing to overwrite it."
+        }
+    }
+    if ($HadPrevious) {
+        if ($null -eq $PreviousBytes) { throw 'CodeGraph rollback is missing previous manifest bytes.' }
+        $parent = Split-Path -Parent $CodeGraphManifest
+        $temp = Join-Path $parent ('.hms-codegraph-manifest-restore-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        $discard = Join-Path $parent ('.hms-codegraph-manifest-discard-' + [guid]::NewGuid().ToString('N') + '.tmp')
+        try {
+            [IO.File]::WriteAllBytes($temp, $PreviousBytes)
+            [IO.File]::Replace($temp, $CodeGraphManifest, $discard, $true)
+        }
+        finally {
+            foreach ($cleanup in @($temp,$discard)) { if (Test-Path -LiteralPath $cleanup) { Remove-Item -LiteralPath $cleanup -Force -ErrorAction SilentlyContinue } }
+        }
+    }
+    else {
+        Remove-Item -LiteralPath $CodeGraphManifest -Force
+    }
+}
+'''
+          sync=replace_once(sync,old_remove,new_remove,'CodeGraph destructive helper block')
+          sync=replace_once(sync,
+          "    $existingManifest = Read-ManagedCodeGraphManifest\n    $wasInstalled = $null -ne $existingManifest\n",
+          "    $existingManifest = Read-ManagedCodeGraphManifest\n    $wasInstalled = $null -ne $existingManifest\n    $existingManifestBytes = $null\n    if ($wasInstalled) {\n        $manifestItem = Get-Item -LiteralPath $CodeGraphManifest -Force -ErrorAction Stop\n        if ([bool]$manifestItem.PSIsContainer -or [bool]($manifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Managed CodeGraph manifest must be a regular file.' }\n        $existingManifestBytes = [IO.File]::ReadAllBytes($CodeGraphManifest)\n    }\n",
+          'capture previous manifest bytes')
+          sync=replace_once(sync,
+          "        $backupIdentity = $null\n        try {\n            New-Item -ItemType Directory -Force -Path $extract | Out-Null\n",
+          "        $backupIdentity = $null\n        $manifestPublished = $false\n        $publishedManifest = $null\n        try {\n            New-Item -ItemType Directory -Force -Path $temp | Out-Null\n            Write-CodeGraphTempMarker -Path $temp -TransactionId $transactionId\n            Assert-CodeGraphTempRoot -Path $temp -TransactionId $transactionId\n            New-Item -ItemType Directory -Force -Path $extract | Out-Null\n",
+          'owned CodeGraph temp root')
+          old_manifest=r'''                $manifest = [ordered]@{
+                    managed_by = $ManagedBy
+                    version = [string]$Spec.version
+                    tag = [string]$Spec.tag
+                    commit = [string]$Spec.commit
+                    asset = $assetName
+                    sha256 = $expectedSha
+                }
+                $manifestTemp = "$CodeGraphManifest.tmp"
+                $manifest | ConvertTo-Json | Set-Content -LiteralPath $manifestTemp -Encoding UTF8
+                Move-Item -LiteralPath $manifestTemp -Destination $CodeGraphManifest -Force
+'''
+          new_manifest=r'''                $publishedManifest = [ordered]@{
+                    managed_by = $ManagedBy
+                    version = [string]$Spec.version
+                    tag = [string]$Spec.tag
+                    commit = [string]$Spec.commit
+                    asset = $assetName
+                    sha256 = $expectedSha
+                }
+                $manifestTemp = Join-Path $CodeGraphRoot ('.hms-codegraph-manifest-' + $transactionId + '.tmp')
+                $publishedManifest | ConvertTo-Json | Set-Content -LiteralPath $manifestTemp -Encoding UTF8
+                if ($wasInstalled) { [IO.File]::Replace($manifestTemp, $CodeGraphManifest, $null, $true) }
+                else { [IO.File]::Move($manifestTemp, $CodeGraphManifest) }
+                $manifestPublished = $true
+'''
+          sync=replace_once(sync,old_manifest,new_manifest,'atomic manifest publication')
+          sync=replace_once(sync,
+          "                catch { $rollbackErrors += $_.Exception.Message }\n                if ($rollbackErrors.Count -gt 0) {\n",
+          "                catch { $rollbackErrors += $_.Exception.Message }\n                try {\n                    if ($manifestPublished) { Restore-CodeGraphManifestAfterFailure -CandidateManifest $publishedManifest -PreviousBytes $existingManifestBytes -HadPrevious $wasInstalled }\n                }\n                catch { $rollbackErrors += $_.Exception.Message }\n                if ($rollbackErrors.Count -gt 0) {\n",
+          'manifest rollback transaction')
+          sync=replace_once(sync,
+          "        finally {\n            if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }\n        }\n",
+          "        finally {\n            if (Test-Path -LiteralPath $temp) { Remove-CodeGraphTempRoot -Path $temp -TransactionId $transactionId }\n        }\n",
+          'temp quarantine cleanup')
+          sync_path.write_text(sync,encoding='utf-8',newline='\n')
+
+          regression=Path('.github/workflows/validate-review-486-latest-p1.yml')
+          regression.write_text(r'''name: Validate HMS review 486 latest P1 boundaries
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  windows-review-486-latest-p1:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+      - name: Qualify source commit and CodeGraph rollback boundaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
+          $w=$env:GITHUB_WORKSPACE; $expected=$env:CANDIDATE_SHA.ToLowerInvariant(); $actual=((& git -C $w rev-parse HEAD)-join '').Trim().ToLowerInvariant()
+          if($LASTEXITCODE -ne 0 -or $actual -cne $expected){throw "Exact SHA mismatch: $actual"}
+          $impl=Join-Path $w 'scripts\Build-HmsCompositeSkill.impl.ps1'; $wrapper=Join-Path $w 'scripts\Build-HmsCompositeSkill.ps1'; $helper=Join-Path $w 'scripts\Copy-HmsCommittedGitPath.ps1'; $delivery=Join-Path $w 'scripts\Sync-DeliveryTools.ps1'
+          foreach($p in @($impl,$wrapper,$helper,$delivery)){ $t=$null;$e=$null;[Management.Automation.Language.Parser]::ParseFile($p,[ref]$t,[ref]$e)|Out-Null;if(@($e).Count){throw "Parser rejected $p"}}
+          $it=[IO.File]::ReadAllText($impl); $wt=[IO.File]::ReadAllText($wrapper); $ht=[IO.File]::ReadAllText($helper); $dt=[IO.File]::ReadAllText($delivery)
+          foreach($lit in @('[Parameter(Mandatory)][string]$ExpectedHead','$collectionHead = $ExpectedHead.Trim().ToLowerInvariant()','-ExpectedHead ([string]$sourceHeadsBefore[''hms''])','-ExpectedHead ([string]$sourceHeadsBefore[''superpowers''])')){if($it -notmatch [regex]::Escape($lit)){throw "Builder source-commit binding missing: $lit"}}
+          foreach($lit in @('-ExpectedHead `$ExpectedHead','-ExpectedHead ([string]`$sourceHeadsBefore[''hms''])')){if($wt -notmatch [regex]::Escape($lit)){throw "Builder wrapper source-commit binding missing: $lit"}}
+          if($ht -notmatch [regex]::Escape('[string]$ExpectedHead')){throw 'Committed-copy helper lacks caller-qualified ExpectedHead.'}
+
+          $root=Join-Path $env:RUNNER_TEMP ('hms-qualified-head-'+[guid]::NewGuid().ToString('N')); $repo=Join-Path $root 'repo'; $src=Join-Path $repo 'skill'; $out=Join-Path $root 'out'
+          try{New-Item -ItemType Directory -Force -Path $src|Out-Null;& git -C $repo init|Out-Null;& git -C $repo config user.email 'hms-ci@example.invalid';& git -C $repo config user.name 'HMS CI';[IO.File]::WriteAllText((Join-Path $src 'SKILL.md'),"A`n",(New-Object Text.UTF8Encoding($false)));& git -C $repo add .;& git -C $repo commit -m A|Out-Null;$a=((& git -C $repo rev-parse HEAD)-join '').Trim();[IO.File]::WriteAllText((Join-Path $src 'SKILL.md'),"B`n",(New-Object Text.UTF8Encoding($false)));& git -C $repo add .;& git -C $repo commit -m B|Out-Null;& $helper -Source $src -Destination $out -ExpectedHead $a;if([IO.File]::ReadAllText((Join-Path $out 'SKILL.md')) -cne "A`n"){throw 'Helper materialized live HEAD instead of caller-qualified commit.'}}finally{Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue}
+          Write-Host 'PASS: source enumeration/materialization is bound to the caller-qualified commit.'
+
+          foreach($lit in @('Restore-CodeGraphManifestAfterFailure','Remove-CodeGraphTempRoot','hms-codegraph-transaction-temp','existingManifestBytes','manifestPublished')){if($dt -notmatch [regex]::Escape($lit)){throw "CodeGraph rollback boundary missing: $lit"}}
+          if($dt -match [regex]::Escape('if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }')){throw 'CodeGraph temp still uses pathname recursive deletion.'}
+
+          function Get-Fn([string]$Path,[string[]]$Names){$to=$null;$er=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$to,[ref]$er);if(@($er).Count){throw 'parse'};$r=@();foreach($n in $Names){$x=@($ast.FindAll({param($z)$z -is [Management.Automation.Language.FunctionDefinitionAst] -and $z.Name -ceq $n},$true));if($x.Count-ne1){throw "fn $n count"};$r+=$x[0].Extent.Text};$r -join "`r`n`r`n"}
+          $defs=Get-Fn $delivery @('Assert-RegularCodeGraphBundle','Write-CodeGraphTempMarker','Assert-CodeGraphTempRoot','Remove-CodeGraphTempRoot','Restore-CodeGraphManifestAfterFailure')
+          $h=Join-Path $env:RUNNER_TEMP ('hms-cg-p1-'+[guid]::NewGuid().ToString('N')+'.ps1');$r=Join-Path $env:RUNNER_TEMP ('hms-cg-p1-root-'+[guid]::NewGuid().ToString('N'))
+          $script=@"
+          param([string]`$Root)
+          Set-StrictMode -Version Latest;`$ErrorActionPreference='Stop';`$ManagedBy='HMS-Skills-Codex';`$CodeGraphTempMarkerName='.hms-codegraph-temp.json';`$CodeGraphManifest=Join-Path `$Root 'hms-codegraph-install.json'
+          $defs
+          New-Item -ItemType Directory -Force -Path `$Root|Out-Null
+          `$old=[Text.Encoding]::UTF8.GetBytes('{"managed_by":"HMS-Skills-Codex","version":"old","tag":"old","commit":"old","asset":"old","sha256":"old"}')
+          `$candidate=[ordered]@{managed_by='HMS-Skills-Codex';version='new';tag='new';commit='new';asset='new';sha256='new'}
+          [IO.File]::WriteAllText(`$CodeGraphManifest,(`$candidate|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
+          Restore-CodeGraphManifestAfterFailure -CandidateManifest `$candidate -PreviousBytes `$old -HadPrevious `$true
+          if(-not ([Linq.Enumerable]::SequenceEqual([byte[]][IO.File]::ReadAllBytes(`$CodeGraphManifest),[byte[]]`$old))){throw 'Previous manifest bytes were not restored exactly.'}
+          `$temp=Join-Path `$Root 'temp';New-Item -ItemType Directory -Force -Path `$temp|Out-Null;Write-CodeGraphTempMarker -Path `$temp -TransactionId 'tx';`$sentinel=Join-Path `$temp 'FOREIGN.txt';`$job=Start-Job -ScriptBlock {param(`$P,`$S);`$d=[DateTime]::UtcNow.AddSeconds(20);while((Test-Path `$P)-and [DateTime]::UtcNow-lt`$d){Start-Sleep -Milliseconds 2};New-Item -ItemType Directory -Force -Path `$P|Out-Null;Set-Content `$S foreign} -ArgumentList `$temp,`$sentinel
+          try{Remove-CodeGraphTempRoot -Path `$temp -TransactionId 'tx';Wait-Job `$job -Timeout 20|Out-Null;Receive-Job `$job -ErrorAction Stop|Out-Null;if(-not(Test-Path `$sentinel)){throw 'Foreign temp replacement was deleted.'}}finally{Remove-Job `$job -Force -ErrorAction SilentlyContinue}
+          "@
+          [IO.File]::WriteAllText($h,$script,(New-Object Text.UTF8Encoding($false)));try{& $h -Root $r}finally{Remove-Item $h -Force -ErrorAction SilentlyContinue;Remove-Item $r -Recurse -Force -ErrorAction SilentlyContinue}
+          Write-Host 'PASS: CodeGraph rollback restores prior manifest bytes and temp cleanup preserves foreign replacement.'
+          Write-Host 'PASS: all three review-486 latest P1 boundaries are qualified on exact candidate HEAD.'
+''',encoding='utf-8',newline='\n')
+          '@ | python -
+
+          foreach($p in @('scripts/Build-HmsCompositeSkill.impl.ps1','scripts/Build-HmsCompositeSkill.ps1','scripts/Sync-DeliveryTools.ps1')){
+            $t=$null;$e=$null;[Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE $p),[ref]$t,[ref]$e)|Out-Null
+            if(@($e).Count){throw "Parser rejected remediated $p : $((@($e)|ForEach-Object Message)-join ' | ')"}
+          }
+          git diff --check
+          if($LASTEXITCODE -ne 0){throw 'git diff --check failed'}
+          git config user.name 'HMS Remediation Bot'
+          git config user.email 'hms-remediation@users.noreply.github.com'
+          git add scripts/Build-HmsCompositeSkill.impl.ps1 scripts/Build-HmsCompositeSkill.ps1 scripts/Sync-DeliveryTools.ps1 .github/workflows/validate-review-486-latest-p1.yml
+          git commit -m 'fix: close review 486 source and CodeGraph transactions'
+          if($LASTEXITCODE -ne 0){throw 'remediation commit failed'}
+          git push origin HEAD:stage/hms-superpowers-v0.2.0-ui-design-authority
+          if($LASTEXITCODE -ne 0){throw 'remediation push failed'}
