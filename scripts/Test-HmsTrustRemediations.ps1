@@ -29,7 +29,12 @@ $badAuthority = 'Owner instruction and current project authority always outrank 
 foreach ($literal in @(
     'Copy-HmsCommittedGitPath.ps1',
     'Write-SupportBlobExact',
-    'cat-file blob',
+    'archive --format=zip',
+    'core.autocrlf=false',
+    'objects\info\alternates',
+    'info\attributes',
+    'export-ignore',
+    'hash-object --no-filters',
     'superpowers.lock.json',
     'ui-skills.lock.json',
     'ExpectedHmsSupportHead',
@@ -38,15 +43,18 @@ foreach ($literal in @(
     'Project-specific authority never bypasses an HMS checkpoint, fail-closed/safety rule, or required model floor.',
     'Generated composite omitted the canonical HMS authority precedence.'
 )) {
-    if ($builderText -notmatch [regex]::Escape($literal)) { throw "Builder trust wrapper is missing required contract literal: $literal" }
+    if ($builderText -notmatch [regex]::Escape($literal)) { throw "Builder trust wrapper is missing required isolated-transport contract literal: $literal" }
 }
 foreach ($literal in @(
-    'Write-GitBlobExact',
-    'cat-file blob',
+    'archive --format=zip',
+    'core.autocrlf=false',
+    'objects\info\alternates',
+    'info\attributes',
+    'export-subst',
     'hash-object --no-filters',
-    'materialized committed Git blobs directly from HEAD'
+    'isolated no-EOL archive transport'
 )) {
-    if ($helperText -notmatch [regex]::Escape($literal)) { throw "Committed-copy helper is missing required raw-blob contract literal: $literal" }
+    if ($helperText -notmatch [regex]::Escape($literal)) { throw "Committed-copy helper is missing required exact-HEAD archive contract literal: $literal" }
 }
 foreach ($entry in @(
     [pscustomobject]@{ Name='installer'; Text=$installText },
@@ -59,11 +67,14 @@ foreach ($entry in @(
 if ($builderText -match [regex]::Escape("'$badAuthority'")) {
     throw 'Builder trust wrapper retained the superseded generated authority rule.'
 }
-if ($builderText -match 'git\s+-C\s+\$repoRoot\s+archive' -or $helperText -match 'git\s+-C\s+\$repoRoot\s+archive') {
-    throw 'Raw committed-byte materialization regressed to git archive.'
+if ($builderText -match [regex]::Escape('cat-file blob') -or $helperText -match [regex]::Escape('cat-file blob')) {
+    throw 'Committed-byte materialization regressed to the Windows background-job-hanging git cat-file content mode.'
+}
+if ($builderText -match [regex]::Escape('StandardOutput.BaseStream.CopyTo') -or $helperText -match [regex]::Escape('StandardOutput.BaseStream.CopyTo')) {
+    throw 'Committed-byte materialization regressed to native Git content-to-stdout stream copying.'
 }
 
-# Trust-root regression: public bootstrap must detect its own hidden drift; all other support/lock inputs execute from HEAD blobs.
+# Trust-root regression: public bootstrap must detect its own hidden drift; all other support/lock inputs execute from exact HEAD bytes.
 $supportTemp = Join-Path ([IO.Path]::GetTempPath()) ('hms-support-bind-' + [guid]::NewGuid().ToString('N'))
 $supportRepo = Join-Path $supportTemp 'repo'
 $supportScripts = Join-Path $supportRepo 'scripts'
@@ -153,7 +164,7 @@ Set-Content -LiteralPath (Join-Path $target 'SKILL.md') -Value (($lines + $uiSeq
     & git -C $supportRepo restore --worktree -- $builderRelative
     if ($LASTEXITCODE -ne 0) { throw 'Failed to restore public builder after self-drift regression.' }
 
-    # Implementation/helper/lock worktree bytes are hidden and malicious; build must still use committed HEAD blobs.
+    # Implementation/helper/lock worktree bytes are hidden and malicious; build must still use committed HEAD bytes.
     foreach ($relative in @($supportRelative,$helperRelative,$superLockRelative,$uiLockRelative)) {
         & git -C $supportRepo update-index --skip-worktree -- $relative
         if ($LASTEXITCODE -ne 0) { throw "Failed to set skip-worktree on support fixture: $relative" }
@@ -230,14 +241,15 @@ try {
 
     & $copyHelperPath -Source $skill -Destination $destination
     $publishedPath = Join-Path $destination 'SKILL.md'
-    if (-not (Test-Path -LiteralPath $publishedPath)) { throw 'Raw-blob helper did not publish the expected SKILL.md.' }
+    if (-not (Test-Path -LiteralPath $publishedPath)) { throw 'Exact-HEAD helper did not publish the expected SKILL.md.' }
     $published = [IO.File]::ReadAllText($publishedPath)
-    if ($published -cne $committedText) { throw 'Raw-blob helper output differs from committed fixture bytes.' }
-    if ($published -match [regex]::Escape($sentinel)) { throw 'skip-worktree worktree bytes leaked into raw-blob output.' }
+    if ($published -cne $committedText) { throw 'Exact-HEAD helper output differs from committed fixture bytes.' }
+    if ($published -match [regex]::Escape($sentinel)) { throw 'skip-worktree worktree bytes leaked into exact-HEAD output.' }
     $publishedBlob = ((& git -C $repo hash-object --no-filters -- $publishedPath) -join '').Trim().ToLowerInvariant()
     if ($LASTEXITCODE -ne 0 -or $publishedBlob -cne $committedBlob) { throw "Published bytes are not the committed Git blob. Expected $committedBlob, found $publishedBlob." }
 
-    # Repository-local archive attributes must be irrelevant because the helper reads raw blob objects directly.
+    # Source-repository info attributes must be irrelevant because materialization runs through an isolated bare transport
+    # with neutral highest-precedence attributes and literal per-file blob verification.
     $infoAttributes = Join-Path $repo '.git\info\attributes'
     $hadInfoAttributes = Test-Path -LiteralPath $infoAttributes
     $originalInfoAttributes = if ($hadInfoAttributes) { [IO.File]::ReadAllText($infoAttributes) } else { $null }
@@ -245,23 +257,23 @@ try {
         [IO.File]::WriteAllText($infoAttributes, "skills/test-skill/SKILL.md export-subst export-ignore`n", $utf8NoBom)
         & $copyHelperPath -Source $skill -Destination $attributeDestination
         $attributePath = Join-Path $attributeDestination 'SKILL.md'
-        if (-not (Test-Path -LiteralPath $attributePath)) { throw 'Raw-blob helper was incorrectly affected by export-ignore.' }
+        if (-not (Test-Path -LiteralPath $attributePath)) { throw 'Isolated exact-HEAD helper was incorrectly affected by source export-ignore.' }
         $attributeText = [IO.File]::ReadAllText($attributePath)
-        if ($attributeText -cne $committedText) { throw 'Repository-local export attributes transformed raw committed bytes.' }
-        if ($attributeText -notmatch [regex]::Escape('$Format:%H$')) { throw 'export-subst altered literal committed content.' }
+        if ($attributeText -cne $committedText) { throw 'Source-repository export attributes transformed isolated committed bytes.' }
+        if ($attributeText -notmatch [regex]::Escape('$Format:%H$')) { throw 'Source export-subst altered literal committed content.' }
         $attributeBlob = ((& git -C $repo hash-object --no-filters -- $attributePath) -join '').Trim().ToLowerInvariant()
-        if ($LASTEXITCODE -ne 0 -or $attributeBlob -cne $committedBlob) { throw 'Raw-blob materialization under archive attributes no longer matches committed blob identity.' }
+        if ($LASTEXITCODE -ne 0 -or $attributeBlob -cne $committedBlob) { throw 'Isolated archive materialization under adversarial source attributes no longer matches committed blob identity.' }
     }
     finally {
         if ($hadInfoAttributes) { [IO.File]::WriteAllText($infoAttributes, $originalInfoAttributes, $utf8NoBom) }
         else { Remove-Item -LiteralPath $infoAttributes -Force -ErrorAction SilentlyContinue }
     }
 
-    if ([IO.File]::ReadAllText($skillPath) -notmatch [regex]::Escape($sentinel)) { throw 'Raw-blob helper mutated the adversarial source worktree.' }
+    if ([IO.File]::ReadAllText($skillPath) -notmatch [regex]::Escape($sentinel)) { throw 'Exact-HEAD helper mutated the adversarial source worktree.' }
 }
 finally {
     if ($skipFlagSet -and (Test-Path -LiteralPath $repo)) { & git -C $repo update-index --no-skip-worktree -- $relativeSkill 2>$null }
     if (Test-Path -LiteralPath $tempRoot) { Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
-Write-Host 'PASS: public builder hidden drift is rejected; implementation/helper/lock support executes from exact HMS HEAD blobs; binary cat-file source materialization defeats skip-worktree and archive/filter transformations; lifecycle scripts reject hidden index state; generated authority precedence is enforced.'
+Write-Host 'PASS: public builder hidden drift is rejected; implementation/helper/lock support executes from exact HMS HEAD blobs; isolated neutral archive transport defeats skip-worktree and source archive/filter transformations with literal blob verification; lifecycle scripts reject hidden index state; generated authority precedence is enforced.'
