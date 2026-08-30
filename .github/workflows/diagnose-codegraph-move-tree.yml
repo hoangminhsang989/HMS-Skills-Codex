@@ -15,7 +15,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Compare exact tree before and after move
+      - name: Emit one-line move identity oracle
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
@@ -27,28 +27,32 @@ jobs:
           function Snapshot([string]$Path) {
             $root=(Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\')
             $markerFull=[IO.Path]::GetFullPath((Join-Path $root $markerName))
-            Write-Host "ROOT=$root"
-            Write-Host "MARKER_FULL=$markerFull"
             $m=[ordered]@{}
+            $markerItemFull='<missing>'
+            $markerRelative='<missing>'
+            $markerMatch=$false
             foreach($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)) {
               if([bool]$item.PSIsContainer){continue}
               $full=[IO.Path]::GetFullPath($item.FullName)
               $isMarker=[string]::Equals($full,$markerFull,[StringComparison]::OrdinalIgnoreCase)
               $relative=$item.FullName.Substring($root.Length).TrimStart('\').Replace('\','/')
-              if($item.Name -ceq $markerName -or $isMarker){Write-Host "MARKER_ITEM_FULL=$full";Write-Host "MARKER_REL=$relative";Write-Host "MARKER_MATCH=$isMarker"}
+              if($item.Name -ceq $markerName){$markerItemFull=$full;$markerRelative=$relative;$markerMatch=$isMarker}
               if($isMarker){continue}
               $m[$relative]=(Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             }
-            return $m
+            [pscustomobject]@{Root=$root;MarkerFull=$markerFull;MarkerItemFull=$markerItemFull;MarkerRelative=$markerRelative;MarkerMatch=$markerMatch;Map=$m}
           }
           function TreeHash($Map){
             $records=@($Map.Keys|ForEach-Object{[string]$_+"`t"+[string]$Map[$_]}|Sort-Object)
             $payload=[string]::Join("`n",$records)
             $sha=[Security.Cryptography.SHA256]::Create();try{return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload)))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
           }
-          function ShowDiff($A,$B){
+          function DiffSummary($A,$B){
+            $out=New-Object System.Collections.Generic.List[string]
             $keys=@($A.Keys)+@($B.Keys)|Sort-Object -Unique
-            foreach($k in $keys){$av=if($A.Contains($k)){$A[$k]}else{'<missing>'};$bv=if($B.Contains($k)){$B[$k]}else{'<missing>'};if($av -cne $bv){Write-Host "DIFF $k : $av -> $bv"}}
+            foreach($k in $keys){$av=if($A.Contains($k)){$A[$k]}else{'<missing>'};$bv=if($B.Contains($k)){$B[$k]}else{'<missing>'};if($av -cne $bv){$out.Add([string]$k)}}
+            if($out.Count -eq 0){return '<none>'}
+            return (($out|Select-Object -First 8)-join ',')
           }
           $temp=Join-Path $env:TEMP ('hms-cg-move-'+[guid]::NewGuid().ToString('N'))
           $zip=Join-Path $temp ([string]$asset.name)
@@ -67,13 +71,13 @@ jobs:
             Get-ChildItem -LiteralPath $inner -Force|ForEach-Object{Move-Item -LiteralPath $_.FullName -Destination $flat -Force}
             $cmd=Join-Path $flat 'bin\codegraph.cmd'
             $out=(& $cmd --version 2>&1)-join "`n";if($LASTEXITCODE -ne 0){throw "version failed: $out"}
-            $s0=Snapshot $flat; $h0=TreeHash $s0; Write-Host "HASH_BEFORE_MARKER=$h0"
+            $s0=Snapshot $flat; $h0=TreeHash $s0.Map
             [IO.File]::WriteAllText((Join-Path $flat $markerName),'{"transaction_id":"0123456789abcdef0123456789abcdef"}',(New-Object Text.UTF8Encoding($false)))
-            $s1=Snapshot $flat; $h1=TreeHash $s1; Write-Host "HASH_AFTER_MARKER=$h1";ShowDiff $s0 $s1
+            $s1=Snapshot $flat; $h1=TreeHash $s1.Map
             Move-Item -LiteralPath $flat -Destination $current
-            $s2=Snapshot $current; $h2=TreeHash $s2; Write-Host "HASH_AFTER_MOVE=$h2";ShowDiff $s1 $s2
-            if($h0 -cne $h1){throw "marker changed authenticated tree: $h0 -> $h1"}
-            if($h1 -cne $h2){throw "move changed authenticated tree: $h1 -> $h2"}
+            $s2=Snapshot $current; $h2=TreeHash $s2.Map
+            $diff=DiffSummary $s1.Map $s2.Map
+            throw ("MOVE_TREE_ORACLE|R1={0}|MF1={1}|MI1={2}|MR1={3}|MM1={4}|H0={5}|H1={6}|R2={7}|MF2={8}|MI2={9}|MR2={10}|MM2={11}|H2={12}|DIFF={13}" -f $s1.Root,$s1.MarkerFull,$s1.MarkerItemFull,$s1.MarkerRelative,$s1.MarkerMatch,$h0,$h1,$s2.Root,$s2.MarkerFull,$s2.MarkerItemFull,$s2.MarkerRelative,$s2.MarkerMatch,$h2,$diff)
           }
           finally {
             Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
