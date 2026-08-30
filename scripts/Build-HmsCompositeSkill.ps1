@@ -26,37 +26,74 @@ function Get-ExpectedSupportBlob {
     if ($LASTEXITCODE -ne 0 -or $value -notmatch '^[0-9a-f]{40}$') {
         throw "$Label support materialization could not resolve committed blob: $RelativePath"
     }
+    $type = ((& git -C $repoRoot cat-file -t $value 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $type -cne 'blob') { throw "$Label committed support object is not a blob: $RelativePath" }
     return $value
+}
+
+function Write-SupportBlobExact {
+    param(
+        [Parameter(Mandatory)][string]$BlobSha,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$Label
+    )
+    if ($BlobSha -notmatch '^[0-9a-f]{40}$') { throw "$Label support blob SHA is invalid: $BlobSha" }
+    $parent = Split-Path -Parent $Destination
+    if (-not [string]::IsNullOrWhiteSpace($parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+    if (Test-Path -LiteralPath $Destination) { throw "$Label support destination already exists: $Destination" }
+
+    $gitExe = [string](Get-Command git -ErrorAction Stop).Source
+    if ([string]::IsNullOrWhiteSpace($gitExe)) { throw "$Label could not resolve git executable." }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $gitExe
+    $psi.WorkingDirectory = $repoRoot
+    $psi.Arguments = "cat-file blob $BlobSha"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    $stream = $null
+    try {
+        if (-not $process.Start()) { throw "$Label git cat-file process failed to start." }
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $stream = New-Object System.IO.FileStream($Destination,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $process.StandardOutput.BaseStream.CopyTo($stream)
+        $stream.Flush()
+        $stream.Dispose(); $stream = $null
+        $process.WaitForExit()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            throw "$Label git cat-file failed with exit code $($process.ExitCode): $stderr"
+        }
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        $process.Dispose()
+    }
+
+    $actual = ((& git -C $repoRoot hash-object --no-filters -- $Destination 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $actual -notmatch '^[0-9a-f]{40}$') { throw "$Label exact support materialization could not be hashed." }
+    if ($actual -cne $BlobSha) {
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        throw "$Label binary cat-file support materialization mismatch. Expected $BlobSha, found $actual."
+    }
 }
 
 $expectedImplementation = Get-ExpectedSupportBlob -RelativePath $implementationRelative -Label 'Composite implementation'
 $expectedHelper = Get-ExpectedSupportBlob -RelativePath $helperRelative -Label 'Committed-copy helper'
 $supportToken = [guid]::NewGuid().ToString('N')
-$supportArchive = Join-Path ([IO.Path]::GetTempPath()) ("hms-builder-support-$supportToken.zip")
 $supportRoot = Join-Path ([IO.Path]::GetTempPath()) ("hms-builder-support-$supportToken")
 
 try {
-    & git -C $repoRoot archive --format=zip "--output=$supportArchive" $head -- $implementationRelative $helperRelative
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $supportArchive)) {
-        throw 'Composite support Git-object archive failed.'
-    }
-    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
     New-Item -ItemType Directory -Force -Path $supportRoot | Out-Null
-    [IO.Compression.ZipFile]::ExtractToDirectory($supportArchive, $supportRoot)
-
-    $implementationPath = Join-Path $supportRoot ($implementationRelative -replace '/', '\')
-    $committedCopyHelper = Join-Path $supportRoot ($helperRelative -replace '/', '\')
-    foreach ($entry in @(
-        [pscustomobject]@{ Path=$implementationPath; Expected=$expectedImplementation; Label='Composite implementation' },
-        [pscustomobject]@{ Path=$committedCopyHelper; Expected=$expectedHelper; Label='Committed-copy helper' }
-    )) {
-        if (-not (Test-Path -LiteralPath $entry.Path -PathType Leaf)) { throw "$($entry.Label) committed support file is missing after archive extraction." }
-        $actual = ((& git -C $repoRoot hash-object --no-filters -- $entry.Path 2>$null) -join '').Trim().ToLowerInvariant()
-        if ($LASTEXITCODE -ne 0 -or $actual -notmatch '^[0-9a-f]{40}$') { throw "$($entry.Label) committed support file could not be hashed." }
-        if ($actual -cne [string]$entry.Expected) {
-            throw "$($entry.Label) archived support file does not match exact HEAD blob. Expected $($entry.Expected), found $actual. Archive attributes/filters must not transform support bytes."
-        }
-    }
+    $implementationPath = Join-Path $supportRoot 'Build-HmsCompositeSkill.impl.ps1'
+    $committedCopyHelper = Join-Path $supportRoot 'Copy-HmsCommittedGitPath.ps1'
+    Write-SupportBlobExact -BlobSha $expectedImplementation -Destination $implementationPath -Label 'Composite implementation'
+    Write-SupportBlobExact -BlobSha $expectedHelper -Destination $committedCopyHelper -Label 'Committed-copy helper'
 
     $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
     try { $source = [IO.File]::ReadAllText($implementationPath, $utf8Strict) }
@@ -101,19 +138,14 @@ try {
     $generatedSkill = Join-Path (Join-Path $OutputRoot 'hms-superpowers') 'SKILL.md'
     if (-not (Test-Path -LiteralPath $generatedSkill)) { throw "Generated composite SKILL.md is missing after build: $generatedSkill" }
     $generatedText = [IO.File]::ReadAllText($generatedSkill, $utf8Strict)
-    if ($generatedText -notmatch [regex]::Escape($authorityLiteral)) {
-        throw 'Generated composite omitted the canonical HMS authority precedence.'
-    }
-    if ($generatedText -match [regex]::Escape($legacyAuthorityLiteral)) {
-        throw 'Generated composite retained the superseded project-authority precedence.'
-    }
+    if ($generatedText -notmatch [regex]::Escape($authorityLiteral)) { throw 'Generated composite omitted the canonical HMS authority precedence.' }
+    if ($generatedText -match [regex]::Escape($legacyAuthorityLiteral)) { throw 'Generated composite retained the superseded project-authority precedence.' }
     if ($generatedText -notmatch [regex]::Escape('Project-specific authority never bypasses an HMS checkpoint, fail-closed/safety rule, or required model floor.')) {
         throw 'Generated composite did not preserve the project-authority safety boundary.'
     }
 
-    Write-Host 'PASS: composite support bytes and source copies are exact-HEAD Git-object-derived; generated authority precedence is pinned below HMS checkpoint/safety/model-floor gates.'
+    Write-Host 'PASS: composite support and source bytes are materialized directly from exact HEAD blobs via binary git cat-file; generated authority precedence is pinned below HMS checkpoint/safety/model-floor gates.'
 }
 finally {
-    Remove-Item -LiteralPath $supportArchive -Force -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $supportRoot) { Remove-Item -LiteralPath $supportRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
