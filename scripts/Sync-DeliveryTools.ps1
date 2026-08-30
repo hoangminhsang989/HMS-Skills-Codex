@@ -436,7 +436,7 @@ function Sync-CodeGraphBundle {
                 }
                 catch { $rollbackErrors += $_.Exception.Message }
                 try {
-                    if ($manifestPublished) { Restore-CodeGraphManifestAfterFailure -CandidateManifest $publishedManifest -PreviousBytes $existingManifestBytes -HadPrevious $wasInstalled }
+                    if ($rollbackErrors.Count -eq 0 -and $manifestPublished) { Restore-CodeGraphManifestAfterFailure -CandidateManifest $publishedManifest -PreviousBytes $existingManifestBytes -HadPrevious $wasInstalled }
                 }
                 catch { $rollbackErrors += $_.Exception.Message }
                 if ($rollbackErrors.Count -gt 0) {
