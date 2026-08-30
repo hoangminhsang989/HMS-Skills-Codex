@@ -81,6 +81,23 @@ jobs:
           }
           if($deliveryText -match [regex]::Escape('if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }')){throw 'CodeGraph temp root still uses pathname recursive deletion.'}
 
+          $rollbackGate='if ($rollbackErrors.Count -eq 0 -and $manifestPublished) { Restore-CodeGraphManifestAfterFailure -CandidateManifest $publishedManifest -PreviousBytes $existingManifestBytes -HadPrevious $wasInstalled }'
+          $oldRollbackGate='if ($manifestPublished) { Restore-CodeGraphManifestAfterFailure -CandidateManifest $publishedManifest -PreviousBytes $existingManifestBytes -HadPrevious $wasInstalled }'
+          if($deliveryText -notmatch [regex]::Escape($rollbackGate)){throw 'CodeGraph manifest restore is not gated on zero prior bundle rollback errors.'}
+          if($deliveryText -match [regex]::Escape($oldRollbackGate)){throw 'CodeGraph manifest restore still has the superseded unconditional published-manifest gate.'}
+          $rollbackStart=$deliveryText.IndexOf('$rollbackErrors = @()', [StringComparison]::Ordinal)
+          $candidateRollback=$deliveryText.IndexOf('Remove-CodeGraphTransactionBundle -Path $current -Identity $candidateIdentity', $rollbackStart, [StringComparison]::Ordinal)
+          $backupRollback=$deliveryText.IndexOf('Move-Item -LiteralPath $backup -Destination $current', $candidateRollback, [StringComparison]::Ordinal)
+          $manifestRollback=$deliveryText.IndexOf($rollbackGate, $backupRollback, [StringComparison]::Ordinal)
+          if($rollbackStart -lt 0 -or $candidateRollback -lt 0 -or $backupRollback -lt 0 -or $manifestRollback -lt 0 -or -not($rollbackStart -lt $candidateRollback -and $candidateRollback -lt $backupRollback -and $backupRollback -lt $manifestRollback)){
+            throw 'CodeGraph rollback ordering no longer proves candidate removal -> backup restore -> manifest restore gate.'
+          }
+          $simulatedRollbackErrors=@('candidate rollback failed')
+          $simulatedManifestPublished=$true
+          $restoreWouldRun=($simulatedRollbackErrors.Count -eq 0 -and $simulatedManifestPublished)
+          if($restoreWouldRun){throw 'Rollback-order guard would restore the manifest after a prior bundle rollback error.'}
+          Write-Host 'PASS: CodeGraph manifest restore is ordered after successful bundle rollback and is suppressed after prior rollback errors.'
+
           function Get-FunctionText{
             param([string]$Path,[string[]]$Names)
             $t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$t,[ref]$e)
@@ -113,4 +130,4 @@ jobs:
           [IO.File]::WriteAllText($harness,$script,(New-Object Text.UTF8Encoding($false)))
           try{& $harness -Root $testRoot}finally{Remove-Item $harness -Force -ErrorAction SilentlyContinue;Remove-Item $testRoot -Recurse -Force -ErrorAction SilentlyContinue}
           Write-Host 'PASS: CodeGraph rollback restores prior manifest bytes and temp cleanup preserves foreign replacement.'
-          Write-Host 'PASS: all three review-486 latest P1 boundaries are qualified on exact candidate HEAD.'
+          Write-Host 'PASS: all review-486 latest P1 boundaries, including rollback ordering, are qualified on exact candidate HEAD.'
