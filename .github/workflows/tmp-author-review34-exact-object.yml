@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   author:
-    if: github.event.head_commit.message == 'Add temporary review34 exact-object author workflow'
+    if: github.event.head_commit.message == 'Retry temporary review34 exact-object author workflow'
     runs-on: windows-latest
     steps:
       - name: Checkout author head
@@ -45,6 +45,36 @@ jobs:
           '@
           $text = $text.Replace($needle,$insert + $needle)
           [IO.File]::WriteAllText($path,$text,(New-Object Text.UTF8Encoding($false)))
+
+      - name: Normalize generated exact-object helper syntax
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $paths = @(
+            'scripts\Build-HmsCompositeSkill.impl.ps1',
+            'scripts\Sync-DeliveryTools.ps1',
+            'uninstall.ps1'
+          )
+          $replacements = [ordered]@{
+            "if(`$env:OS-cne'Windows_NT')" = "if (`$env:OS -cne 'Windows_NT')"
+            'if($null-eq$h-or$h.IsInvalid)' = 'if ($null -eq $h -or $h.IsInvalid)'
+            'if($null-ne$h)' = 'if ($null -ne $h)'
+            'if($before-cne[string]$Guard.Identity)' = 'if ($before -cne [string]$Guard.Identity)'
+            'if($after-cne[string]$Guard.Identity)' = 'if ($after -cne [string]$Guard.Identity)'
+            'foreach($child in@(' = 'foreach ($child in @('
+            'if(-not$deleteStarted-and$renamed-and$null-ne$guard.Handle-and-not$guard.Handle.IsClosed-and-not(' = 'if (-not $deleteStarted -and $renamed -and $null -ne $guard.Handle -and -not $guard.Handle.IsClosed -and -not ('
+            'elseif($deleteStarted-and(' = 'elseif ($deleteStarted -and ('
+            'if($null-ne$guard-and$null-ne$guard.Handle)' = 'if ($null -ne $guard -and $null -ne $guard.Handle)'
+            'if(-not(Test-Path' = 'if (-not (Test-Path'
+            'if(-not[HmsDeliveryExactFsNative]::DeleteByHandle' = 'if (-not [HmsDeliveryExactFsNative]::DeleteByHandle'
+            'if(-not[HmsUninstallExactFsNative]::DeleteByHandle' = 'if (-not [HmsUninstallExactFsNative]::DeleteByHandle'
+          }
+          foreach ($relative in $paths) {
+            $path = Join-Path $env:GITHUB_WORKSPACE $relative
+            $text = [IO.File]::ReadAllText($path)
+            foreach ($entry in $replacements.GetEnumerator()) { $text = $text.Replace([string]$entry.Key,[string]$entry.Value) }
+            [IO.File]::WriteAllText($path,$text,(New-Object Text.UTF8Encoding($false)))
+          }
 
       - name: Parse all changed PowerShell
         shell: pwsh
