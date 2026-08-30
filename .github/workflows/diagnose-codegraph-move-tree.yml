@@ -1,0 +1,81 @@
+name: Diagnose CodeGraph move tree identity
+
+on:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.2.0-ui-design-authority
+    paths:
+      - .github/workflows/diagnose-codegraph-move-tree.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Compare exact tree before and after move
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Set-StrictMode -Version Latest
+          $lock=Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'delivery-tools.lock.json') -Raw|ConvertFrom-Json
+          $spec=$lock.codegraph
+          $asset=$spec.windows_assets.x64
+          $markerName='.hms-codegraph-bundle.json'
+          function Snapshot([string]$Path) {
+            $root=(Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\')
+            $markerFull=[IO.Path]::GetFullPath((Join-Path $root $markerName))
+            Write-Host "ROOT=$root"
+            Write-Host "MARKER_FULL=$markerFull"
+            $m=[ordered]@{}
+            foreach($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)) {
+              if([bool]$item.PSIsContainer){continue}
+              $full=[IO.Path]::GetFullPath($item.FullName)
+              $isMarker=[string]::Equals($full,$markerFull,[StringComparison]::OrdinalIgnoreCase)
+              $relative=$item.FullName.Substring($root.Length).TrimStart('\').Replace('\','/')
+              if($item.Name -ceq $markerName -or $isMarker){Write-Host "MARKER_ITEM_FULL=$full";Write-Host "MARKER_REL=$relative";Write-Host "MARKER_MATCH=$isMarker"}
+              if($isMarker){continue}
+              $m[$relative]=(Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+            return $m
+          }
+          function TreeHash($Map){
+            $records=@($Map.Keys|ForEach-Object{[string]$_+"`t"+[string]$Map[$_]}|Sort-Object)
+            $payload=[string]::Join("`n",$records)
+            $sha=[Security.Cryptography.SHA256]::Create();try{return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload)))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+          }
+          function ShowDiff($A,$B){
+            $keys=@($A.Keys)+@($B.Keys)|Sort-Object -Unique
+            foreach($k in $keys){$av=if($A.Contains($k)){$A[$k]}else{'<missing>'};$bv=if($B.Contains($k)){$B[$k]}else{'<missing>'};if($av -cne $bv){Write-Host "DIFF $k : $av -> $bv"}}
+          }
+          $temp=Join-Path $env:TEMP ('hms-cg-move-'+[guid]::NewGuid().ToString('N'))
+          $zip=Join-Path $temp ([string]$asset.name)
+          $extract=Join-Path $temp 'extract'
+          $flat=Join-Path $temp 'flat'
+          $destParent=Join-Path $env:USERPROFILE '.codex\hms-cg-move-diag'
+          $current=Join-Path $destParent 'current'
+          try {
+            New-Item -ItemType Directory -Force -Path $extract,$flat,$destParent|Out-Null
+            $url="https://github.com/colbymchenry/codegraph/releases/download/$([string]$spec.tag)/$([string]$asset.name)"
+            Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
+            $actual=(Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+            if($actual -cne [string]$asset.sha256){throw "asset SHA mismatch: $actual"}
+            Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+            $inner=Join-Path $extract 'codegraph-win32-x64'
+            Get-ChildItem -LiteralPath $inner -Force|ForEach-Object{Move-Item -LiteralPath $_.FullName -Destination $flat -Force}
+            $cmd=Join-Path $flat 'bin\codegraph.cmd'
+            $out=(& $cmd --version 2>&1)-join "`n";if($LASTEXITCODE -ne 0){throw "version failed: $out"}
+            $s0=Snapshot $flat; $h0=TreeHash $s0; Write-Host "HASH_BEFORE_MARKER=$h0"
+            [IO.File]::WriteAllText((Join-Path $flat $markerName),'{"transaction_id":"0123456789abcdef0123456789abcdef"}',(New-Object Text.UTF8Encoding($false)))
+            $s1=Snapshot $flat; $h1=TreeHash $s1; Write-Host "HASH_AFTER_MARKER=$h1";ShowDiff $s0 $s1
+            Move-Item -LiteralPath $flat -Destination $current
+            $s2=Snapshot $current; $h2=TreeHash $s2; Write-Host "HASH_AFTER_MOVE=$h2";ShowDiff $s1 $s2
+            if($h0 -cne $h1){throw "marker changed authenticated tree: $h0 -> $h1"}
+            if($h1 -cne $h2){throw "move changed authenticated tree: $h1 -> $h2"}
+          }
+          finally {
+            Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $destParent -Recurse -Force -ErrorAction SilentlyContinue
+          }
