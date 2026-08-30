@@ -32,6 +32,16 @@ $ModelDefinitions = @(
     }
 )
 
+$RiskFloorMap = [ordered]@{
+    'FAST_LOW_RISK / HIGH_VOLUME_MECHANICAL' = 'LUNA_LOW_RISK'
+    'NORMAL_WORK' = 'TERRA_MEDIUM_OR_STRONGER'
+    'MODERATE_DEBUG_OR_IMPLEMENTATION' = 'TERRA_HIGH_OR_STRONGER'
+    'COMPLEX_WORK' = 'SOL_HIGH'
+    'ARCHITECTURE_SECURITY_MIGRATION' = 'SOL_XHIGH'
+    'CRITICAL_BLOCKER_RELEASE_GATE' = 'SOL_MAX'
+    'FINAL_STAGE_REVIEW' = 'SOL_MAX_AND_INDEPENDENT_REVIEW'
+}
+
 function Assert-ResolverAvailable {
     if (-not (Test-Path -LiteralPath $ResolverPath)) { throw "Model resolver is missing: $ResolverPath" }
 }
@@ -40,18 +50,44 @@ function New-DefaultModelState {
     return [ordered]@{ luna=$true; terra=$true; sol=$true }
 }
 
+function Assert-ExactSchemaVersionOne {
+    param([Parameter(Mandatory)]$Value)
+    $type = $Value.GetType()
+    $isInteger = ($type -eq [int]) -or ($type -eq [long])
+    if (-not $isInteger -or [long]$Value -ne 1) {
+        throw "Unsupported model settings schema_version type/value: $($type.FullName) / $Value"
+    }
+}
+
+function Assert-StateBooleans {
+    param([Parameter(Mandatory)]$State)
+    foreach ($key in @('luna','terra','sol')) {
+        $value = $State[$key]
+        if ($value -isnot [bool]) { throw "Model state '$key' must be boolean." }
+    }
+}
+
 function Convert-StateToSettingsObject {
     param([Parameter(Mandatory)]$State)
+    Assert-StateBooleans -State $State
     return [ordered]@{
         schema_version = 1
         managed_by = 'HMS-Skills-Codex'
         artifact = 'hms-model-settings'
         updated_at_utc = [DateTime]::UtcNow.ToString('o')
         models = [ordered]@{
-            luna = [bool]$State.luna
-            terra = [bool]$State.terra
-            sol = [bool]$State.sol
+            luna = $State.luna
+            terra = $State.terra
+            sol = $State.sol
         }
+    }
+}
+
+function Assert-RegularSettingsFile {
+    param([Parameter(Mandatory)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Model settings path must be a regular file: $Path"
     }
 }
 
@@ -59,11 +95,13 @@ function Read-ModelState {
     param([string]$Path = $SettingsPath)
 
     if (-not (Test-Path -LiteralPath $Path)) { return New-DefaultModelState }
+    Assert-RegularSettingsFile -Path $Path
 
     try { $settings = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json }
     catch { throw "Model settings are invalid JSON: $($_.Exception.Message)" }
 
-    if ([int]$settings.schema_version -ne 1) { throw "Unsupported model settings schema_version: $($settings.schema_version)" }
+    if ($null -eq $settings.PSObject.Properties['schema_version']) { throw 'Model settings are missing schema_version.' }
+    Assert-ExactSchemaVersionOne -Value $settings.schema_version
     if ([string]$settings.managed_by -cne 'HMS-Skills-Codex') { throw 'Model settings ownership mismatch.' }
     if ([string]$settings.artifact -cne 'hms-model-settings') { throw 'Model settings artifact mismatch.' }
     if ($null -eq $settings.models) { throw 'Model settings are missing models.' }
@@ -73,7 +111,7 @@ function Read-ModelState {
         $property = $settings.models.PSObject.Properties[$key]
         if ($null -eq $property) { throw "Model settings are missing '$key'." }
         if ($property.Value -isnot [bool]) { throw "Model setting '$key' must be boolean." }
-        $state[$key] = [bool]$property.Value
+        $state[$key] = $property.Value
     }
     return $state
 }
@@ -84,50 +122,76 @@ function Write-ModelState {
         [string]$Path = $SettingsPath
     )
 
+    Assert-StateBooleans -State $State
     $parent = Split-Path -Parent $Path
     New-Item -ItemType Directory -Force -Path $parent | Out-Null
+
+    $existingItem = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    $hadExisting = $null -ne $existingItem
+    if ($hadExisting) {
+        Assert-RegularSettingsFile -Path $Path
+        $null = Read-ModelState -Path $Path
+    }
 
     $settings = Convert-StateToSettingsObject -State $State
     $json = $settings | ConvertTo-Json -Depth 6
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     $temp = Join-Path $parent ('.model-settings-' + [guid]::NewGuid().ToString('N') + '.tmp')
     $backup = Join-Path $parent ('.model-settings-' + [guid]::NewGuid().ToString('N') + '.bak')
+    $rollbackDiscard = Join-Path $parent ('.model-settings-' + [guid]::NewGuid().ToString('N') + '.rollback')
 
     try {
         [IO.File]::WriteAllText($temp, $json, $utf8)
         $null = Read-ModelState -Path $temp
 
-        $hadExisting = Test-Path -LiteralPath $Path
-        if ($hadExisting) { Move-Item -LiteralPath $Path -Destination $backup -ErrorAction Stop }
+        if ($hadExisting) {
+            # File.Replace is atomic on the same volume: readers see either the old
+            # canonical file or the new one, never an absent canonical path.
+            [IO.File]::Replace($temp, $Path, $backup, $true)
+        }
+        else {
+            # First creation has no prior persisted policy to preserve. Same-directory
+            # File.Move publishes the complete file in one namespace operation.
+            [IO.File]::Move($temp, $Path)
+        }
 
         try {
-            Move-Item -LiteralPath $temp -Destination $Path -ErrorAction Stop
             $verified = Read-ModelState -Path $Path
             foreach ($key in @('luna','terra','sol')) {
-                if ([bool]$verified[$key] -ne [bool]$State[$key]) { throw "Model setting verification mismatch for '$key'." }
+                if ($verified[$key] -ne $State[$key]) { throw "Model setting verification mismatch for '$key'." }
             }
         }
         catch {
-            $writeError = $_
-            if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
-            if (Test-Path -LiteralPath $backup) { Move-Item -LiteralPath $backup -Destination $Path -ErrorAction Stop }
-            throw $writeError
+            $verifyError = $_
+            if ($hadExisting -and (Test-Path -LiteralPath $backup)) {
+                if (Test-Path -LiteralPath $Path) {
+                    [IO.File]::Replace($backup, $Path, $rollbackDiscard, $true)
+                }
+                else {
+                    [IO.File]::Move($backup, $Path)
+                }
+            }
+            elseif (-not $hadExisting -and (Test-Path -LiteralPath $Path)) {
+                Remove-Item -LiteralPath $Path -Force
+            }
+            throw $verifyError
         }
-
-        if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
     }
     finally {
-        if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force }
+        foreach ($cleanup in @($temp,$backup,$rollbackDiscard)) {
+            if (Test-Path -LiteralPath $cleanup) { Remove-Item -LiteralPath $cleanup -Force }
+        }
     }
 }
 
 function Resolve-Route {
     param(
         [Parameter(Mandatory)][string]$RiskClass,
+        [Parameter(Mandatory)][string]$RequiredFloor,
         [string]$Path = $SettingsPath
     )
     Assert-ResolverAvailable
-    return & $ResolverPath -RiskClass $RiskClass -SettingsPath $Path
+    return & $ResolverPath -RiskClass $RiskClass -RequiredFloor $RequiredFloor -SettingsPath $Path
 }
 
 function Invoke-ModelSettingsSelfTest {
@@ -144,40 +208,69 @@ function Invoke-ModelSettingsSelfTest {
 
         $allOn = [ordered]@{ luna=$true; terra=$true; sol=$true }
         Write-ModelState -State $allOn -Path $path
-        $normal = Resolve-Route -RiskClass 'NORMAL_WORK' -Path $path
+        $normal = Resolve-Route -RiskClass 'NORMAL_WORK' -RequiredFloor 'TERRA_MEDIUM_OR_STRONGER' -Path $path
         if ($normal.status -cne 'ASSIGNED' -or $normal.assigned_model -cne 'gpt-5.6-terra' -or [bool]$normal.reassigned) {
             throw 'All-ON routing did not assign NORMAL_WORK to Terra.'
         }
 
         $lunaOff = [ordered]@{ luna=$false; terra=$true; sol=$true }
         Write-ModelState -State $lunaOff -Path $path
-        $fast = Resolve-Route -RiskClass 'FAST_LOW_RISK / HIGH_VOLUME_MECHANICAL' -Path $path
+        $fast = Resolve-Route -RiskClass 'FAST_LOW_RISK / HIGH_VOLUME_MECHANICAL' -RequiredFloor 'LUNA_LOW_RISK' -Path $path
         if ($fast.status -cne 'ASSIGNED' -or $fast.assigned_model -cne 'gpt-5.6-terra' -or -not [bool]$fast.reassigned) {
             throw 'Luna-OFF routing did not safely reassign low-risk work to Terra.'
         }
 
         $terraOff = [ordered]@{ luna=$true; terra=$false; sol=$true }
         Write-ModelState -State $terraOff -Path $path
-        $moderate = Resolve-Route -RiskClass 'MODERATE_DEBUG_OR_IMPLEMENTATION' -Path $path
+        $moderate = Resolve-Route -RiskClass 'MODERATE_DEBUG_OR_IMPLEMENTATION' -RequiredFloor 'TERRA_HIGH_OR_STRONGER' -Path $path
         if ($moderate.status -cne 'ASSIGNED' -or $moderate.assigned_model -cne 'gpt-5.6-sol' -or -not [bool]$moderate.reassigned) {
             throw 'Terra-OFF routing did not safely reassign moderate work to Sol.'
         }
 
         $solOff = [ordered]@{ luna=$true; terra=$true; sol=$false }
         Write-ModelState -State $solOff -Path $path
-        $architecture = Resolve-Route -RiskClass 'ARCHITECTURE_SECURITY_MIGRATION' -Path $path
+        $architecture = Resolve-Route -RiskClass 'ARCHITECTURE_SECURITY_MIGRATION' -RequiredFloor 'SOL_XHIGH' -Path $path
         if ($architecture.status -cne 'BLOCKED' -or $architecture.reason -cne 'NO_ENABLED_MODEL_SATISFIES_REQUIRED_FLOOR') {
             throw 'Sol-OFF routing did not fail closed for Sol-required architecture work.'
         }
 
+        # Prove a higher-authority floor is consumed directly rather than recomputed
+        # from the NORMAL_WORK label.
+        $raisedFloor = Resolve-Route -RiskClass 'NORMAL_WORK' -RequiredFloor 'SOL_XHIGH' -Path $path
+        if ($raisedFloor.status -cne 'BLOCKED' -or $raisedFloor.required_floor -cne 'SOL_XHIGH') {
+            throw 'Raised required floor was not preserved by the dispatcher.'
+        }
+
+        $loweredRejected = $false
+        try {
+            $null = Resolve-Route -RiskClass 'ARCHITECTURE_SECURITY_MIGRATION' -RequiredFloor 'TERRA_HIGH_OR_STRONGER' -Path $path
+        }
+        catch {
+            if ($_.Exception.Message -match 'below risk-class minimum') { $loweredRejected = $true } else { throw }
+        }
+        if (-not $loweredRejected) { throw 'Dispatcher accepted a required floor below the risk-class minimum.' }
+
         $allOff = [ordered]@{ luna=$false; terra=$false; sol=$false }
         Write-ModelState -State $allOff -Path $path
-        $blocked = Resolve-Route -RiskClass 'NORMAL_WORK' -Path $path
+        $blocked = Resolve-Route -RiskClass 'NORMAL_WORK' -RequiredFloor 'TERRA_MEDIUM_OR_STRONGER' -Path $path
         if ($blocked.status -cne 'BLOCKED' -or $blocked.reason -cne 'NO_ENABLED_MODEL_SATISFIES_REQUIRED_FLOOR') {
             throw 'All-OFF routing did not block model-routed work.'
         }
 
-        Write-Host 'PASS: HMS Model Settings verified ON/OFF persistence, Luna->Terra fallback, Terra->Sol fallback, and fail-closed Sol-required routing.'
+        # Strict JSON typing: values that merely coerce to schema 1 or boolean must fail.
+        Remove-Item -LiteralPath $path -Force
+        [IO.File]::WriteAllText($path, '{"schema_version":true,"managed_by":"HMS-Skills-Codex","artifact":"hms-model-settings","models":{"luna":true,"terra":true,"sol":true}}', (New-Object System.Text.UTF8Encoding($false)))
+        $schemaRejected = $false
+        try { $null = Read-ModelState -Path $path } catch { if ($_.Exception.Message -match 'schema_version') { $schemaRejected = $true } else { throw } }
+        if (-not $schemaRejected) { throw 'Boolean schema_version was incorrectly accepted as schema version 1.' }
+
+        Remove-Item -LiteralPath $path -Force
+        [IO.File]::WriteAllText($path, '{"schema_version":1,"managed_by":"HMS-Skills-Codex","artifact":"hms-model-settings","models":{"luna":"false","terra":true,"sol":true}}', (New-Object System.Text.UTF8Encoding($false)))
+        $booleanRejected = $false
+        try { $null = Read-ModelState -Path $path } catch { if ($_.Exception.Message -match 'must be boolean') { $booleanRejected = $true } else { throw } }
+        if (-not $booleanRejected) { throw 'String model toggle was incorrectly accepted as boolean.' }
+
+        Write-Host 'PASS: HMS Model Settings verified atomic persistence, strict schema typing, direct required-floor dispatch, Luna->Terra fallback, Terra->Sol fallback, and fail-closed Sol-required routing.'
     }
     finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
@@ -252,7 +345,8 @@ foreach ($model in $ModelDefinitions) {
     $vi.Text = 'Tiếng Việt: ' + $model.DescriptionVi
     $vi.ForeColor = [System.Drawing.Color]::FromArgb(50, 70, 95)
     $vi.Location = New-Object System.Drawing.Point(38, 63)
-    $vi.Size = New-Object System.Drawing.Size(640, 34)
+    $vi.MaximumSize = New-Object System.Drawing.Size(640, 0)
+    $vi.AutoSize = $true
     $panel.Controls.Add($vi)
 
     $form.Controls.Add($panel)
@@ -311,8 +405,8 @@ function Read-UiState {
 
 function Refresh-UiState {
     $state = Read-ModelState
-    foreach ($key in @('luna','terra','sol')) { $checks[$key].Checked = [bool]$state[$key] }
-    $enabled = @($state.Keys | Where-Object { [bool]$state[$_] })
+    foreach ($key in @('luna','terra','sol')) { $checks[$key].Checked = $state[$key] }
+    $enabled = @($state.Keys | Where-Object { $state[$_] })
     if ($enabled.Count -eq 0) {
         $status.Text = 'Model pool: OFF - no model can receive routed HMS work.'
         $status.ForeColor = [System.Drawing.Color]::DarkRed
@@ -353,18 +447,9 @@ $allOffButton.Add_Click({
 $testButton.Add_Click({
     try {
         Save-UiState
-        $classes = @(
-            'FAST_LOW_RISK / HIGH_VOLUME_MECHANICAL',
-            'NORMAL_WORK',
-            'MODERATE_DEBUG_OR_IMPLEMENTATION',
-            'COMPLEX_WORK',
-            'ARCHITECTURE_SECURITY_MIGRATION',
-            'CRITICAL_BLOCKER_RELEASE_GATE',
-            'FINAL_STAGE_REVIEW'
-        )
         $lines = @()
-        foreach ($class in $classes) {
-            $route = Resolve-Route -RiskClass $class
+        foreach ($class in @($RiskFloorMap.Keys)) {
+            $route = Resolve-Route -RiskClass $class -RequiredFloor ([string]$RiskFloorMap[$class])
             if ($route.status -ceq 'ASSIGNED') {
                 $lines += ($class + ' -> ' + $route.assigned_model + ' / ' + $route.effort)
             }
