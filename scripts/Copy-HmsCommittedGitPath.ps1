@@ -30,57 +30,107 @@ function Get-LiteralBlobHash {
     param([Parameter(Mandatory)][string]$RepoRoot,[Parameter(Mandatory)][string]$Path)
     $value = ((& git -C $RepoRoot hash-object --no-filters -- $Path 2>$null) -join '').Trim().ToLowerInvariant()
     if ($LASTEXITCODE -ne 0 -or $value -notmatch '^[0-9a-f]{40}$') {
-        throw "Unable to compute literal Git blob hash for extracted file: $Path"
+        throw "Unable to compute literal Git blob hash for materialized file: $Path"
     }
     return $value
 }
 
-function Assert-MaterializedFilesMatchHead {
+function Assert-SafeRelativeGitPath {
+    param([Parameter(Mandatory)][string]$RelativePath)
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) { throw 'Committed-copy tree produced an empty relative path.' }
+    if ($RelativePath.Contains('\')) { throw "Committed-copy Git path contains a backslash and is unsafe on Windows: $RelativePath" }
+    if ($RelativePath.StartsWith('/') -or $RelativePath -match '^[A-Za-z]:') { throw "Committed-copy Git path is rooted: $RelativePath" }
+    foreach ($segment in @($RelativePath -split '/')) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -eq '.' -or $segment -eq '..') {
+            throw "Committed-copy Git path contains an unsafe segment: $RelativePath"
+        }
+    }
+}
+
+function Get-SafeDestinationPath {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$RelativePath
+    )
+    Assert-SafeRelativeGitPath -RelativePath $RelativePath
+    $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\','/')
+    $candidate = $rootFull
+    foreach ($segment in @($RelativePath -split '/')) { $candidate = Join-Path $candidate $segment }
+    $candidateFull = [IO.Path]::GetFullPath($candidate)
+    $prefix = $rootFull + [IO.Path]::DirectorySeparatorChar
+    if (-not $candidateFull.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Committed-copy destination escaped managed root: $RelativePath"
+    }
+    return $candidateFull
+}
+
+function Write-GitBlobExact {
     param(
         [Parameter(Mandatory)][string]$RepoRoot,
-        [Parameter(Mandatory)][string]$MaterializedPath,
-        [Parameter(Mandatory)][string]$SourceType,
-        [Parameter(Mandatory)]$ExpectedBlobs
+        [Parameter(Mandatory)][string]$BlobSha,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string]$Mode
     )
 
-    if ($SourceType -ceq 'blob') {
-        if (-not (Test-Path -LiteralPath $MaterializedPath -PathType Leaf)) {
-            throw "Committed-copy materialization expected one file but did not find it: $MaterializedPath"
+    if ($BlobSha -notmatch '^[0-9a-f]{40}$') { throw "Invalid committed blob SHA: $BlobSha" }
+    if ($Mode -notin @('100644','100755')) { throw "Unsupported committed file mode: $Mode" }
+    if (Test-Path -LiteralPath $Destination) { throw "Committed-copy materialization destination already exists: $Destination" }
+
+    $parent = Split-Path -Parent $Destination
+    if (-not [string]::IsNullOrWhiteSpace($parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+
+    $gitCommand = Get-Command git -ErrorAction Stop
+    $gitExe = [string]$gitCommand.Source
+    if ([string]::IsNullOrWhiteSpace($gitExe)) { throw 'Unable to resolve git executable for binary cat-file materialization.' }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $gitExe
+    $psi.WorkingDirectory = $RepoRoot
+    $psi.Arguments = "cat-file blob $BlobSha"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    $started = $false
+    $stream = $null
+    try {
+        $started = $process.Start()
+        if (-not $started) { throw "git cat-file failed to start for blob $BlobSha" }
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $stream = New-Object System.IO.FileStream($Destination,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $process.StandardOutput.BaseStream.CopyTo($stream)
+        $stream.Flush()
+        $stream.Dispose(); $stream = $null
+        $process.WaitForExit()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            throw "git cat-file failed for blob $BlobSha with exit code $($process.ExitCode): $stderr"
         }
-        if ($ExpectedBlobs.Count -ne 1) { throw 'Committed-copy blob verification expected exactly one Git blob.' }
-        $expected = [string](@($ExpectedBlobs.Values)[0])
-        $actual = Get-LiteralBlobHash -RepoRoot $RepoRoot -Path $MaterializedPath
-        if ($actual -cne $expected) {
-            throw "Committed-copy materialized blob mismatch. Expected $expected, found $actual. Archive attributes/filters must not transform committed bytes."
-        }
-        return
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        $process.Dispose()
     }
 
-    if (-not (Test-Path -LiteralPath $MaterializedPath -PathType Container)) {
-        throw "Committed-copy materialization expected a directory tree: $MaterializedPath"
+    $actual = Get-LiteralBlobHash -RepoRoot $RepoRoot -Path $Destination
+    if ($actual -cne $BlobSha) {
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        throw "Binary cat-file materialization mismatch. Expected $BlobSha, found $actual."
     }
-    $files = @(Get-ChildItem -LiteralPath $MaterializedPath -File -Recurse -Force)
-    if ($files.Count -ne $ExpectedBlobs.Count) {
-        throw "Committed-copy materialized file count mismatch. Expected $($ExpectedBlobs.Count), found $($files.Count). Archive export-ignore/local attributes must not change the committed tree."
-    }
-    foreach ($file in $files) {
-        $relative = $file.FullName.Substring($MaterializedPath.Length).TrimStart('\','/').Replace('\','/')
-        if (-not $ExpectedBlobs.Contains($relative)) {
-            throw "Committed-copy materialization contains an unexpected file: $relative"
-        }
-        $expected = [string]$ExpectedBlobs[$relative]
-        $actual = Get-LiteralBlobHash -RepoRoot $RepoRoot -Path $file.FullName
-        if ($actual -cne $expected) {
-            throw "Committed-copy materialized blob mismatch for '$relative'. Expected $expected, found $actual. Archive attributes/filters must not transform committed bytes."
-        }
+
+    if ($Mode -ceq '100755' -and $env:OS -cne 'Windows_NT') {
+        & chmod 755 -- $Destination
+        if ($LASTEXITCODE -ne 0) { throw "Failed to restore executable mode on materialized file: $Destination" }
     }
 }
 
 $sourceFull = Get-FullPathWithoutExistenceRequirement -Path $Source
 $probePath = Get-ExistingProbePath -Path $Source
-if (-not (Test-Path -LiteralPath $probePath -PathType Container)) {
-    $probePath = Split-Path -Parent $probePath
-}
+if (-not (Test-Path -LiteralPath $probePath -PathType Container)) { $probePath = Split-Path -Parent $probePath }
 
 $repoTopRaw = ((& git -C $probePath rev-parse --show-toplevel 2>$null) -join '').Trim()
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoTopRaw)) {
@@ -114,13 +164,14 @@ $treeLines = @(& git -C $repoRoot -c 'core.quotePath=false' ls-tree -r $head -- 
 if ($LASTEXITCODE -ne 0 -or $treeLines.Count -eq 0) {
     throw "Committed-copy tree could not be enumerated from HEAD $head : $pathSpec"
 }
-$expectedBlobs = [ordered]@{}
+$entries = [ordered]@{}
 $treePrefix = if ($pathSpec -ceq '.') { '' } else { $pathSpec.TrimEnd('/') + '/' }
 foreach ($line in $treeLines) {
     $text = [string]$line
     if ($text -notmatch '^(100644|100755) blob ([0-9a-f]{40})\t(.+)$') {
-        throw "Committed-copy path contains a non-regular or unparseable Git entry; refusing archive extraction: $text"
+        throw "Committed-copy path contains a non-regular or unparseable Git entry: $text"
     }
+    $mode = $Matches[1]
     $blob = $Matches[2].ToLowerInvariant()
     $repoRelative = $Matches[3].Replace('\','/')
     if ($sourceType -ceq 'blob') {
@@ -132,62 +183,37 @@ foreach ($line in $treeLines) {
         }
         $relative = if ([string]::IsNullOrEmpty($treePrefix)) { $repoRelative } else { $repoRelative.Substring($treePrefix.Length) }
     }
-    if ([string]::IsNullOrWhiteSpace($relative) -or $expectedBlobs.Contains($relative)) {
-        throw "Committed-copy tree produced an invalid/duplicate relative path: $relative"
-    }
-    $expectedBlobs[$relative] = $blob
+    Assert-SafeRelativeGitPath -RelativePath $relative
+    if ($entries.Contains($relative)) { throw "Committed-copy tree produced a duplicate relative path: $relative" }
+    $entries[$relative] = [pscustomobject]@{ Mode=$mode; Blob=$blob }
 }
-if ($sourceType -ceq 'blob' -and $expectedBlobs.Count -ne 1) {
-    throw "Committed-copy blob source enumerated $($expectedBlobs.Count) files instead of one: $pathSpec"
-}
-
-if (Test-Path -LiteralPath $Destination) {
-    throw "Committed-copy destination already exists: $Destination"
+if ($sourceType -ceq 'blob' -and $entries.Count -ne 1) {
+    throw "Committed-copy blob source enumerated $($entries.Count) files instead of one: $pathSpec"
 }
 
-$token = [guid]::NewGuid().ToString('N')
-$archivePath = Join-Path ([IO.Path]::GetTempPath()) ("hms-committed-$token.zip")
-$extractRoot = Join-Path ([IO.Path]::GetTempPath()) ("hms-committed-$token")
-try {
-    & git -C $repoRoot archive --format=zip "--output=$archivePath" $head -- $pathSpec
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archivePath)) {
-        throw "git archive failed for committed source $head : $pathSpec"
-    }
+if (Test-Path -LiteralPath $Destination) { throw "Committed-copy destination already exists: $Destination" }
 
-    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
-    New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
-    [IO.Compression.ZipFile]::ExtractToDirectory($archivePath, $extractRoot)
-
-    $extracted = $extractRoot
-    if ($pathSpec -ne '.') {
-        foreach ($segment in @($pathSpec -split '/')) {
-            if ([string]::IsNullOrWhiteSpace($segment)) { continue }
-            $extracted = Join-Path $extracted $segment
+if ($sourceType -ceq 'blob') {
+    $entry = @($entries.Values)[0]
+    Write-GitBlobExact -RepoRoot $repoRoot -BlobSha ([string]$entry.Blob) -Destination $Destination -Mode ([string]$entry.Mode)
+}
+else {
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    try {
+        foreach ($relative in @($entries.Keys)) {
+            $entry = $entries[$relative]
+            $target = Get-SafeDestinationPath -Root $Destination -RelativePath ([string]$relative)
+            Write-GitBlobExact -RepoRoot $repoRoot -BlobSha ([string]$entry.Blob) -Destination $target -Mode ([string]$entry.Mode)
+        }
+        $materializedFiles = @(Get-ChildItem -LiteralPath $Destination -File -Recurse -Force)
+        if ($materializedFiles.Count -ne $entries.Count) {
+            throw "Committed-copy materialized file count mismatch. Expected $($entries.Count), found $($materializedFiles.Count)."
         }
     }
-    if (-not (Test-Path -LiteralPath $extracted)) {
-        throw "Committed-copy archive did not contain expected path: $pathSpec"
-    }
-
-    Assert-MaterializedFilesMatchHead -RepoRoot $repoRoot -MaterializedPath $extracted -SourceType $sourceType -ExpectedBlobs $expectedBlobs
-
-    $destinationParent = Split-Path -Parent $Destination
-    if (-not [string]::IsNullOrWhiteSpace($destinationParent)) {
-        New-Item -ItemType Directory -Force -Path $destinationParent | Out-Null
-    }
-    $item = Get-Item -LiteralPath $extracted -Force -ErrorAction Stop
-    if ($item.PSIsContainer) {
-        Copy-Item -LiteralPath $extracted -Destination $Destination -Recurse -Force
-    }
-    else {
-        Copy-Item -LiteralPath $extracted -Destination $Destination -Force
-    }
-
-    Assert-MaterializedFilesMatchHead -RepoRoot $repoRoot -MaterializedPath $Destination -SourceType $sourceType -ExpectedBlobs $expectedBlobs
-}
-finally {
-    Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
-    if (Test-Path -LiteralPath $extractRoot) {
-        Remove-Item -LiteralPath $extractRoot -Recurse -Force -ErrorAction SilentlyContinue
+    catch {
+        Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction SilentlyContinue
+        throw
     }
 }
+
+Write-Host "PASS: materialized committed Git blobs directly from HEAD $head without worktree/archive/filter transformation: $pathSpec"
