@@ -1,26 +1,28 @@
 name: Invoke review 486 P1 remediation
 
 on:
-  push:
-    branches:
-      - stage/hms-superpowers-v0.2.0-ui-design-authority
+  pull_request:
 
 permissions:
   contents: write
 
 jobs:
   remediate:
-    if: github.event.head_commit.message == 'chore: invoke registered review 486 P1 remediation'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: stage/hms-superpowers-v0.2.0-ui-design-authority
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
       - name: Execute staged exact remediation script
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
+          $message = ((& git log -1 --format=%s) -join '').Trim()
+          if($message -cne 'chore: invoke registered review 486 P1 remediation v2') {
+            Write-Host "No remediation action for head message: $message"
+            exit 0
+          }
           $source = Join-Path $env:GITHUB_WORKSPACE '.github\workflows\remediate-review-486-p1.yml'
           $lines = [IO.File]::ReadAllLines($source)
           $marker = -1
