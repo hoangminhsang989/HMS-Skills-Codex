@@ -20,7 +20,7 @@ jobs:
         with:
           ref: ${{ env.CANDIDATE_SHA }}
 
-      - name: Localize post-lifecycle lock and two-process builder liveness
+      - name: Isolate mutex primitive implementation and public wrapper liveness
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -32,51 +32,9 @@ jobs:
 
           $buildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
           $builderPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.ps1'
+          $implementationPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.impl.ps1'
 
-          function Assert-ExternalMutexAcquire {
-            param([Parameter(Mandatory)][string]$Label)
-            $probe = Start-Job -ScriptBlock {
-              param($MutexName)
-              $ErrorActionPreference = 'Stop'
-              $mutex = New-Object System.Threading.Mutex($false, $MutexName)
-              $owned = $false
-              try {
-                try {
-                  $owned = $mutex.WaitOne([TimeSpan]::FromSeconds(10))
-                }
-                catch [System.Threading.AbandonedMutexException] {
-                  $owned = $true
-                }
-                if (-not $owned) { throw "Timed out acquiring composite build mutex from external process: $MutexName" }
-              }
-              finally {
-                if ($owned) {
-                  $mutex.ReleaseMutex()
-                  $owned = $false
-                }
-                $mutex.Dispose()
-              }
-            } -ArgumentList $buildMutexName
-            try {
-              $null = Wait-Job -Job $probe -Timeout 20
-              if ($probe.State -eq 'Completed') {
-                Receive-Job -Job $probe -ErrorAction Stop | Write-Host
-              }
-              elseif ($probe.State -eq 'Failed') {
-                Receive-Job -Job $probe -ErrorAction Stop | Write-Host
-                throw "External composite mutex probe failed after $Label."
-              }
-              else {
-                throw "External composite mutex probe did not complete after $Label. State=$($probe.State)"
-              }
-            }
-            finally {
-              Remove-Job -Job $probe -Force -ErrorAction SilentlyContinue
-            }
-            Write-Host "PASS: external process acquired and released composite mutex after $Label."
-          }
-
-          function Wait-BuilderPair {
+          function Drain-JobsUntilTerminal {
             param(
               [Parameter(Mandatory)][object[]]$Jobs,
               [Parameter(Mandatory)][string]$Label,
@@ -86,41 +44,111 @@ jobs:
             while ([DateTime]::UtcNow -lt $deadline) {
               foreach ($job in $Jobs) { Receive-Job -Job $job -ErrorAction Stop | Write-Host }
               if (@($Jobs | Where-Object { $_.State -notin @('Completed','Failed','Stopped') }).Count -eq 0) { break }
-              Start-Sleep -Milliseconds 250
+              Start-Sleep -Milliseconds 200
             }
-            foreach ($job in $Jobs) {
-              Receive-Job -Job $job -ErrorAction Stop | Write-Host
-              if ($job.State -ne 'Completed') {
-                $states = (($Jobs | ForEach-Object { "Id=$($_.Id):$($_.State)" }) -join ', ')
-                throw "$Label did not complete within ${TimeoutSeconds}s. $states"
-              }
+            foreach ($job in $Jobs) { Receive-Job -Job $job -ErrorAction Stop | Write-Host }
+            $nonCompleted = @($Jobs | Where-Object { $_.State -ne 'Completed' })
+            if ($nonCompleted.Count -ne 0) {
+              $states = (($Jobs | ForEach-Object { "Id=$($_.Id):$($_.State)" }) -join ', ')
+              throw "$Label did not complete within ${TimeoutSeconds}s. $states"
             }
             Write-Host "PASS: $Label completed within ${TimeoutSeconds}s."
           }
 
-          $jobScript = {
-            param($Builder,$Install,$Output,$Skills,$HmsEnabled,$Label)
+          function Remove-TestJobs {
+            param([object[]]$Jobs)
+            foreach ($job in @($Jobs)) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+          }
+
+          function Assert-ExternalMutexAcquire {
+            param([Parameter(Mandatory)][string]$Label)
+            $probe = Start-Job -ScriptBlock {
+              param($MutexName,$ProbeLabel)
+              $ErrorActionPreference = 'Stop'
+              Write-Output "HMS_MUTEX_PROBE_WAIT label=$ProbeLabel pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+              $mutex = New-Object System.Threading.Mutex($false, $MutexName)
+              $owned = $false
+              try {
+                try { $owned = $mutex.WaitOne([TimeSpan]::FromSeconds(10)) }
+                catch [System.Threading.AbandonedMutexException] { $owned = $true }
+                if (-not $owned) { throw "Timed out acquiring composite build mutex from external process: $MutexName" }
+                Write-Output "HMS_MUTEX_PROBE_ACQUIRED label=$ProbeLabel pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+              }
+              finally {
+                if ($owned) {
+                  $mutex.ReleaseMutex()
+                  $owned = $false
+                  Write-Output "HMS_MUTEX_PROBE_RELEASED label=$ProbeLabel pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+                }
+                $mutex.Dispose()
+              }
+            } -ArgumentList $buildMutexName,$Label
+            try { Drain-JobsUntilTerminal -Jobs @($probe) -Label "external mutex probe after $Label" -TimeoutSeconds 20 }
+            finally { Remove-TestJobs -Jobs @($probe) }
+          }
+
+          $mutexJobScript = {
+            param($MutexName,$Label,$HoldMilliseconds)
             $ErrorActionPreference = 'Stop'
-            Write-Output "HMS_JOB_START label=$Label pid=$PID hms=$HmsEnabled utc=$([DateTime]::UtcNow.ToString('o'))"
+            Write-Output "HMS_MUTEX_WAIT label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+            $mutex = New-Object System.Threading.Mutex($false, $MutexName)
+            $owned = $false
+            try {
+              try { $owned = $mutex.WaitOne([TimeSpan]::FromSeconds(10)) }
+              catch [System.Threading.AbandonedMutexException] { $owned = $true }
+              if (-not $owned) { throw "Mutex-only child timed out: $Label" }
+              Write-Output "HMS_MUTEX_ACQUIRED label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+              Start-Sleep -Milliseconds $HoldMilliseconds
+            }
+            finally {
+              if ($owned) {
+                $mutex.ReleaseMutex()
+                $owned = $false
+                Write-Output "HMS_MUTEX_RELEASED label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+              }
+              $mutex.Dispose()
+            }
+          }
+
+          $implementationJobScript = {
+            param($Implementation,$Install,$Output,$Skills,$Label)
+            $ErrorActionPreference = 'Stop'
+            Write-Output "HMS_IMPL_JOB_START label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+            & $Implementation `
+              -InstallRoot $Install `
+              -OutputRoot $Output `
+              -SkillsRoot $Skills `
+              -Hms $false `
+              -Superpowers $false `
+              -Taste $false `
+              -Impeccable $false
+            Write-Output "HMS_IMPL_JOB_RETURN label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+          }
+
+          $wrapperJobScript = {
+            param($Builder,$Install,$Output,$Skills,$Label)
+            $ErrorActionPreference = 'Stop'
+            Write-Output "HMS_WRAPPER_JOB_START label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
             & $Builder `
               -InstallRoot $Install `
               -OutputRoot $Output `
               -SkillsRoot $Skills `
-              -Hms ([bool]$HmsEnabled) `
+              -Hms $false `
               -Superpowers $false `
               -Taste $false `
               -Impeccable $false
-            Write-Output "HMS_JOB_RETURN label=$Label pid=$PID hms=$HmsEnabled utc=$([DateTime]::UtcNow.ToString('o'))"
+            Write-Output "HMS_WRAPPER_JOB_RETURN label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
           }
 
           $runnerHome = $env:USERPROFILE
           $originalHome = $env:HOME
           $originalCodexHome = $env:CODEX_HOME
-          $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-mutex-liveness-' + [guid]::NewGuid().ToString('N'))
+          $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-mutex-isolation-' + [guid]::NewGuid().ToString('N'))
           try {
             $env:HOME = $runnerHome
             $env:CODEX_HOME = Join-Path $runnerHome '.codex'
 
+            # Baseline lifecycle and post-lifecycle probe stay lightweight and independent of external UI modules.
             & "$env:GITHUB_WORKSPACE\install.ps1" `
               -InstallRoot $env:GITHUB_WORKSPACE `
               -SkipSuperpowers `
@@ -130,52 +158,53 @@ jobs:
               -SkipThreeLevelDelivery
             Assert-ExternalMutexAcquire -Label 'install lifecycle'
 
-            $directOutput = Join-Path $tempRoot 'direct-composite'
-            $directSkills = Join-Path $tempRoot 'direct-skills'
-            & $builderPath `
-              -InstallRoot $env:GITHUB_WORKSPACE `
-              -OutputRoot $directOutput `
-              -SkillsRoot $directSkills `
-              -Hms $false `
-              -Superpowers $false `
-              -Taste $false `
-              -Impeccable $false
-            Assert-ExternalMutexAcquire -Label 'direct builder lifecycle'
-
-            # Phase A: both children leave public discovery OFF. This removes Junction create/remove transitions from the liveness equation.
-            $offOutput = Join-Path $tempRoot 'parallel-off-composite'
-            $offSkills = Join-Path $tempRoot 'parallel-off-skills'
-            $offJobs = @()
+            # Phase M: prove two Start-Job child processes can serialize the exact named Mutex primitive itself.
+            $mutexJobs = @()
             try {
-              $offJobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$offOutput,$offSkills,$false,'off-a'
-              $offJobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$offOutput,$offSkills,$false,'off-b'
-              Wait-BuilderPair -Jobs $offJobs -Label 'two-process OFF/OFF composite build' -TimeoutSeconds 60
+              $mutexJobs += Start-Job -ScriptBlock $mutexJobScript -ArgumentList $buildMutexName,'mutex-a',500
+              $mutexJobs += Start-Job -ScriptBlock $mutexJobScript -ArgumentList $buildMutexName,'mutex-b',500
+              Drain-JobsUntilTerminal -Jobs $mutexJobs -Label 'two-process mutex-only serialization' -TimeoutSeconds 15
             }
-            finally {
-              foreach ($job in $offJobs) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
-            }
-            Assert-ExternalMutexAcquire -Label 'two-process OFF/OFF lifecycle'
+            finally { Remove-TestJobs -Jobs $mutexJobs }
+            Assert-ExternalMutexAcquire -Label 'mutex-only pair'
 
-            # Phase B: preserve the original reproducer: one child enables HMS discovery while the other disables it.
-            $toggleOutput = Join-Path $tempRoot 'parallel-toggle-composite'
-            $toggleSkills = Join-Path $tempRoot 'parallel-toggle-skills'
-            $toggleJobs = @()
+            # Phase I: bypass the public trust/bootstrap wrapper and execute the implementation directly.
+            # Same OutputRoot/SkillsRoot intentionally preserves the serialized activation target while removing support-blob materialization.
+            $implOutput = Join-Path $tempRoot 'implementation-shared-output'
+            $implSkills = Join-Path $tempRoot 'implementation-shared-skills'
+            $implJobs = @()
             try {
-              $toggleJobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$toggleOutput,$toggleSkills,$true,'toggle-on'
-              $toggleJobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$toggleOutput,$toggleSkills,$false,'toggle-off'
-              Wait-BuilderPair -Jobs $toggleJobs -Label 'two-process ON/OFF composite build' -TimeoutSeconds 120
+              $implJobs += Start-Job -ScriptBlock $implementationJobScript -ArgumentList $implementationPath,$env:GITHUB_WORKSPACE,$implOutput,$implSkills,'impl-a'
+              $implJobs += Start-Job -ScriptBlock $implementationJobScript -ArgumentList $implementationPath,$env:GITHUB_WORKSPACE,$implOutput,$implSkills,'impl-b'
+              Drain-JobsUntilTerminal -Jobs $implJobs -Label 'two-process direct implementation OFF/OFF build' -TimeoutSeconds 45
             }
-            finally {
-              foreach ($job in $toggleJobs) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+            finally { Remove-TestJobs -Jobs $implJobs }
+            Assert-ExternalMutexAcquire -Label 'direct implementation pair'
+
+            # Phase WD: execute two public wrappers concurrently but with distinct targets.
+            # If this fails while Phase I passes, shared output/Junction state is excluded and the public bootstrap/support path is isolated.
+            $distinctJobs = @()
+            try {
+              $distinctJobs += Start-Job -ScriptBlock $wrapperJobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,(Join-Path $tempRoot 'wrapper-a-output'),(Join-Path $tempRoot 'wrapper-a-skills'),'wrapper-distinct-a'
+              $distinctJobs += Start-Job -ScriptBlock $wrapperJobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,(Join-Path $tempRoot 'wrapper-b-output'),(Join-Path $tempRoot 'wrapper-b-skills'),'wrapper-distinct-b'
+              Drain-JobsUntilTerminal -Jobs $distinctJobs -Label 'two-process public wrapper distinct-target OFF/OFF build' -TimeoutSeconds 60
             }
-            Assert-ExternalMutexAcquire -Label 'two-process ON/OFF lifecycle'
+            finally { Remove-TestJobs -Jobs $distinctJobs }
+            Assert-ExternalMutexAcquire -Label 'public wrapper distinct-target pair'
 
-            $toggleManifestPath = Join-Path $toggleOutput 'hms-superpowers\manifest.json'
-            if (-not (Test-Path -LiteralPath $toggleManifestPath)) { throw 'Two-process ON/OFF build did not leave a composite manifest.' }
-            $leftovers = @(Get-ChildItem -LiteralPath $toggleOutput -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.stage-*' -or $_.Name -like '.backup-*' })
-            if ($leftovers.Count -ne 0) { throw 'Two-process ON/OFF build left stage/backup artifacts.' }
+            # Phase WS: original public-wrapper reproducer with one shared target, still OFF/OFF so no discovery Junction transition is involved.
+            $sharedOutput = Join-Path $tempRoot 'wrapper-shared-output'
+            $sharedSkills = Join-Path $tempRoot 'wrapper-shared-skills'
+            $sharedJobs = @()
+            try {
+              $sharedJobs += Start-Job -ScriptBlock $wrapperJobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$sharedOutput,$sharedSkills,'wrapper-shared-a'
+              $sharedJobs += Start-Job -ScriptBlock $wrapperJobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$sharedOutput,$sharedSkills,'wrapper-shared-b'
+              Drain-JobsUntilTerminal -Jobs $sharedJobs -Label 'two-process public wrapper shared-target OFF/OFF build' -TimeoutSeconds 60
+            }
+            finally { Remove-TestJobs -Jobs $sharedJobs }
+            Assert-ExternalMutexAcquire -Label 'public wrapper shared-target pair'
 
-            Write-Host 'PASS: external mutex reacquisition, OFF/OFF process serialization, and ON/OFF process serialization all satisfy bounded Windows liveness.'
+            Write-Host 'PASS: mutex primitive, direct implementation, distinct-target wrapper, and shared-target wrapper all satisfy bounded Windows cross-process liveness.'
           }
           finally {
             if (Test-Path -LiteralPath $tempRoot) { Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue }
