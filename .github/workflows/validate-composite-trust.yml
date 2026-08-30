@@ -20,7 +20,7 @@ jobs:
         with:
           ref: ${{ env.CANDIDATE_SHA }}
 
-      - name: Qualify committed-only copy update serialization and swap rollback
+      - name: Qualify composite source state writer and uninstall trust boundaries
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -39,7 +39,10 @@ jobs:
 
             $installPath = Join-Path $env:GITHUB_WORKSPACE 'install.ps1'
             $updatePath = Join-Path $env:GITHUB_WORKSPACE 'update.ps1'
+            $uninstallPath = Join-Path $env:GITHUB_WORKSPACE 'uninstall.ps1'
             $builderPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.ps1'
+            $strictReader = Join-Path $env:GITHUB_WORKSPACE 'scripts\Read-HmsCompositeModuleState.ps1'
+            $modelSettingsScript = Join-Path $env:GITHUB_WORKSPACE 'manager\HmsModelSettings.ps1'
             & $installPath -InstallRoot $env:GITHUB_WORKSPACE -SkipCodeGraph -SkipThreeLevelDelivery
 
             $skillsRoot = Join-Path $runnerHome '.agents\skills'
@@ -56,7 +59,7 @@ jobs:
             if (-not (Test-Path -LiteralPath $manifestPath)) { throw 'Baseline composite manifest is missing.' }
             if (-not (Test-Path -LiteralPath $compositeLink)) { throw 'Baseline composite discovery Junction is missing.' }
 
-            # P1 regression: an ignored local file beneath a copied skill must not be publishable.
+            # P1 regression: ignored/local-only bytes beneath copied skill trees must be rejected.
             $ignoreFile = Join-Path $tasteRoot '.git\info\exclude'
             $originalIgnore = [IO.File]::ReadAllText($ignoreFile)
             $ignoredRelative = ([string]$uiLock.taste.skill_path).TrimEnd('/') + '/.hms-ci-ignored-sentinel'
@@ -65,106 +68,150 @@ jobs:
             try {
               [IO.File]::AppendAllText($ignoreFile, "`r`n/$ignoredRelative`r`n")
               [IO.File]::WriteAllText($ignoredPath, 'ignored-local-only-byte')
-
               $ordinaryStatus = ((& git -C $tasteRoot status --porcelain=v1 --untracked-files=all) -join "`n")
               if ($LASTEXITCODE -ne 0) { throw 'Ordinary Taste clean-state probe failed.' }
-              if (-not [string]::IsNullOrWhiteSpace($ordinaryStatus)) {
-                throw "Ignored sentinel unexpectedly appeared in the ordinary clean-state probe: $ordinaryStatus"
-              }
-
+              if (-not [string]::IsNullOrWhiteSpace($ordinaryStatus)) { throw "Ignored sentinel unexpectedly appeared in ordinary status: $ordinaryStatus" }
               $ignoredStatus = ((& git -C $tasteRoot status --porcelain=v1 --untracked-files=all --ignored -- $ignoredRelative) -join "`n")
-              if ($LASTEXITCODE -ne 0 -or $ignoredStatus -notmatch '!!') {
-                throw "Ignored sentinel was not proven ignored by Git: $ignoredStatus"
-              }
-
+              if ($LASTEXITCODE -ne 0 -or $ignoredStatus -notmatch '!!') { throw "Ignored sentinel was not proven ignored by Git: $ignoredStatus" }
               $ignoredRejected = $false
-              try {
-                & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -Hms $true -Superpowers $true -Taste $true -Impeccable $true
-              }
-              catch {
-                if ($_.Exception.Message -match 'non-committed or ignored content') { $ignoredRejected = $true } else { throw }
-              }
-              if (-not $ignoredRejected) { throw 'Composite compiler published or accepted an ignored local source file.' }
-              $manifestHashAfterIgnored = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
-              if ($manifestHashAfterIgnored -cne $manifestHashBeforeIgnored) { throw 'Ignored-source rejection mutated the active composite manifest.' }
+              try { & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -Hms $true -Superpowers $true -Taste $true -Impeccable $true }
+              catch { if ($_.Exception.Message -match 'non-committed or ignored content') { $ignoredRejected = $true } else { throw } }
+              if (-not $ignoredRejected) { throw 'Composite compiler accepted an ignored local source file.' }
+              if ((Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash -cne $manifestHashBeforeIgnored) { throw 'Ignored-source rejection mutated active manifest.' }
             }
             finally {
               Remove-Item -LiteralPath $ignoredPath -Force -ErrorAction SilentlyContinue
               [IO.File]::WriteAllText($ignoreFile, $originalIgnore)
             }
-            $cleanAfterIgnored = ((& git -C $tasteRoot status --porcelain=v1 --untracked-files=all) -join "`n")
-            if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($cleanAfterIgnored)) { throw "Taste source did not return to clean state after ignored-file qualification: $cleanAfterIgnored" }
+            if (-not [string]::IsNullOrWhiteSpace(((& git -C $tasteRoot status --porcelain=v1 --untracked-files=all) -join "`n"))) { throw 'Taste source did not return clean after ignored-file test.' }
             Write-Host 'PASS: ignored local files beneath copied skills are rejected before composite activation.'
 
-            # P2 regression: failure after old FinalRoot -> backup but before stage -> FinalRoot must restore the old bundle.
+            # P2 regression: failure between old-root quarantine and staged activation must restore old bundle.
             $manifestHashBeforeSwapFailure = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
             $swapFailureObserved = $false
             try {
               $env:HMS_TEST_FAIL_STAGE_ACTIVATION = '1'
               & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -Hms $true -Superpowers $true -Taste $true -Impeccable $true
             }
-            catch {
-              if ($_.Exception.Message -match 'Injected staged-root activation failure') { $swapFailureObserved = $true } else { throw }
-            }
-            finally {
-              Remove-Item Env:HMS_TEST_FAIL_STAGE_ACTIVATION -ErrorAction SilentlyContinue
-            }
-            if (-not $swapFailureObserved) { throw 'Injected staged-root activation failure did not execute the rollback branch.' }
-            if (-not (Test-Path -LiteralPath $manifestPath)) { throw 'Previous composite manifest was not restored after staged-root activation failure.' }
-            $manifestHashAfterSwapFailure = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
-            if ($manifestHashAfterSwapFailure -cne $manifestHashBeforeSwapFailure) { throw 'Previous composite bytes changed after staged-root activation rollback.' }
-            if (-not (Test-Path -LiteralPath $compositeLink)) { throw 'Composite discovery Junction became dangling/absent after staged-root activation rollback.' }
+            catch { if ($_.Exception.Message -match 'Injected staged-root activation failure') { $swapFailureObserved = $true } else { throw } }
+            finally { Remove-Item Env:HMS_TEST_FAIL_STAGE_ACTIVATION -ErrorAction SilentlyContinue }
+            if (-not $swapFailureObserved) { throw 'Injected stage activation failure did not execute rollback branch.' }
+            if (-not (Test-Path -LiteralPath $manifestPath)) { throw 'Previous manifest was not restored after stage activation failure.' }
+            if ((Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash -cne $manifestHashBeforeSwapFailure) { throw 'Previous composite bytes changed after rollback.' }
+            if (-not (Test-Path -LiteralPath $compositeLink)) { throw 'Composite discovery became dangling/absent after rollback.' }
             $swapLeftovers = @(Get-ChildItem -LiteralPath $outputRoot -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.stage-*' -or $_.Name -like '.backup-*' })
-            if ($swapLeftovers.Count -ne 0) { throw 'Staged-root activation rollback left stage/backup artifacts.' }
+            if ($swapLeftovers.Count -ne 0) { throw 'Stage activation rollback left stage/backup artifacts.' }
             Write-Host 'PASS: pre-discovery staged-root activation failure restores the previous bundle and discovery path.'
 
-            # P1 regression: updater must wait on the same mutex before inspecting/updating source trees.
+            # P1 regression: updater source reconciliation must wait on same composite mutex.
             $updateJob = $null
             $mutex = New-Object System.Threading.Mutex($false, $buildMutexName)
             $mutexOwned = $false
             try {
               Add-Content -LiteralPath $tasteSkillPath -Value "`n<!-- HMS CI updater-lock dirty sentinel -->"
               $mutexOwned = $mutex.WaitOne([TimeSpan]::FromSeconds(30))
-              if (-not $mutexOwned) { throw 'Failed to acquire parent composite mutex for updater serialization qualification.' }
-
-              $updateJob = Start-Job -ScriptBlock {
-                param($UpdatePath,$InstallRoot)
-                $ErrorActionPreference = 'Stop'
-                & $UpdatePath -InstallRoot $InstallRoot -SkipCodeGraph -SkipThreeLevelDelivery
-              } -ArgumentList $updatePath,$env:GITHUB_WORKSPACE
-
+              if (-not $mutexOwned) { throw 'Failed to acquire composite mutex for updater serialization test.' }
+              $updateJob = Start-Job -ScriptBlock { param($UpdatePath,$InstallRoot) $ErrorActionPreference='Stop'; & $UpdatePath -InstallRoot $InstallRoot -SkipCodeGraph -SkipThreeLevelDelivery } -ArgumentList $updatePath,$env:GITHUB_WORKSPACE
               Start-Sleep -Seconds 3
-              if ($updateJob.State -notin @('Running','NotStarted')) {
-                $premature = (Receive-Job -Job $updateJob -Keep -ErrorAction SilentlyContinue) -join "`n"
-                throw "Updater crossed source reconciliation before the shared mutex was released. State=$($updateJob.State) Output=$premature"
-              }
-
-              $mutex.ReleaseMutex()
-              $mutexOwned = $false
+              if ($updateJob.State -notin @('Running','NotStarted')) { throw "Updater crossed reconciliation while mutex held. State=$($updateJob.State)" }
+              $mutex.ReleaseMutex(); $mutexOwned = $false
               $null = Wait-Job -Job $updateJob -Timeout 120
-              if ($updateJob.State -ne 'Failed') {
-                $unexpected = (Receive-Job -Job $updateJob -Keep -ErrorAction SilentlyContinue) -join "`n"
-                throw "Updater did not fail on the deliberately dirty Taste source after lock release. State=$($updateJob.State) Output=$unexpected"
-              }
+              if ($updateJob.State -ne 'Failed') { throw "Updater did not fail on dirty Taste after lock release. State=$($updateJob.State)" }
             }
             finally {
               if ($mutexOwned) { try { $mutex.ReleaseMutex() } catch { } }
               $mutex.Dispose()
               if ($null -ne $updateJob) { Remove-Job -Job $updateJob -Force -ErrorAction SilentlyContinue }
               & git -C $tasteRoot restore --worktree -- $tasteSkillRelative
-              if ($LASTEXITCODE -ne 0) { throw 'Failed to restore Taste source after updater serialization qualification.' }
+              if ($LASTEXITCODE -ne 0) { throw 'Failed to restore Taste after updater serialization test.' }
             }
-            $cleanAfterUpdateLock = ((& git -C $tasteRoot status --porcelain=v1 --untracked-files=all) -join "`n")
-            if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($cleanAfterUpdateLock)) { throw "Taste source did not return to clean state after updater-lock qualification: $cleanAfterUpdateLock" }
             Write-Host 'PASS: updater source reconciliation is serialized by the composite build mutex.'
 
-            # Normal update proves same-thread nested/reentrant acquisition does not deadlock.
             & $updatePath -InstallRoot $env:GITHUB_WORKSPACE -SkipCodeGraph -SkipThreeLevelDelivery
-            if (-not (Test-Path -LiteralPath $manifestPath)) { throw 'Normal serialized updater did not leave a valid composite manifest.' }
-            if (-not (Test-Path -LiteralPath $compositeLink)) { throw 'Normal serialized updater lost the composite discovery Junction.' }
+            if (-not (Test-Path -LiteralPath $manifestPath) -or -not (Test-Path -LiteralPath $compositeLink)) { throw 'Normal serialized update lost composite state/discovery.' }
             Write-Host 'PASS: serialized install/update -> builder nested mutex path completed without deadlock.'
 
-            Write-Host 'PASS: exact-SHA committed-only copy, source-update serialization, and staged-root rollback regressions qualified.'
+            # P2 regression: malformed module state must never be bool-coerced by lifecycle readers.
+            $manifestOriginal = [IO.File]::ReadAllText($manifestPath)
+            $malformed = '{"schema_version":1,"managed_by":"HMS-Skills-Codex","artifact":"hms-superpowers-composite","modules":{"hms":true,"superpowers":true,"taste":"false","impeccable":true}}'
+            [IO.File]::WriteAllText($manifestPath, $malformed, (New-Object System.Text.UTF8Encoding($false)))
+            foreach ($entry in @(
+              [pscustomobject]@{ Name='strict reader'; Invoke={ & $strictReader -ManifestPath $manifestPath | Out-Null } },
+              [pscustomobject]@{ Name='updater'; Invoke={ & $updatePath -InstallRoot $env:GITHUB_WORKSPACE -SkipCodeGraph -SkipThreeLevelDelivery } },
+              [pscustomobject]@{ Name='installer'; Invoke={ & $installPath -InstallRoot $env:GITHUB_WORKSPACE -SkipCodeGraph -SkipThreeLevelDelivery } }
+            )) {
+              $rejected = $false
+              try { & $entry.Invoke }
+              catch { if ($_.Exception.Message -match "module 'taste' must be boolean") { $rejected = $true } else { throw } }
+              if (-not $rejected) { throw "$($entry.Name) accepted malformed string module state." }
+            }
+            [IO.File]::WriteAllText($manifestPath, $manifestOriginal, (New-Object System.Text.UTF8Encoding($false)))
+            $restoredState = & $strictReader -ManifestPath $manifestPath
+            foreach ($key in @('hms','superpowers','taste','impeccable')) { if ($restoredState.PSObject.Properties[$key].Value -isnot [bool]) { throw "Restored state '$key' is not boolean." } }
+            Write-Host 'PASS: malformed composite module state is rejected without boolean coercion by strict lifecycle readers.'
+
+            # P1 regression: model-settings writers serialize the entire write/verify/rollback transaction.
+            $writerMutex = New-Object System.Threading.Mutex($false, 'Local\HMS-Skills-Codex-ModelSettings-v1')
+            $writerOwned = $false
+            $writerJob = $null
+            try {
+              $writerOwned = $writerMutex.WaitOne([TimeSpan]::FromSeconds(30))
+              if (-not $writerOwned) { throw 'Failed to acquire Model Settings writer mutex.' }
+              $writerJob = Start-Job -ScriptBlock { param($ScriptPath) $ErrorActionPreference='Stop'; & $ScriptPath -SelfTest } -ArgumentList $modelSettingsScript
+              Start-Sleep -Seconds 3
+              if ($writerJob.State -notin @('Running','NotStarted')) { throw "Model Settings writer crossed mutex while held. State=$($writerJob.State)" }
+              $writerMutex.ReleaseMutex(); $writerOwned = $false
+              $null = Wait-Job -Job $writerJob -Timeout 90
+              if ($writerJob.State -ne 'Completed') { throw "Model Settings writer did not complete after mutex release. State=$($writerJob.State)" }
+              Receive-Job -Job $writerJob -ErrorAction Stop | Write-Host
+            }
+            finally {
+              if ($writerOwned) { try { $writerMutex.ReleaseMutex() } catch { } }
+              $writerMutex.Dispose()
+              if ($null -ne $writerJob) { Remove-Job -Job $writerJob -Force -ErrorAction SilentlyContinue }
+            }
+            Write-Host 'PASS: Model Settings write/verify/rollback transaction is serialized by a cross-process mutex.'
+
+            # P1 regression: clone deletion must quarantine/revalidate and preserve a replacement pathname.
+            $testHome = Join-Path ([IO.Path]::GetTempPath()) ('hms-uninstall-race-' + [guid]::NewGuid().ToString('N'))
+            $fakeClone = Join-Path $testHome '.codex\hms-skills-codex'
+            $foreignSentinel = Join-Path $fakeClone 'FOREIGN-DO-NOT-DELETE.txt'
+            $watcher = $null
+            try {
+              New-Item -ItemType Directory -Force -Path (Join-Path $fakeClone 'skills\hms-superpowers') | Out-Null
+              Set-Content -LiteralPath (Join-Path $fakeClone 'skills\hms-superpowers\SKILL.md') -Value 'test marker' -Encoding UTF8
+              & git -C $fakeClone init | Out-Null
+              & git -C $fakeClone config user.email 'ci@example.invalid'
+              & git -C $fakeClone config user.name 'HMS CI'
+              & git -C $fakeClone add .
+              & git -C $fakeClone commit -m 'fake qualified clone' | Out-Null
+              & git -C $fakeClone remote add origin 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
+              if ($LASTEXITCODE -ne 0) { throw 'Failed to prepare fake HMS clone.' }
+              $watcher = Start-Job -ScriptBlock {
+                param($OriginalPath,$SentinelPath)
+                $deadline=[DateTime]::UtcNow.AddSeconds(30)
+                while ((Test-Path -LiteralPath $OriginalPath) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 5 }
+                if (Test-Path -LiteralPath $OriginalPath) { throw 'Clone pathname was never quarantined.' }
+                New-Item -ItemType Directory -Force -Path $OriginalPath | Out-Null
+                Set-Content -LiteralPath $SentinelPath -Value 'foreign replacement' -Encoding UTF8
+              } -ArgumentList $fakeClone,$foreignSentinel
+              $savedProfile=$env:USERPROFILE; $savedHome=$env:HOME
+              try { $env:USERPROFILE=$testHome; $env:HOME=$testHome; & $uninstallPath -InstallRoot $fakeClone -RemoveClones }
+              finally { $env:USERPROFILE=$savedProfile; $env:HOME=$savedHome }
+              $null = Wait-Job -Job $watcher -Timeout 30
+              if ($watcher.State -ne 'Completed') { throw "Foreign replacement watcher failed. State=$($watcher.State)" }
+              Receive-Job -Job $watcher -ErrorAction Stop | Out-Null
+              if (-not (Test-Path -LiteralPath $foreignSentinel)) { throw 'Uninstall deleted foreign replacement at original clone pathname.' }
+              $leftovers = @(Get-ChildItem -LiteralPath (Split-Path -Parent $fakeClone) -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.hms-clone-removing-*' })
+              if ($leftovers.Count -ne 0) { throw 'Clone quarantine removal left residue.' }
+            }
+            finally {
+              if ($null -ne $watcher) { Remove-Job -Job $watcher -Force -ErrorAction SilentlyContinue }
+              if (Test-Path -LiteralPath $testHome) { Remove-Item -LiteralPath $testHome -Recurse -Force }
+            }
+            Write-Host 'PASS: clone deletion quarantines and revalidates the managed clone while preserving a foreign replacement pathname.'
+
+            Write-Host 'PASS: exact-SHA composite source, swap, state-writer, strict-module, and uninstall trust regressions qualified.'
           }
           finally {
             $env:HOME = $originalHome
