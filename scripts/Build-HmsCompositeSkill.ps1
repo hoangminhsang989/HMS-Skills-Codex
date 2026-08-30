@@ -43,11 +43,11 @@ function Write-SupportBlobExact {
     )
     if ($BlobSha -notmatch '^[0-9a-f]{40}$') { throw "$Label support blob SHA is invalid: $BlobSha" }
     if ([string]::IsNullOrWhiteSpace($RelativePath) -or $RelativePath.Contains('\') -or $RelativePath.StartsWith('/') -or $RelativePath -match '^[A-Za-z]:') {
-        throw "$Label support path is not a canonical repository-relative Git path: $RelativePath"
+        throw "$Label support relative path is unsafe: $RelativePath"
     }
     foreach ($segment in @($RelativePath -split '/')) {
-        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -eq '.' -or $segment -eq '..') {
-            throw "$Label support path contains an unsafe segment: $RelativePath"
+        if ([string]::IsNullOrEmpty($segment) -or $segment -eq '.' -or $segment -eq '..') {
+            throw "$Label support relative path contains an unsafe segment: $RelativePath"
         }
     }
 
@@ -57,13 +57,34 @@ function Write-SupportBlobExact {
 
     $gitExe = [string](Get-Command git -ErrorAction Stop).Source
     if ([string]::IsNullOrWhiteSpace($gitExe)) { throw "$Label could not resolve git executable." }
-    $archivePath = "$Destination.hms-support.zip"
-    if (Test-Path -LiteralPath $archivePath) { throw "$Label support archive destination already exists: $archivePath" }
 
+    $transportRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-support-transport-' + [guid]::NewGuid().ToString('N'))
+    $transportGit = Join-Path $transportRoot 'repo.git'
+    $archivePath = Join-Path $transportRoot 'support.zip'
     try {
-        & $gitExe -C $repoRoot -c core.autocrlf=false -c core.eol=lf archive --format=zip "--output=$archivePath" $head -- $RelativePath 2>$null
+        New-Item -ItemType Directory -Force -Path $transportRoot | Out-Null
+        & $gitExe init --bare --quiet $transportGit
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $transportGit -PathType Container)) {
+            throw "$Label could not initialize isolated Git object transport."
+        }
+
+        $objectsPath = ((& $gitExe -C $repoRoot rev-parse --path-format=absolute --git-path objects 2>$null) -join '').Trim()
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($objectsPath) -or -not (Test-Path -LiteralPath $objectsPath -PathType Container)) {
+            throw "$Label could not resolve the source Git object directory."
+        }
+        $alternatesPath = Join-Path $transportGit 'objects\info\alternates'
+        [IO.File]::WriteAllText($alternatesPath, ($objectsPath.Replace('\','/') + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+
+        # The isolated bare transport intentionally has no source-repository info/attributes.
+        # Its highest-precedence attributes neutralize archive/EOL transforms; the literal blob hash below
+        # remains the final fail-closed authority and rejects any transport that changes committed bytes.
+        $attributesPath = Join-Path $transportGit 'info\attributes'
+        $neutralAttributes = '** -text -crlf -eol -ident -filter -working-tree-encoding -export-ignore -export-subst' + "`n"
+        [IO.File]::WriteAllText($attributesPath, $neutralAttributes, (New-Object System.Text.UTF8Encoding($false)))
+
+        & $gitExe "--git-dir=$transportGit" -c core.autocrlf=false -c core.eol=lf archive --format=zip "--output=$archivePath" $head -- $RelativePath
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
-            throw "$Label exact-HEAD archive materialization failed for: $RelativePath"
+            throw "$Label exact-HEAD archive transport failed for: $RelativePath"
         }
 
         Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -71,7 +92,7 @@ function Write-SupportBlobExact {
         try {
             $matches = @($archive.Entries | Where-Object { $_.FullName -ceq $RelativePath })
             if ($matches.Count -ne 1) {
-                throw "$Label exact-HEAD archive expected one entry '$RelativePath', found $($matches.Count)."
+                throw "$Label exact-HEAD archive transport expected one entry '$RelativePath', found $($matches.Count)."
             }
             $input = $matches[0].Open()
             $output = New-Object System.IO.FileStream($Destination,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
@@ -87,16 +108,20 @@ function Write-SupportBlobExact {
         finally {
             $archive.Dispose()
         }
+
+        $actual = ((& $gitExe -C $repoRoot hash-object --no-filters -- $Destination 2>$null) -join '').Trim().ToLowerInvariant()
+        if ($LASTEXITCODE -ne 0 -or $actual -notmatch '^[0-9a-f]{40}$') { throw "$Label exact support materialization could not be hashed." }
+        if ($actual -cne $BlobSha) {
+            Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+            throw "$Label exact-HEAD archive transport changed committed bytes. Expected $BlobSha, found $actual."
+        }
+    }
+    catch {
+        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+        throw
     }
     finally {
-        if (Test-Path -LiteralPath $archivePath) { Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue }
-    }
-
-    $actual = ((& git -C $repoRoot hash-object --no-filters -- $Destination 2>$null) -join '').Trim().ToLowerInvariant()
-    if ($LASTEXITCODE -ne 0 -or $actual -notmatch '^[0-9a-f]{40}$') { throw "$Label exact support materialization could not be hashed." }
-    if ($actual -cne $BlobSha) {
-        Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
-        throw "$Label exact-HEAD archive transport changed committed bytes. Expected $BlobSha, found $actual."
+        if (Test-Path -LiteralPath $transportRoot) { Remove-Item -LiteralPath $transportRoot -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -265,7 +290,7 @@ try {
         throw 'Generated composite did not preserve the project-authority safety boundary.'
     }
 
-    Write-Host "PASS: public bootstrap, file-executed runtime implementation, committed-copy helper, and lock inputs are bound to HMS HEAD $head; published source bytes are Git-object-derived, single-owner serialized, and authority precedence is pinned below HMS checkpoint/safety/model-floor gates."
+    Write-Host "PASS: public bootstrap, file-executed runtime implementation, committed-copy helper, and lock inputs are bound to HMS HEAD $head; support bytes are isolated exact-HEAD archive transports with literal blob verification, runtime ownership is single-lock serialized, and authority precedence is pinned below HMS checkpoint/safety/model-floor gates."
 }
 finally {
     if ($null -ne $supportRoot -and (Test-Path -LiteralPath $supportRoot)) {
