@@ -1,0 +1,69 @@
+name: Author CodeGraph marker exclusion remediation
+
+on:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.2.0-ui-design-authority
+    paths:
+      - .github/workflows/author-codegraph-marker-exclusion-remediation.yml
+
+permissions:
+  contents: write
+
+jobs:
+  author-exact-marker-exclusion:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Patch exact production blob
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          path=Path('scripts/Sync-DeliveryTools.ps1')
+          expected='c687c094235f1cab1f6dddb23fb968237f375061'
+          actual=subprocess.check_output(['git','hash-object',str(path)],text=True).strip().lower()
+          if actual != expected:
+              raise SystemExit(f'Production blob drifted. Expected {expected}, found {actual}')
+          text=path.read_text(encoding='utf-8')
+          old="""    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\\')
+    $records = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)) {
+        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw \"CodeGraph bundle tree contains a reparse point: $($item.FullName)\" }
+        if ([bool]$item.PSIsContainer) { continue }
+        $relative = $item.FullName.Substring($root.Length).TrimStart('\\').Replace('\\','/')
+        if ($relative -ceq $CodeGraphBundleMarkerName) { continue }
+        $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $records.Add($relative + \"`t\" + $hash)
+    }
+"""
+          new="""    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\\')
+    $markerFullPath = [IO.Path]::GetFullPath((Join-Path $root $CodeGraphBundleMarkerName))
+    $records = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)) {
+        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw \"CodeGraph bundle tree contains a reparse point: $($item.FullName)\" }
+        if ([bool]$item.PSIsContainer) { continue }
+        $itemFullPath = [IO.Path]::GetFullPath($item.FullName)
+        if ([string]::Equals($itemFullPath, $markerFullPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $relative = $itemFullPath.Substring($root.Length).TrimStart('\\').Replace('\\','/')
+        $hash = (Get-FileHash -LiteralPath $itemFullPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $records.Add($relative + \"`t\" + $hash)
+    }
+"""
+          if text.count(old) != 1:
+              raise SystemExit(f'Marker exclusion anchor mismatch: {text.count(old)}')
+          text=text.replace(old,new,1)
+          path.write_text(text,encoding='utf-8',newline='\n')
+      - name: Validate and push production commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff -- scripts/Sync-DeliveryTools.ps1
+          git config user.name 'HMS exact-blob remediation'
+          git config user.email '121548965+hoangminhsang989@users.noreply.github.com'
+          git add scripts/Sync-DeliveryTools.ps1
+          git commit -m 'Exclude CodeGraph marker by canonical full path'
+          git push origin HEAD:stage/hms-superpowers-v0.2.0-ui-design-authority
