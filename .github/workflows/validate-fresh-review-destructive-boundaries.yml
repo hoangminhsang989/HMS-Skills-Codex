@@ -1,53 +1,180 @@
-name: Invoke CodeGraph rollback ordering hardening
+name: Validate HMS fresh review destructive boundaries
 
 on:
+  push:
+    branches: ['**']
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
 jobs:
-  harden:
+  windows-fresh-review-destructive-boundaries:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 0
-      - name: Patch rollback ordering and push
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Qualify rollback and CodeGraph quarantine boundaries
         shell: pwsh
         run: |
-          $ErrorActionPreference='Stop'
-          $message=((& git log -1 --format=%s)-join '').Trim()
-          if($message -cne 'chore: invoke CodeGraph rollback ordering hardening'){ Write-Host "No hardening action for $message"; exit 0 }
-          @'
-          from pathlib import Path
-          p=Path('scripts/Sync-DeliveryTools.ps1')
-          s=p.read_text(encoding='utf-8')
-          old="""                try {
-                    if ($manifestPublished) { Restore-CodeGraphManifestAfterFailure -CandidateManifest $publishedManifest -PreviousBytes $existingManifestBytes -HadPrevious $wasInstalled }
-                }
-                catch { $rollbackErrors += $_.Exception.Message }
-"""
-          new="""                try {
-                    if ($rollbackErrors.Count -eq 0 -and $manifestPublished) {
-                        Restore-CodeGraphManifestAfterFailure -CandidateManifest $publishedManifest -PreviousBytes $existingManifestBytes -HadPrevious $wasInstalled
-                    }
-                }
-                catch { $rollbackErrors += $_.Exception.Message }
-"""
-          if s.count(old)!=1: raise SystemExit(f'rollback manifest ordering: expected 1 block, found {s.count(old)}')
-          p.write_text(s.replace(old,new,1),encoding='utf-8',newline='\n')
-          '@ | python -
-          if($LASTEXITCODE -ne 0){throw 'rollback ordering patch failed'}
-          $t=$null;$e=$null;[Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE 'scripts\Sync-DeliveryTools.ps1'),[ref]$t,[ref]$e)|Out-Null
-          if(@($e).Count){throw "Parser rejected Sync-DeliveryTools.ps1: $((@($e)|ForEach-Object Message)-join ' | ')"}
-          git diff --check
-          if($LASTEXITCODE -ne 0){throw 'git diff --check failed'}
-          git config user.name 'HMS Remediation Bot'
-          git config user.email 'hms-remediation@users.noreply.github.com'
-          git add scripts/Sync-DeliveryTools.ps1
-          git commit -m 'fix: restore CodeGraph manifest only after bundle rollback'
-          if($LASTEXITCODE -ne 0){throw 'commit failed'}
-          git push origin HEAD:stage/hms-superpowers-v0.2.0-ui-design-authority
-          if($LASTEXITCODE -ne 0){throw 'push failed'}
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $workspace = $env:GITHUB_WORKSPACE
+          $expectedSha = $env:CANDIDATE_SHA.ToLowerInvariant()
+          $actualSha = ((& git -C $workspace rev-parse HEAD) -join '').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $actualSha -cne $expectedSha) {
+            throw "Workflow checkout identity mismatch. Expected $expectedSha, found $actualSha"
+          }
+
+          $implPath = Join-Path $workspace 'scripts\Build-HmsCompositeSkill.impl.ps1'
+          $uninstallPath = Join-Path $workspace 'uninstall.ps1'
+          foreach ($path in @($implPath,$uninstallPath)) {
+            $tokens=$null; $errors=$null
+            [System.Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors) | Out-Null
+            if (@($errors).Count -ne 0) {
+              throw "PowerShell parser rejected $path : $((@($errors) | ForEach-Object Message) -join ' | ')"
+            }
+          }
+
+          $implText = [IO.File]::ReadAllText($implPath)
+          $uninstallText = [IO.File]::ReadAllText($uninstallPath)
+          if ($implText -notmatch [regex]::Escape('Remove-OwnedCompositeQuarantine -Path $FinalRoot')) {
+            throw 'Builder rollback is not bound to the verified composite quarantine primitive.'
+          }
+          if ($implText -match [regex]::Escape('Remove-Item -LiteralPath $FinalRoot -Recurse -Force')) {
+            throw 'Builder rollback still contains pathname-based recursive deletion of FinalRoot.'
+          }
+          foreach ($literal in @(
+            'function Remove-VerifiedCodeGraphRoot',
+            '.hms-codegraph-removing-',
+            'Assert-ManagedCodeGraphRoot -Path $quarantine',
+            'Remove-VerifiedCodeGraphRoot -Path $codeGraphRoot'
+          )) {
+            if ($uninstallText -notmatch [regex]::Escape($literal)) {
+              throw "CodeGraph uninstall is missing destructive-boundary contract: $literal"
+            }
+          }
+          if ($uninstallText -match [regex]::Escape('Remove-VerifiedDirectory -Path $codeGraphRoot')) {
+            throw 'CodeGraph uninstall still uses generic pathname-based recursive deletion.'
+          }
+          Write-Host 'PASS: committed source binds rollback and CodeGraph removal to quarantine/revalidation primitives.'
+
+          function Get-FunctionText {
+            param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string[]]$Names)
+            $tokens=$null; $errors=$null
+            $ast=[System.Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$errors)
+            if (@($errors).Count -ne 0) { throw "Could not parse function source: $Path" }
+            $texts = @()
+            foreach ($name in $Names) {
+              $nodes = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name },$true))
+              if ($nodes.Count -ne 1) { throw "Expected one function '$name' in $Path, found $($nodes.Count)." }
+              $texts += $nodes[0].Extent.Text
+            }
+            return ($texts -join "`r`n`r`n")
+          }
+
+          # Regression 1: exercise the actual rollback deletion primitive. A non-cooperating
+          # actor may populate the original pathname after the owned directory is quarantined;
+          # that foreign replacement must never become the recursive deletion target.
+          $implDefs = Get-FunctionText -Path $implPath -Names @('Assert-OwnedCompositeRoot','Restore-Quarantine','Remove-OwnedCompositeQuarantine')
+          $rollbackHarnessPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-rollback-quarantine-' + [guid]::NewGuid().ToString('N') + '.ps1')
+          $rollbackRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-rollback-root-' + [guid]::NewGuid().ToString('N'))
+          $rollbackHarness = @"
+          param([Parameter(Mandatory)][string]`$TestRoot)
+          Set-StrictMode -Version Latest
+          `$ErrorActionPreference='Stop'
+          `$ManagedBy='HMS-Skills-Codex'
+          `$Artifact='hms-superpowers-composite'
+          $implDefs
+          New-Item -ItemType Directory -Force -Path `$TestRoot | Out-Null
+          `$manifest=[ordered]@{schema_version=1;managed_by=`$ManagedBy;artifact=`$Artifact}
+          `$manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path `$TestRoot 'manifest.json') -Encoding UTF8
+          Set-Content -LiteralPath (Join-Path `$TestRoot 'OWNED.txt') -Value 'owned activated root' -Encoding UTF8
+          `$foreignSentinel=Join-Path `$TestRoot 'FOREIGN-PRESERVE.txt'
+          `$watcher=Start-Job -ScriptBlock {
+            param(`$Original,`$Sentinel)
+            `$ErrorActionPreference='Stop'
+            `$deadline=[DateTime]::UtcNow.AddSeconds(20)
+            while ((Test-Path -LiteralPath `$Original) -and [DateTime]::UtcNow -lt `$deadline) { Start-Sleep -Milliseconds 2 }
+            if (Test-Path -LiteralPath `$Original) { throw 'Rollback quarantine rename was never observed.' }
+            New-Item -ItemType Directory -Force -Path `$Original | Out-Null
+            Set-Content -LiteralPath `$Sentinel -Value 'foreign replacement must survive rollback cleanup' -Encoding UTF8
+          } -ArgumentList `$TestRoot,`$foreignSentinel
+          try {
+            Remove-OwnedCompositeQuarantine -Path `$TestRoot
+            `$null=Wait-Job -Job `$watcher -Timeout 20
+            if (`$watcher.State -ne 'Completed') { throw "Rollback replacement watcher failed. State=`$(`$watcher.State)" }
+            Receive-Job -Job `$watcher -ErrorAction Stop | Out-Null
+            if (-not (Test-Path -LiteralPath `$foreignSentinel -PathType Leaf)) { throw 'Rollback cleanup deleted the foreign replacement pathname.' }
+            `$parent=Split-Path -Parent `$TestRoot
+            `$leftovers=@(Get-ChildItem -LiteralPath `$parent -Force -ErrorAction SilentlyContinue | Where-Object { `$_.Name -like '.hms-composite-deleting-*' })
+            if (`$leftovers.Count -ne 0) { throw 'Rollback composite quarantine left deletion residue.' }
+          }
+          finally { Remove-Job -Job `$watcher -Force -ErrorAction SilentlyContinue }
+          "@
+          [IO.File]::WriteAllText($rollbackHarnessPath,$rollbackHarness,(New-Object System.Text.UTF8Encoding($false)))
+          try {
+            & $rollbackHarnessPath -TestRoot $rollbackRoot
+          }
+          finally {
+            Remove-Item -LiteralPath $rollbackHarnessPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $rollbackRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host 'PASS: rollback composite quarantine deletes only the revalidated owned root and preserves a foreign replacement pathname.'
+
+          # Regression 2: exercise the actual CodeGraph removal primitive under the same race.
+          # The harness is advanced because the production function calls $PSCmdlet.ShouldProcess.
+          $codeDefs = Get-FunctionText -Path $uninstallPath -Names @('Assert-SafeRemovalPath','Assert-ManagedCodeGraphRoot','Restore-Quarantine','Remove-VerifiedCodeGraphRoot')
+          $codeHarnessPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-codegraph-quarantine-' + [guid]::NewGuid().ToString('N') + '.ps1')
+          $codeHome = Join-Path ([IO.Path]::GetTempPath()) ('hms-codegraph-home-' + [guid]::NewGuid().ToString('N'))
+          $codeHarness = @"
+          [CmdletBinding(SupportsShouldProcess)]
+          param([Parameter(Mandatory)][string]`$TestHome)
+          Set-StrictMode -Version Latest
+          `$ErrorActionPreference='Stop'
+          `$env:USERPROFILE=`$TestHome
+          $codeDefs
+          `$codeGraphRoot=Join-Path `$TestHome '.codex\codegraph'
+          New-Item -ItemType Directory -Force -Path `$codeGraphRoot | Out-Null
+          `$manifest=[ordered]@{schema_version=1;managed_by='HMS-Skills-Codex'}
+          `$manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path `$codeGraphRoot 'hms-codegraph-install.json') -Encoding UTF8
+          Set-Content -LiteralPath (Join-Path `$codeGraphRoot 'OWNED.txt') -Value 'owned codegraph root' -Encoding UTF8
+          `$foreignSentinel=Join-Path `$codeGraphRoot 'FOREIGN-PRESERVE.txt'
+          `$watcher=Start-Job -ScriptBlock {
+            param(`$Original,`$Sentinel)
+            `$ErrorActionPreference='Stop'
+            `$deadline=[DateTime]::UtcNow.AddSeconds(20)
+            while ((Test-Path -LiteralPath `$Original) -and [DateTime]::UtcNow -lt `$deadline) { Start-Sleep -Milliseconds 2 }
+            if (Test-Path -LiteralPath `$Original) { throw 'CodeGraph quarantine rename was never observed.' }
+            New-Item -ItemType Directory -Force -Path `$Original | Out-Null
+            Set-Content -LiteralPath `$Sentinel -Value 'foreign CodeGraph replacement must survive' -Encoding UTF8
+          } -ArgumentList `$codeGraphRoot,`$foreignSentinel
+          try {
+            Remove-VerifiedCodeGraphRoot -Path `$codeGraphRoot -Action 'Fresh review P1 regression CodeGraph removal'
+            `$null=Wait-Job -Job `$watcher -Timeout 20
+            if (`$watcher.State -ne 'Completed') { throw "CodeGraph replacement watcher failed. State=`$(`$watcher.State)" }
+            Receive-Job -Job `$watcher -ErrorAction Stop | Out-Null
+            if (-not (Test-Path -LiteralPath `$foreignSentinel -PathType Leaf)) { throw 'CodeGraph removal deleted the foreign replacement pathname.' }
+            `$parent=Split-Path -Parent `$codeGraphRoot
+            `$leftovers=@(Get-ChildItem -LiteralPath `$parent -Force -ErrorAction SilentlyContinue | Where-Object { `$_.Name -like '.hms-codegraph-removing-*' })
+            if (`$leftovers.Count -ne 0) { throw 'CodeGraph quarantine left removal residue.' }
+          }
+          finally { Remove-Job -Job `$watcher -Force -ErrorAction SilentlyContinue }
+          "@
+          [IO.File]::WriteAllText($codeHarnessPath,$codeHarness,(New-Object System.Text.UTF8Encoding($false)))
+          try {
+            & $codeHarnessPath -TestHome $codeHome
+          }
+          finally {
+            Remove-Item -LiteralPath $codeHarnessPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $codeHome -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host 'PASS: CodeGraph uninstall quarantine deletes only the revalidated HMS-owned root and preserves a foreign replacement pathname.'
+          Write-Host 'PASS: both fresh-review destructive P1 boundaries are qualified on exact candidate HEAD.'

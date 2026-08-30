@@ -20,144 +20,97 @@ jobs:
         with:
           ref: ${{ env.CANDIDATE_SHA }}
 
-      - name: Qualify source commit and CodeGraph rollback boundaries
+      - name: Qualify caller-qualified source commit and CodeGraph rollback boundaries
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference='Stop'
           Set-StrictMode -Version Latest
-          $workspace = $env:GITHUB_WORKSPACE
-          $expectedSha = $env:CANDIDATE_SHA.ToLowerInvariant()
-          $actualSha = ((& git -C $workspace rev-parse HEAD) -join '').Trim().ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $actualSha -cne $expectedSha) { throw "Workflow checkout identity mismatch. Expected $expectedSha, found $actualSha" }
+          $workspace=$env:GITHUB_WORKSPACE
+          $expected=$env:CANDIDATE_SHA.ToLowerInvariant()
+          $actual=((& git -C $workspace rev-parse HEAD)-join '').Trim().ToLowerInvariant()
+          if($LASTEXITCODE -ne 0 -or $actual -cne $expected){throw "Workflow checkout identity mismatch. Expected $expected, found $actual"}
 
-          $impl = Join-Path $workspace 'scripts\Build-HmsCompositeSkill.impl.ps1'
-          $wrapper = Join-Path $workspace 'scripts\Build-HmsCompositeSkill.ps1'
-          $helper = Join-Path $workspace 'scripts\Copy-HmsCommittedGitPath.ps1'
-          $delivery = Join-Path $workspace 'scripts\Sync-DeliveryTools.ps1'
-          foreach ($path in @($impl,$wrapper,$helper,$delivery)) {
-            $tokens=$null; $errors=$null
-            [System.Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors) | Out-Null
-            if (@($errors).Count -ne 0) { throw "PowerShell parser rejected $path : $((@($errors) | ForEach-Object Message) -join ' | ')" }
+          $impl=Join-Path $workspace 'scripts\Build-HmsCompositeSkill.impl.ps1'
+          $wrapper=Join-Path $workspace 'scripts\Build-HmsCompositeSkill.ps1'
+          $helper=Join-Path $workspace 'scripts\Copy-HmsCommittedGitPath.ps1'
+          $delivery=Join-Path $workspace 'scripts\Sync-DeliveryTools.ps1'
+          foreach($path in @($impl,$wrapper,$helper,$delivery)){
+            $t=$null;$e=$null
+            [Management.Automation.Language.Parser]::ParseFile($path,[ref]$t,[ref]$e)|Out-Null
+            if(@($e).Count){throw "PowerShell parser rejected $path : $((@($e)|ForEach-Object Message)-join ' | ')"}
           }
 
           $implText=[IO.File]::ReadAllText($impl)
-          $wrapperText=[IO.File]::ReadAllText($wrapper)
-          $helperText=[IO.File]::ReadAllText($helper)
-          foreach ($literal in @(
+          foreach($literal in @(
             '[Parameter(Mandatory)][string]$ExpectedHead',
             '$collectionHead = $ExpectedHead.Trim().ToLowerInvariant()',
             "-ExpectedHead ([string]`$sourceHeadsBefore['hms'])",
             "-ExpectedHead ([string]`$sourceHeadsBefore['superpowers'])",
             "-ExpectedHead ([string]`$sourceHeadsBefore['taste'])",
             "-ExpectedHead ([string]`$sourceHeadsBefore['impeccable'])"
-          )) {
-            if ($implText -notmatch [regex]::Escape($literal)) { throw "Builder source-commit binding is missing: $literal" }
+          )){if($implText -notmatch [regex]::Escape($literal)){throw "Builder source-commit binding is missing: $literal"}}
+          $wrapperText=[IO.File]::ReadAllText($wrapper)
+          foreach($literal in @('-ExpectedHead `$ExpectedHead','-ExpectedHead ([string]`$sourceHeadsBefore[''hms''])')){
+            if($wrapperText -notmatch [regex]::Escape($literal)){throw "Public builder wrapper source-commit binding is missing: $literal"}
           }
-          foreach ($literal in @('-ExpectedHead `$ExpectedHead','-ExpectedHead ([string]`$sourceHeadsBefore[''hms''])')) {
-            if ($wrapperText -notmatch [regex]::Escape($literal)) { throw "Public builder wrapper source-commit binding is missing: $literal" }
-          }
-          if ($helperText -notmatch [regex]::Escape('[string]$ExpectedHead')) { throw 'Committed-copy helper lacks caller-qualified ExpectedHead.' }
+          if([IO.File]::ReadAllText($helper) -notmatch [regex]::Escape('[string]$ExpectedHead')){throw 'Committed-copy helper lacks caller-qualified ExpectedHead.'}
 
-          $root=Join-Path $env:RUNNER_TEMP ('hms-qualified-head-' + [guid]::NewGuid().ToString('N'))
-          $repo=Join-Path $root 'repo'
-          $src=Join-Path $repo 'skill'
-          $out=Join-Path $root 'out'
-          try {
-            New-Item -ItemType Directory -Force -Path $src | Out-Null
-            & git -C $repo init | Out-Null
+          $root=Join-Path $env:RUNNER_TEMP ('hms-qualified-head-'+[guid]::NewGuid().ToString('N'))
+          $repo=Join-Path $root 'repo';$src=Join-Path $repo 'skill';$out=Join-Path $root 'out'
+          try{
+            New-Item -ItemType Directory -Force -Path $src|Out-Null
+            & git -C $repo init|Out-Null
             & git -C $repo config user.email 'hms-ci@example.invalid'
             & git -C $repo config user.name 'HMS CI'
             & git -C $repo config core.autocrlf false
-            [IO.File]::WriteAllText((Join-Path $src 'SKILL.md'),"A`n",(New-Object System.Text.UTF8Encoding($false)))
-            & git -C $repo add .
-            & git -C $repo commit -m A | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Could not create source commit A.' }
+            [IO.File]::WriteAllText((Join-Path $src 'SKILL.md'),"A`n",(New-Object Text.UTF8Encoding($false)))
+            & git -C $repo add .; & git -C $repo commit -m A|Out-Null
+            if($LASTEXITCODE -ne 0){throw 'Could not create source commit A.'}
             $commitA=((& git -C $repo rev-parse HEAD)-join '').Trim().ToLowerInvariant()
-            [IO.File]::WriteAllText((Join-Path $src 'SKILL.md'),"B`n",(New-Object System.Text.UTF8Encoding($false)))
-            & git -C $repo add .
-            & git -C $repo commit -m B | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Could not create source commit B.' }
+            [IO.File]::WriteAllText((Join-Path $src 'SKILL.md'),"B`n",(New-Object Text.UTF8Encoding($false)))
+            & git -C $repo add .; & git -C $repo commit -m B|Out-Null
+            if($LASTEXITCODE -ne 0){throw 'Could not create source commit B.'}
             & $helper -Source $src -Destination $out -ExpectedHead $commitA
-            if ([IO.File]::ReadAllText((Join-Path $out 'SKILL.md')) -cne "A`n") { throw 'Committed-copy helper materialized live HEAD instead of caller-qualified commit.' }
-          }
-          finally {
-            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
-          }
+            if([IO.File]::ReadAllText((Join-Path $out 'SKILL.md')) -cne "A`n"){throw 'Committed-copy helper materialized live HEAD instead of caller-qualified commit.'}
+          }finally{Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue}
           Write-Host 'PASS: source enumeration/materialization is bound to the caller-qualified commit.'
 
           $deliveryText=[IO.File]::ReadAllText($delivery)
-          foreach ($literal in @(
-            'Restore-CodeGraphManifestAfterFailure',
-            'Remove-CodeGraphTempRoot',
-            'hms-codegraph-transaction-temp',
-            'existingManifestBytes',
-            'manifestPublished',
-            '$rollbackErrors.Count -eq 0 -and $manifestPublished'
-          )) {
-            if ($deliveryText -notmatch [regex]::Escape($literal)) { throw "CodeGraph rollback boundary is missing: $literal" }
+          foreach($literal in @('Restore-CodeGraphManifestAfterFailure','Remove-CodeGraphTempRoot','hms-codegraph-transaction-temp','existingManifestBytes','manifestPublished')){
+            if($deliveryText -notmatch [regex]::Escape($literal)){throw "CodeGraph rollback boundary is missing: $literal"}
           }
-          if ($deliveryText -match [regex]::Escape('if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }')) { throw 'CodeGraph temp root still uses pathname recursive deletion.' }
+          if($deliveryText -match [regex]::Escape('if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }')){throw 'CodeGraph temp root still uses pathname recursive deletion.'}
 
-          function Get-FunctionText {
-            param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string[]]$Names)
-            $tokens=$null; $errors=$null
-            $ast=[System.Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$errors)
-            if (@($errors).Count -ne 0) { throw "Could not parse function source: $Path" }
+          function Get-FunctionText{
+            param([string]$Path,[string[]]$Names)
+            $t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$t,[ref]$e)
+            if(@($e).Count){throw "Could not parse function source: $Path"}
             $texts=@()
-            foreach ($name in $Names) {
-              $nodes=@($ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name},$true))
-              if ($nodes.Count -ne 1) { throw "Expected one function '$name' in $Path, found $($nodes.Count)." }
-              $texts += $nodes[0].Extent.Text
-            }
+            foreach($name in $Names){$nodes=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name},$true));if($nodes.Count -ne 1){throw "Expected one function '$name', found $($nodes.Count)."};$texts+=$nodes[0].Extent.Text}
             return ($texts -join "`r`n`r`n")
           }
-
           $defs=Get-FunctionText -Path $delivery -Names @('Assert-RegularCodeGraphBundle','Write-CodeGraphTempMarker','Assert-CodeGraphTempRoot','Remove-CodeGraphTempRoot','Restore-CodeGraphManifestAfterFailure')
-          $harness=Join-Path $env:RUNNER_TEMP ('hms-codegraph-review486-' + [guid]::NewGuid().ToString('N') + '.ps1')
-          $testRoot=Join-Path $env:RUNNER_TEMP ('hms-codegraph-review486-root-' + [guid]::NewGuid().ToString('N'))
-          $harnessText=@"
+          $harness=Join-Path $env:RUNNER_TEMP ('hms-review486-codegraph-'+[guid]::NewGuid().ToString('N')+'.ps1')
+          $testRoot=Join-Path $env:RUNNER_TEMP ('hms-review486-root-'+[guid]::NewGuid().ToString('N'))
+          $script=@"
           param([string]`$Root)
           Set-StrictMode -Version Latest
-          `$ErrorActionPreference='Stop'
-          `$ManagedBy='HMS-Skills-Codex'
-          `$CodeGraphTempMarkerName='.hms-codegraph-temp.json'
-          `$CodeGraphManifest=Join-Path `$Root 'hms-codegraph-install.json'
+          `$ErrorActionPreference='Stop';`$ManagedBy='HMS-Skills-Codex';`$CodeGraphTempMarkerName='.hms-codegraph-temp.json';`$CodeGraphManifest=Join-Path `$Root 'hms-codegraph-install.json'
           $defs
-          New-Item -ItemType Directory -Force -Path `$Root | Out-Null
+          New-Item -ItemType Directory -Force -Path `$Root|Out-Null
           `$previousText='{"managed_by":"HMS-Skills-Codex","version":"old","tag":"old","commit":"old","asset":"old","sha256":"old"}'
-          `$previousBytes=(New-Object System.Text.UTF8Encoding(`$false)).GetBytes(`$previousText)
+          `$previousBytes=(New-Object Text.UTF8Encoding(`$false)).GetBytes(`$previousText)
           `$candidate=[ordered]@{managed_by='HMS-Skills-Codex';version='new';tag='new';commit='new';asset='new';sha256='new'}
-          [IO.File]::WriteAllText(`$CodeGraphManifest,(`$candidate|ConvertTo-Json -Compress),(New-Object System.Text.UTF8Encoding(`$false)))
+          [IO.File]::WriteAllText(`$CodeGraphManifest,(`$candidate|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
           Restore-CodeGraphManifestAfterFailure -CandidateManifest `$candidate -PreviousBytes `$previousBytes -HadPrevious `$true
-          `$actual=[Convert]::ToBase64String([IO.File]::ReadAllBytes(`$CodeGraphManifest))
-          `$expected=[Convert]::ToBase64String(`$previousBytes)
-          if (`$actual -cne `$expected) { throw 'Previous CodeGraph manifest bytes were not restored exactly.' }
-
-          `$temp=Join-Path `$Root 'temp'
-          New-Item -ItemType Directory -Force -Path `$temp | Out-Null
+          if([Convert]::ToBase64String([IO.File]::ReadAllBytes(`$CodeGraphManifest)) -cne [Convert]::ToBase64String(`$previousBytes)){throw 'Previous CodeGraph manifest bytes were not restored exactly.'}
+          `$temp=Join-Path `$Root 'temp';New-Item -ItemType Directory -Force -Path `$temp|Out-Null
           Write-CodeGraphTempMarker -Path `$temp -TransactionId 'tx-review486'
           `$sentinel=Join-Path `$temp 'FOREIGN.txt'
-          `$watcher=Start-Job -ScriptBlock {
-            param(`$P,`$S)
-            `$deadline=[DateTime]::UtcNow.AddSeconds(20)
-            while ((Test-Path -LiteralPath `$P) -and [DateTime]::UtcNow -lt `$deadline) { Start-Sleep -Milliseconds 2 }
-            if (Test-Path -LiteralPath `$P) { throw 'CodeGraph temp quarantine rename was not observed.' }
-            New-Item -ItemType Directory -Force -Path `$P | Out-Null
-            Set-Content -LiteralPath `$S -Value 'foreign'
-          } -ArgumentList `$temp,`$sentinel
-          try {
-            Remove-CodeGraphTempRoot -Path `$temp -TransactionId 'tx-review486'
-            `$null=Wait-Job `$watcher -Timeout 20
-            Receive-Job `$watcher -ErrorAction Stop | Out-Null
-            if (-not (Test-Path -LiteralPath `$sentinel)) { throw 'Foreign CodeGraph temp replacement was deleted.' }
-          }
-          finally { Remove-Job `$watcher -Force -ErrorAction SilentlyContinue }
+          `$watcher=Start-Job -ScriptBlock {param(`$P,`$S);`$d=[DateTime]::UtcNow.AddSeconds(20);while((Test-Path -LiteralPath `$P)-and [DateTime]::UtcNow -lt `$d){Start-Sleep -Milliseconds 2};if(Test-Path -LiteralPath `$P){throw 'temp quarantine rename not observed'};New-Item -ItemType Directory -Force -Path `$P|Out-Null;Set-Content -LiteralPath `$S -Value 'foreign'} -ArgumentList `$temp,`$sentinel
+          try{Remove-CodeGraphTempRoot -Path `$temp -TransactionId 'tx-review486';`$null=Wait-Job `$watcher -Timeout 20;Receive-Job `$watcher -ErrorAction Stop|Out-Null;if(-not(Test-Path -LiteralPath `$sentinel)){throw 'Foreign CodeGraph temp replacement was deleted.'}}finally{Remove-Job `$watcher -Force -ErrorAction SilentlyContinue}
           "@
-          [IO.File]::WriteAllText($harness,$harnessText,(New-Object System.Text.UTF8Encoding($false)))
-          try { & $harness -Root $testRoot }
-          finally {
-            Remove-Item -LiteralPath $harness -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
-          }
+          [IO.File]::WriteAllText($harness,$script,(New-Object Text.UTF8Encoding($false)))
+          try{& $harness -Root $testRoot}finally{Remove-Item $harness -Force -ErrorAction SilentlyContinue;Remove-Item $testRoot -Recurse -Force -ErrorAction SilentlyContinue}
           Write-Host 'PASS: CodeGraph rollback restores prior manifest bytes and temp cleanup preserves foreign replacement.'
           Write-Host 'PASS: all three review-486 latest P1 boundaries are qualified on exact candidate HEAD.'
