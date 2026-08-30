@@ -1,0 +1,123 @@
+name: Diagnose composite builder support cleanup race
+
+on:
+  push:
+    branches: ['stage/hms-superpowers-v0.2.0-ui-design-authority']
+
+permissions:
+  contents: read
+
+jobs:
+  windows-builder-support-cleanup-race:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Probe foreign replacement at builder support cleanup boundary
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $workspace = $env:GITHUB_WORKSPACE
+          $tempRoot = [IO.Path]::GetTempPath()
+          $existing = @(
+            Get-ChildItem -LiteralPath $tempRoot -Directory -Filter 'hms-builder-support-*' -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.FullName }
+          )
+          $outputRoot = Join-Path $env:RUNNER_TEMP ('hms-support-race-output-' + [guid]::NewGuid().ToString('N'))
+          $skillsRoot = Join-Path $env:RUNNER_TEMP ('hms-support-race-skills-' + [guid]::NewGuid().ToString('N'))
+
+          $watcher = Start-Job -ScriptBlock {
+            param($TempRoot,$Existing)
+            Set-StrictMode -Version Latest
+            $ErrorActionPreference = 'Stop'
+            $deadline = [DateTime]::UtcNow.AddSeconds(90)
+            $root = $null
+            while ([DateTime]::UtcNow -lt $deadline) {
+              $candidates = @(
+                Get-ChildItem -LiteralPath $TempRoot -Directory -Filter 'hms-builder-support-*' -ErrorAction SilentlyContinue |
+                  Where-Object { $Existing -notcontains $_.FullName } |
+                  Sort-Object LastWriteTimeUtc -Descending
+              )
+              if ($candidates.Count -gt 0) { $root = $candidates[0].FullName; break }
+              Start-Sleep -Milliseconds 2
+            }
+            if ([string]::IsNullOrWhiteSpace($root)) { throw 'Diagnostic did not observe a fresh hms-builder-support root.' }
+
+            $runtime = Join-Path $root 'Build-HmsCompositeSkill.runtime.ps1'
+            while (-not (Test-Path -LiteralPath $runtime -PathType Leaf) -and [DateTime]::UtcNow -lt $deadline) {
+              Start-Sleep -Milliseconds 1
+            }
+            if (-not (Test-Path -LiteralPath $runtime -PathType Leaf)) { throw 'Diagnostic support root never published the runtime implementation.' }
+
+            $moved = $root + '-owned-original-' + [guid]::NewGuid().ToString('N')
+            $movedLeaf = Split-Path -Leaf $moved
+            $renamed = $false
+            while (-not $renamed -and [DateTime]::UtcNow -lt $deadline) {
+              try {
+                Rename-Item -LiteralPath $root -NewName $movedLeaf -ErrorAction Stop
+                $renamed = $true
+              }
+              catch { Start-Sleep -Milliseconds 1 }
+            }
+            if (-not $renamed) { throw 'Diagnostic could not move the owned support root before cleanup.' }
+
+            New-Item -ItemType Directory -Force -Path $root | Out-Null
+            $sentinel = Join-Path $root 'FOREIGN-PRESERVE.txt'
+            Set-Content -LiteralPath $sentinel -Value 'foreign replacement must not be recursively deleted' -Encoding UTF8
+            [pscustomobject]@{ Original=$root; Moved=$moved; Sentinel=$sentinel }
+          } -ArgumentList $tempRoot,$existing
+
+          $builderError = $null
+          try {
+            & (Join-Path $workspace 'scripts\Build-HmsCompositeSkill.ps1') `
+              -InstallRoot $workspace `
+              -OutputRoot $outputRoot `
+              -SkillsRoot $skillsRoot `
+              -Hms $true `
+              -Superpowers $false `
+              -Taste $false `
+              -Impeccable $false
+          }
+          catch {
+            $builderError = $_
+            Write-Host ('Builder terminated during injected support-root replacement: ' + $_.Exception.Message)
+          }
+
+          $null = Wait-Job -Job $watcher -Timeout 100
+          if ($watcher.State -ne 'Completed') {
+            $state = $watcher.State
+            $jobError = ($watcher.ChildJobs[0].JobStateInfo.Reason | Out-String).Trim()
+            throw "Support-root watcher did not complete. State=$state Error=$jobError"
+          }
+          $probe = Receive-Job -Job $watcher -ErrorAction Stop
+          if ($null -eq $probe) { throw 'Support-root watcher returned no probe evidence.' }
+
+          $sentinelSurvived = Test-Path -LiteralPath ([string]$probe.Sentinel) -PathType Leaf
+          Write-Host "SUPPORT_ROOT=$($probe.Original)"
+          Write-Host "OWNED_MOVED_ROOT=$($probe.Moved)"
+          Write-Host "FOREIGN_SENTINEL_SURVIVED=$sentinelSurvived"
+          if ($null -ne $builderError) { Write-Host 'BUILDER_ERROR_OBSERVED=YES' } else { Write-Host 'BUILDER_ERROR_OBSERVED=NO' }
+
+          try {
+            if (-not $sentinelSurvived) {
+              Write-Host 'DEFECT_CONFIRMED=YES'
+              Write-Host 'The public builder finally block recursively deleted a foreign replacement placed at the original hms-builder-support pathname.'
+            }
+            else {
+              Write-Host 'DEFECT_CONFIRMED=NO'
+              throw 'Foreign support-root replacement survived; the suspected cleanup race was not reproduced.'
+            }
+          }
+          finally {
+            Remove-Job -Job $watcher -Force -ErrorAction SilentlyContinue
+            foreach ($cleanup in @([string]$probe.Moved,[string]$probe.Original,$outputRoot,$skillsRoot)) {
+              if (-not [string]::IsNullOrWhiteSpace($cleanup) -and (Test-Path -LiteralPath $cleanup)) {
+                Remove-Item -LiteralPath $cleanup -Recurse -Force -ErrorAction SilentlyContinue
+              }
+            }
+          }
