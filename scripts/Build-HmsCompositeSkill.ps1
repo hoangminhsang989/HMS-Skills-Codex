@@ -13,8 +13,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$selfRelative = 'scripts/Build-HmsCompositeSkill.ps1'
 $implementationRelative = 'scripts/Build-HmsCompositeSkill.impl.ps1'
 $helperRelative = 'scripts/Copy-HmsCommittedGitPath.ps1'
+$superLockRelative = 'superpowers.lock.json'
+$uiLockRelative = 'ui-skills.lock.json'
 $head = ((& git -C $repoRoot rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
 if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') {
     throw 'Composite support materialization could not resolve a canonical repository HEAD.'
@@ -83,8 +86,19 @@ function Write-SupportBlobExact {
     }
 }
 
+$expectedSelf = Get-ExpectedSupportBlob -RelativePath $selfRelative -Label 'Public composite bootstrap'
+$actualSelf = ((& git -C $repoRoot hash-object "--path=$selfRelative" -- $PSCommandPath 2>$null) -join '').Trim().ToLowerInvariant()
+if ($LASTEXITCODE -ne 0 -or $actualSelf -notmatch '^[0-9a-f]{40}$') {
+    throw 'Public composite bootstrap worktree bytes could not be hashed with Git clean semantics.'
+}
+if ($actualSelf -cne $expectedSelf) {
+    throw "Public composite bootstrap bytes do not match HMS HEAD $head; refusing hidden worktree drift. Expected $expectedSelf, found $actualSelf."
+}
+
 $expectedImplementation = Get-ExpectedSupportBlob -RelativePath $implementationRelative -Label 'Composite implementation'
 $expectedHelper = Get-ExpectedSupportBlob -RelativePath $helperRelative -Label 'Committed-copy helper'
+$expectedSuperLock = Get-ExpectedSupportBlob -RelativePath $superLockRelative -Label 'Superpowers lock'
+$expectedUiLock = Get-ExpectedSupportBlob -RelativePath $uiLockRelative -Label 'UI skills lock'
 $supportToken = [guid]::NewGuid().ToString('N')
 $supportRoot = Join-Path ([IO.Path]::GetTempPath()) ("hms-builder-support-$supportToken")
 
@@ -92,8 +106,12 @@ try {
     New-Item -ItemType Directory -Force -Path $supportRoot | Out-Null
     $implementationPath = Join-Path $supportRoot 'Build-HmsCompositeSkill.impl.ps1'
     $committedCopyHelper = Join-Path $supportRoot 'Copy-HmsCommittedGitPath.ps1'
+    $committedSuperLock = Join-Path $supportRoot 'superpowers.lock.json'
+    $committedUiLock = Join-Path $supportRoot 'ui-skills.lock.json'
     Write-SupportBlobExact -BlobSha $expectedImplementation -Destination $implementationPath -Label 'Composite implementation'
     Write-SupportBlobExact -BlobSha $expectedHelper -Destination $committedCopyHelper -Label 'Committed-copy helper'
+    Write-SupportBlobExact -BlobSha $expectedSuperLock -Destination $committedSuperLock -Label 'Superpowers lock'
+    Write-SupportBlobExact -BlobSha $expectedUiLock -Destination $committedUiLock -Label 'UI skills lock'
 
     $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
     try { $source = [IO.File]::ReadAllText($implementationPath, $utf8Strict) }
@@ -120,6 +138,24 @@ try {
     $resolverCopyReplacement = "    & '$escapedHelper' -Source `$ModelResolverSource -Destination (Join-Path `$modelDispatcherDestination 'Resolve-HmsModelRoute.ps1')"
     $source = Replace-ExactlyOnce -Text $source -Needle $resolverCopyNeedle -Replacement $resolverCopyReplacement -Label 'Committed model-resolver copy'
 
+    $escapedSuperLock = $committedSuperLock.Replace("'", "''")
+    $superLockNeedle = '$SuperpowersLockPath = Join-Path $InstallRoot ''superpowers.lock.json'''
+    $superLockReplacement = "`$SuperpowersLockPath = '$escapedSuperLock'"
+    $source = Replace-ExactlyOnce -Text $source -Needle $superLockNeedle -Replacement $superLockReplacement -Label 'Committed Superpowers lock binding'
+
+    $escapedUiLock = $committedUiLock.Replace("'", "''")
+    $uiLockNeedle = '$UiLockPath = Join-Path $InstallRoot ''ui-skills.lock.json'''
+    $uiLockReplacement = "`$UiLockPath = '$escapedUiLock'"
+    $source = Replace-ExactlyOnce -Text $source -Needle $uiLockNeedle -Replacement $uiLockReplacement -Label 'Committed UI lock binding'
+
+    $canonicalRemoteNeedle = '$CanonicalHmsRemote = ''https://github.com/hoangminhsang989/HMS-Skills-Codex.git'''
+    $canonicalRemoteReplacement = $canonicalRemoteNeedle + "`n`$ExpectedHmsSupportHead = '$head'"
+    $source = Replace-ExactlyOnce -Text $source -Needle $canonicalRemoteNeedle -Replacement $canonicalRemoteReplacement -Label 'HMS support HEAD binding'
+
+    $hmsIdentityNeedle = "        hms = (Assert-GitSourceIdentity -Path `$InstallRoot -ExpectedRepository `$CanonicalHmsRemote -Label 'HMS Skills Codex')"
+    $hmsIdentityReplacement = "        hms = (Assert-GitSourceIdentity -Path `$InstallRoot -ExpectedRepository `$CanonicalHmsRemote -ExpectedCommit `$ExpectedHmsSupportHead -Label 'HMS Skills Codex')"
+    $source = Replace-ExactlyOnce -Text $source -Needle $hmsIdentityNeedle -Replacement $hmsIdentityReplacement -Label 'HMS source/support identity binding'
+
     $legacyAuthorityLiteral = '1. Owner instruction and current project authority always outrank every internal module.'
     $authorityLiteral = '1. Authority precedence is fixed, highest to lowest: Owner instruction > latest valid HMS checkpoint / frozen authority > HMS fail-closed + safety rules > HMS model risk floor + dedicated model dispatcher > HMS project-specific product / UI authority > explicitly requested Three-Level Delivery governance > enabled Superpowers engineering method > CodeGraph context/evidence + enabled UI advisors > Codex defaults. Project-specific authority never bypasses an HMS checkpoint, fail-closed/safety rule, or required model floor.'
     $authorityNeedle = "        '$legacyAuthorityLiteral',"
@@ -144,7 +180,7 @@ try {
         throw 'Generated composite did not preserve the project-authority safety boundary.'
     }
 
-    Write-Host 'PASS: composite support and source bytes are materialized directly from exact HEAD blobs via binary git cat-file; generated authority precedence is pinned below HMS checkpoint/safety/model-floor gates.'
+    Write-Host "PASS: public bootstrap, implementation, committed-copy helper, and lock inputs are bound to HMS HEAD $head; published source bytes are Git-object-derived and authority precedence is pinned below HMS checkpoint/safety/model-floor gates."
 }
 finally {
     if (Test-Path -LiteralPath $supportRoot) { Remove-Item -LiteralPath $supportRoot -Recurse -Force -ErrorAction SilentlyContinue }

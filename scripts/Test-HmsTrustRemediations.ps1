@@ -9,7 +9,9 @@ $ErrorActionPreference = 'Stop'
 $builderPath = Join-Path $RepoRoot 'scripts\Build-HmsCompositeSkill.ps1'
 $builderImplPath = Join-Path $RepoRoot 'scripts\Build-HmsCompositeSkill.impl.ps1'
 $copyHelperPath = Join-Path $RepoRoot 'scripts\Copy-HmsCommittedGitPath.ps1'
-foreach ($path in @($builderPath,$builderImplPath,$copyHelperPath)) {
+$installPath = Join-Path $RepoRoot 'install.ps1'
+$updatePath = Join-Path $RepoRoot 'update.ps1'
+foreach ($path in @($builderPath,$builderImplPath,$copyHelperPath,$installPath,$updatePath)) {
     if (-not (Test-Path -LiteralPath $path)) { throw "Trust-remediation support file is missing: $path" }
     $tokens = $null; $parseErrors = $null
     [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$parseErrors) | Out-Null
@@ -20,12 +22,18 @@ foreach ($path in @($builderPath,$builderImplPath,$copyHelperPath)) {
 
 $builderText = Get-Content -LiteralPath $builderPath -Raw
 $helperText = Get-Content -LiteralPath $copyHelperPath -Raw
+$installText = Get-Content -LiteralPath $installPath -Raw
+$updateText = Get-Content -LiteralPath $updatePath -Raw
 $canonicalAuthority = 'Authority precedence is fixed, highest to lowest: Owner instruction > latest valid HMS checkpoint / frozen authority > HMS fail-closed + safety rules > HMS model risk floor + dedicated model dispatcher > HMS project-specific product / UI authority > explicitly requested Three-Level Delivery governance > enabled Superpowers engineering method > CodeGraph context/evidence + enabled UI advisors > Codex defaults.'
 $badAuthority = 'Owner instruction and current project authority always outrank every internal module.'
 foreach ($literal in @(
     'Copy-HmsCommittedGitPath.ps1',
     'Write-SupportBlobExact',
     'cat-file blob',
+    'superpowers.lock.json',
+    'ui-skills.lock.json',
+    'ExpectedHmsSupportHead',
+    'Public composite bootstrap bytes do not match HMS HEAD',
     $canonicalAuthority,
     'Project-specific authority never bypasses an HMS checkpoint, fail-closed/safety rule, or required model floor.',
     'Generated composite omitted the canonical HMS authority precedence.'
@@ -40,6 +48,14 @@ foreach ($literal in @(
 )) {
     if ($helperText -notmatch [regex]::Escape($literal)) { throw "Committed-copy helper is missing required raw-blob contract literal: $literal" }
 }
+foreach ($entry in @(
+    [pscustomobject]@{ Name='installer'; Text=$installText },
+    [pscustomobject]@{ Name='updater'; Text=$updateText }
+)) {
+    foreach ($literal in @('Assert-NoHiddenIndexState','skip-worktree/assume-unchanged index flags')) {
+        if ($entry.Text -notmatch [regex]::Escape($literal)) { throw "$($entry.Name) is missing hidden-index trust gate literal: $literal" }
+    }
+}
 if ($builderText -match [regex]::Escape("'$badAuthority'")) {
     throw 'Builder trust wrapper retained the superseded generated authority rule.'
 }
@@ -47,14 +63,20 @@ if ($builderText -match 'git\s+-C\s+\$repoRoot\s+archive' -or $helperText -match
     throw 'Raw committed-byte materialization regressed to git archive.'
 }
 
-# Trust-root regression: builder support must execute from committed Git blobs, not hidden live worktree bytes.
+# Trust-root regression: public bootstrap must detect its own hidden drift; all other support/lock inputs execute from HEAD blobs.
 $supportTemp = Join-Path ([IO.Path]::GetTempPath()) ('hms-support-bind-' + [guid]::NewGuid().ToString('N'))
 $supportRepo = Join-Path $supportTemp 'repo'
 $supportScripts = Join-Path $supportRepo 'scripts'
+$builderRelative = 'scripts/Build-HmsCompositeSkill.ps1'
 $supportRelative = 'scripts/Build-HmsCompositeSkill.impl.ps1'
-$supportFlagSet = $false
+$helperRelative = 'scripts/Copy-HmsCommittedGitPath.ps1'
+$superLockRelative = 'superpowers.lock.json'
+$uiLockRelative = 'ui-skills.lock.json'
+$sourceRelative = 'skills/fixture-source/SKILL.md'
+$hiddenFlags = New-Object System.Collections.Generic.List[string]
 try {
     New-Item -ItemType Directory -Force -Path $supportScripts | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $supportRepo 'skills\fixture-source') | Out-Null
     Copy-Item -LiteralPath $builderPath -Destination (Join-Path $supportScripts 'Build-HmsCompositeSkill.ps1') -Force
     Copy-Item -LiteralPath $copyHelperPath -Destination (Join-Path $supportScripts 'Copy-HmsCommittedGitPath.ps1') -Force
 
@@ -69,6 +91,14 @@ param(
     [bool]$Taste = $true,
     [bool]$Impeccable = $true
 )
+$SuperpowersLockPath = Join-Path $InstallRoot 'superpowers.lock.json'
+$UiLockPath = Join-Path $InstallRoot 'ui-skills.lock.json'
+$CanonicalHmsRemote = 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
+if ($false) {
+    $unusedHeads = [ordered]@{
+        hms = (Assert-GitSourceIdentity -Path $InstallRoot -ExpectedRepository $CanonicalHmsRemote -Label 'HMS Skills Codex')
+    }
+}
 function Copy-SkillModule {
     param([string]$Source,[string]$Destination)
     Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
@@ -85,36 +115,75 @@ $lines = @(
 $uiSequence = 'Apply only enabled work modules, sequentially, inside owner/project UI authority. Taste owns unresolved direction when enabled; Impeccable owns audit/polish when enabled; Superpowers owns implementation when enabled; HMS owns evidence/release when enabled.'
 $target = Join-Path $OutputRoot 'hms-superpowers'
 New-Item -ItemType Directory -Force -Path $target | Out-Null
-Set-Content -LiteralPath (Join-Path $target 'SKILL.md') -Value (($lines + $uiSequence) -join "`r`n") -Encoding UTF8
+Copy-SkillModule -Source (Join-Path $InstallRoot 'skills\fixture-source') -Destination (Join-Path $target 'references\fixture-source')
+$superRaw = [IO.File]::ReadAllText($SuperpowersLockPath)
+$uiRaw = [IO.File]::ReadAllText($UiLockPath)
+Set-Content -LiteralPath (Join-Path $target 'SKILL.md') -Value (($lines + $uiSequence + $superRaw + $uiRaw) -join "`r`n") -Encoding UTF8
 '@
     [IO.File]::WriteAllText((Join-Path $supportScripts 'Build-HmsCompositeSkill.impl.ps1'), $syntheticImpl, (New-Object System.Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText((Join-Path $supportRepo $superLockRelative), '{"fixture":"COMMITTED_SUPER_LOCK"}', (New-Object System.Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText((Join-Path $supportRepo $uiLockRelative), '{"fixture":"COMMITTED_UI_LOCK"}', (New-Object System.Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText((Join-Path $supportRepo ($sourceRelative -replace '/', '\')), "COMMITTED_HELPER_SOURCE`n", (New-Object System.Text.UTF8Encoding($false)))
 
     & git -C $supportRepo init | Out-Null
     & git -C $supportRepo config user.email 'hms-ci@example.invalid'
     & git -C $supportRepo config user.name 'HMS Support Regression'
     & git -C $supportRepo config core.autocrlf false
-    & git -C $supportRepo add scripts
-    & git -C $supportRepo commit -m 'fixture: exact builder support bytes' | Out-Null
+    & git -C $supportRepo add .
+    & git -C $supportRepo commit -m 'fixture: exact builder support and lock bytes' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to commit builder support regression fixture.' }
 
-    & git -C $supportRepo update-index --skip-worktree -- $supportRelative
-    if ($LASTEXITCODE -ne 0) { throw 'Failed to set skip-worktree on builder implementation fixture.' }
-    $supportFlagSet = $true
-    [IO.File]::WriteAllText((Join-Path $supportRepo ($supportRelative -replace '/', '\')), "throw 'HMS_HIDDEN_SUPPORT_DRIFT_EXECUTED'`n", (New-Object System.Text.UTF8Encoding($false)))
+    # Public wrapper is the bootstrap trust root: hidden drift in the wrapper itself must stop before any build.
+    & git -C $supportRepo update-index --skip-worktree -- $builderRelative
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to set skip-worktree on public builder fixture.' }
+    $hiddenFlags.Add($builderRelative)
+    Add-Content -LiteralPath (Join-Path $supportRepo ($builderRelative -replace '/', '\')) -Value '# HMS_HIDDEN_PUBLIC_BOOTSTRAP_DRIFT'
     $supportStatus = ((& git -C $supportRepo status --porcelain=v1 --untracked-files=all) -join "`n")
-    if (-not [string]::IsNullOrWhiteSpace($supportStatus)) { throw "Support hidden-drift premise was not reproduced: $supportStatus" }
+    if (-not [string]::IsNullOrWhiteSpace($supportStatus)) { throw "Public-bootstrap hidden-drift premise was not reproduced: $supportStatus" }
+    $selfRejected = $false
+    try {
+        & (Join-Path $supportScripts 'Build-HmsCompositeSkill.ps1') -InstallRoot $supportRepo -OutputRoot (Join-Path $supportTemp 'self-reject') -SkillsRoot (Join-Path $supportTemp 'self-skills') -Hms $false -Superpowers $false -Taste $false -Impeccable $false
+    }
+    catch {
+        if ($_.Exception.Message -match 'Public composite bootstrap bytes do not match HMS HEAD') { $selfRejected = $true } else { throw }
+    }
+    if (-not $selfRejected) { throw 'Hidden public-builder drift was not rejected by exact self-blob identity.' }
+    & git -C $supportRepo update-index --no-skip-worktree -- $builderRelative
+    $hiddenFlags.Remove($builderRelative) | Out-Null
+    & git -C $supportRepo restore --worktree -- $builderRelative
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to restore public builder after self-drift regression.' }
+
+    # Implementation/helper/lock worktree bytes are hidden and malicious; build must still use committed HEAD blobs.
+    foreach ($relative in @($supportRelative,$helperRelative,$superLockRelative,$uiLockRelative)) {
+        & git -C $supportRepo update-index --skip-worktree -- $relative
+        if ($LASTEXITCODE -ne 0) { throw "Failed to set skip-worktree on support fixture: $relative" }
+        $hiddenFlags.Add($relative)
+    }
+    [IO.File]::WriteAllText((Join-Path $supportRepo ($supportRelative -replace '/', '\')), "throw 'HMS_HIDDEN_SUPPORT_DRIFT_EXECUTED'`n", (New-Object System.Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText((Join-Path $supportRepo ($helperRelative -replace '/', '\')), "throw 'HMS_HIDDEN_HELPER_DRIFT_EXECUTED'`n", (New-Object System.Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText((Join-Path $supportRepo $superLockRelative), '{"fixture":"HMS_HIDDEN_SUPER_LOCK_DRIFT"}', (New-Object System.Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText((Join-Path $supportRepo $uiLockRelative), '{"fixture":"HMS_HIDDEN_UI_LOCK_DRIFT"}', (New-Object System.Text.UTF8Encoding($false)))
+    $supportStatus = ((& git -C $supportRepo status --porcelain=v1 --untracked-files=all) -join "`n")
+    if (-not [string]::IsNullOrWhiteSpace($supportStatus)) { throw "Support/lock hidden-drift premise was not reproduced: $supportStatus" }
 
     $fixtureOutput = Join-Path $supportTemp 'out'
     & (Join-Path $supportScripts 'Build-HmsCompositeSkill.ps1') -InstallRoot $supportRepo -OutputRoot $fixtureOutput -SkillsRoot (Join-Path $supportTemp 'skills') -Hms $false -Superpowers $false -Taste $false -Impeccable $false
     $fixtureSkill = Join-Path $fixtureOutput 'hms-superpowers\SKILL.md'
     if (-not (Test-Path -LiteralPath $fixtureSkill)) { throw 'Committed support implementation was not executed successfully.' }
     $fixtureText = Get-Content -LiteralPath $fixtureSkill -Raw
-    if ($fixtureText -match 'HMS_HIDDEN_SUPPORT_DRIFT_EXECUTED') { throw 'Hidden live implementation bytes reached committed support execution.' }
-    if ($fixtureText -notmatch [regex]::Escape($canonicalAuthority)) { throw 'Synthetic committed support execution did not receive canonical authority precedence.' }
+    foreach ($forbidden in @('HMS_HIDDEN_SUPPORT_DRIFT_EXECUTED','HMS_HIDDEN_HELPER_DRIFT_EXECUTED','HMS_HIDDEN_SUPER_LOCK_DRIFT','HMS_HIDDEN_UI_LOCK_DRIFT')) {
+        if ($fixtureText -match [regex]::Escape($forbidden)) { throw "Hidden live support/lock bytes reached committed execution: $forbidden" }
+    }
+    foreach ($required in @($canonicalAuthority,'COMMITTED_SUPER_LOCK','COMMITTED_UI_LOCK')) {
+        if ($fixtureText -notmatch [regex]::Escape($required)) { throw "Synthetic committed support execution missed expected committed content: $required" }
+    }
+    $copiedFixture = Join-Path $fixtureOutput 'hms-superpowers\references\fixture-source\SKILL.md'
+    if (-not (Test-Path -LiteralPath $copiedFixture)) { throw 'Committed helper did not materialize synthetic committed source.' }
+    if ([IO.File]::ReadAllText($copiedFixture) -cne "COMMITTED_HELPER_SOURCE`n") { throw 'Committed helper output did not match committed synthetic source bytes.' }
 }
 finally {
-    if ($supportFlagSet -and (Test-Path -LiteralPath $supportRepo)) {
-        & git -C $supportRepo update-index --no-skip-worktree -- $supportRelative 2>$null
+    if (Test-Path -LiteralPath $supportRepo) {
+        foreach ($relative in @($hiddenFlags)) { & git -C $supportRepo update-index --no-skip-worktree -- $relative 2>$null }
     }
     if (Test-Path -LiteralPath $supportTemp) { Remove-Item -LiteralPath $supportTemp -Recurse -Force -ErrorAction SilentlyContinue }
 }
@@ -195,4 +264,4 @@ finally {
     if (Test-Path -LiteralPath $tempRoot) { Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
-Write-Host 'PASS: builder support executes from exact HEAD blobs despite hidden worktree drift; binary cat-file materialization defeats skip-worktree and ignores archive attributes/CRLF transforms; generated authority precedence is enforced.'
+Write-Host 'PASS: public builder hidden drift is rejected; implementation/helper/lock support executes from exact HMS HEAD blobs; binary cat-file source materialization defeats skip-worktree and archive/filter transformations; lifecycle scripts reject hidden index state; generated authority precedence is enforced.'

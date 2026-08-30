@@ -39,6 +39,21 @@ function Assert-ExpectedOrigin {
     }
 }
 
+function Assert-NoHiddenIndexState {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath (Join-Path $Path '.git'))) { return }
+    $lines = @(& git -C $Path ls-files -v 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "Unable to inspect Git index flags for $Path" }
+    $hidden = @($lines | Where-Object {
+        $text = [string]$_
+        $text -match '^S ' -or $text -cmatch '^[a-z] '
+    })
+    if ($hidden.Count -ne 0) {
+        $sample = (($hidden | Select-Object -First 8) -join '; ')
+        throw "HMS tracked files use skip-worktree/assume-unchanged index flags; refusing lifecycle mutation because live trust inputs may be hidden: $sample"
+    }
+}
+
 function Get-CurrentBranch {
     param([Parameter(Mandatory)][string]$Path)
     $branch = & git -C $Path symbolic-ref --quiet --short HEAD
@@ -164,9 +179,11 @@ try {
     if (-not $mutexOwned) { throw "Timed out waiting for composite build lock: $BuildMutexName" }
 
     Assert-Git
+    if (Test-Path -LiteralPath (Join-Path $InstallRoot '.git')) { Assert-NoHiddenIndexState -Path $InstallRoot }
 
     # Source reconciliation and composite compilation are one cross-process transaction.
     Sync-Repository -Remote $HmsRemote -Path $InstallRoot
+    Assert-NoHiddenIndexState -Path $InstallRoot
     $state = Get-ModuleState
 
     & (Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1')

@@ -34,6 +34,21 @@ function Assert-ExpectedOrigin {
     if ((ConvertTo-NormalizedRemote $origin) -ne (ConvertTo-NormalizedRemote $ExpectedRemote)) { throw "Unexpected Git origin for $Path." }
 }
 
+function Assert-NoHiddenIndexState {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath (Join-Path $Path '.git'))) { return }
+    $lines = @(& git -C $Path ls-files -v 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "Unable to inspect Git index flags for $Path" }
+    $hidden = @($lines | Where-Object {
+        $text = [string]$_
+        $text -match '^S ' -or $text -cmatch '^[a-z] '
+    })
+    if ($hidden.Count -ne 0) {
+        $sample = (($hidden | Select-Object -First 8) -join '; ')
+        throw "HMS tracked files use skip-worktree/assume-unchanged index flags; refusing lifecycle mutation because live trust inputs may be hidden: $sample"
+    }
+}
+
 function Get-CurrentBranch {
     param([Parameter(Mandatory)][string]$Path)
     $branch = & git -C $Path symbolic-ref --quiet --short HEAD
@@ -124,16 +139,18 @@ try {
     if (-not $mutexOwned) { throw "Timed out waiting for composite build lock: $BuildMutexName" }
 
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }
+    Assert-NoHiddenIndexState -Path $InstallRoot
     $state = Get-ModuleState
+
+    # Fail fast on local UI-source drift before HMS/external network reconciliation.
+    if (-not $SkipTaste) { Assert-ExistingPinnedSourceClean -Path $TasteRoot -Label 'GPT Taste' }
+    if (-not $SkipImpeccable) { Assert-ExistingPinnedSourceClean -Path $ImpeccableRoot -Label 'Impeccable' }
 
     # Source reconciliation and composite compilation are one cross-process transaction.
     Update-CleanRepo -Path $InstallRoot -ExpectedRemote $HmsRemote
+    Assert-NoHiddenIndexState -Path $InstallRoot
     & (Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1')
     & (Join-Path $InstallRoot 'scripts\Test-DeliveryTools.ps1')
-
-    # Fail fast on local UI-source drift before any unrelated external network reconciliation.
-    if (-not $SkipTaste) { Assert-ExistingPinnedSourceClean -Path $TasteRoot -Label 'GPT Taste' }
-    if (-not $SkipImpeccable) { Assert-ExistingPinnedSourceClean -Path $ImpeccableRoot -Label 'Impeccable' }
 
     if (-not $SkipSuperpowers) {
         $lock = Read-SuperLock

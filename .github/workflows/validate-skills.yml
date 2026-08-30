@@ -150,6 +150,7 @@ jobs:
             if (-not [string]::IsNullOrWhiteSpace(((& git -C $tasteRoot status --porcelain=v1 --untracked-files=all) -join "`n"))) { throw 'Taste source did not return to clean state.' }
 
             # Prove two independent PowerShell processes can rebuild the same managed target without racing activation/rollback.
+            # Raw per-blob materialization intentionally performs stronger byte verification and may exceed the old 120s budget on hosted Windows.
             $parallelRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-composite-lock-' + [guid]::NewGuid().ToString('N'))
             $parallelOutput = Join-Path $parallelRoot 'composite'
             $parallelSkills = Join-Path $parallelRoot 'agents\skills'
@@ -162,7 +163,7 @@ jobs:
             try {
               $jobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$parallelOutput,$parallelSkills,$true
               $jobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$parallelOutput,$parallelSkills,$false
-              $null = Wait-Job -Job $jobs -Timeout 120
+              $null = Wait-Job -Job $jobs -Timeout 300
               foreach ($job in $jobs) {
                 if ($job.State -ne 'Completed') { throw "Concurrent composite build job did not complete: $($job.State)" }
                 Receive-Job -Job $job -ErrorAction Stop | Write-Host
@@ -199,7 +200,7 @@ jobs:
             if ([bool]$beforeUpdate.modules.taste) { throw 'Failed to create Taste OFF composite state.' }
             if (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\taste')) { throw 'Taste reference remained after Taste OFF rebuild.' }
             if (-not (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\model-router\MODULE.md'))) { throw 'Model router disappeared during module rebuild.' }
-            if (-not (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\model-dispatcher\MODULE.md'))) { throw 'Model dispatcher disappeared during module rebuild.' }
+            if (-not (Test-Path -LiteralPath (Join-Path $modelDispatcherRoot 'MODULE.md'))) { throw 'Model dispatcher disappeared during module rebuild.' }
 
             & "$env:GITHUB_WORKSPACE\update.ps1" -InstallRoot $env:GITHUB_WORKSPACE
             $afterUpdate = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
