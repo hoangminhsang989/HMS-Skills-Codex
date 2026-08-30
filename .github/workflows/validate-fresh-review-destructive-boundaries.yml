@@ -45,8 +45,8 @@ jobs:
 
           $implText = [IO.File]::ReadAllText($implPath)
           $uninstallText = [IO.File]::ReadAllText($uninstallPath)
-          if ($implText -notmatch [regex]::Escape('Remove-OwnedCompositeQuarantine -Path $FinalRoot')) {
-            throw 'Builder rollback is not bound to the verified composite quarantine primitive.'
+          if ($implText -notmatch [regex]::Escape('Remove-OwnedCompositeIdentityQuarantine -Path $FinalRoot -ExpectedTreeSha256 $candidateCompositeTreeSha')) {
+            throw 'Builder rollback is not bound to the exact-tree composite quarantine primitive.'
           }
           if ($implText -match [regex]::Escape('Remove-Item -LiteralPath $FinalRoot -Recurse -Force')) {
             throw 'Builder rollback still contains pathname-based recursive deletion of FinalRoot.'
@@ -83,7 +83,7 @@ jobs:
           # Regression 1: exercise the actual rollback deletion primitive. A non-cooperating
           # actor may populate the original pathname after the owned directory is quarantined;
           # that foreign replacement must never become the recursive deletion target.
-          $implDefs = Get-FunctionText -Path $implPath -Names @('Assert-OwnedCompositeRoot','Restore-Quarantine','Remove-OwnedCompositeQuarantine')
+          $implDefs = Get-FunctionText -Path $implPath -Names @('Assert-OwnedCompositeRoot','Add-OwnedCompositeTreeRecords','Get-OwnedCompositeTreeSha256','Assert-OwnedCompositeIdentity','Remove-OwnedCompositeIdentityQuarantine')
           $rollbackHarnessPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-rollback-quarantine-' + [guid]::NewGuid().ToString('N') + '.ps1')
           $rollbackRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-rollback-root-' + [guid]::NewGuid().ToString('N'))
           $rollbackHarness = @"
@@ -108,7 +108,8 @@ jobs:
             Set-Content -LiteralPath `$Sentinel -Value 'foreign replacement must survive rollback cleanup' -Encoding UTF8
           } -ArgumentList `$TestRoot,`$foreignSentinel
           try {
-            Remove-OwnedCompositeQuarantine -Path `$TestRoot
+            `$expectedTree=Get-OwnedCompositeTreeSha256 -Path `$TestRoot
+            Remove-OwnedCompositeIdentityQuarantine -Path `$TestRoot -ExpectedTreeSha256 `$expectedTree
             `$null=Wait-Job -Job `$watcher -Timeout 20
             if (`$watcher.State -ne 'Completed') { throw "Rollback replacement watcher failed. State=`$(`$watcher.State)" }
             Receive-Job -Job `$watcher -ErrorAction Stop | Out-Null

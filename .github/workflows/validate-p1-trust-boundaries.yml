@@ -53,8 +53,14 @@ jobs:
             throw 'Public bootstrap still authorizes executable bytes through Git clean/path filters.'
           }
           foreach ($literal in @(
-            'Remove-OwnedCompositeQuarantine',
-            'Assert-OwnedCompositeRoot -Path $backup',
+            'function Add-OwnedCompositeTreeRecords',
+            '[AllowEmptyString()][string]$LogicalPrefix',
+            '[Array]::Sort($sorted, [StringComparer]::Ordinal)',
+            'Reserve-OwnedCompositeRollbackBackup',
+            'Assert-OwnedCompositeIdentity -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha',
+            'Remove-OwnedCompositeIdentityQuarantine -Path $FinalRoot -ExpectedTreeSha256 $candidateCompositeTreeSha',
+            'Restore-OwnedCompositeRollbackBackup -BackupPath $backup -ReservedPath $reservedBackup -FinalPath $FinalRoot -ExpectedTreeSha256 $previousCompositeTreeSha',
+            '.hms-composite-rollback-reserved-',
             '.hms-composite-deleting-'
           )) {
             if ($implText -notmatch [regex]::Escape($literal)) { throw "Composite builder is missing quarantine trust boundary: $literal" }

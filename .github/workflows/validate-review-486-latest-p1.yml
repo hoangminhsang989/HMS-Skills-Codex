@@ -102,6 +102,8 @@ jobs:
           $defs=Get-FunctionText -Path $delivery -Names @(
             'Assert-CodeGraphVersion',
             'Assert-RegularCodeGraphBundle',
+            'Add-CodeGraphBundleTreeRecords',
+            'Get-CodeGraphBundleTreeSha256',
             'New-CodeGraphBundleIdentity',
             'Write-CodeGraphBundleMarker',
             'Assert-CodeGraphTransactionBundle',
