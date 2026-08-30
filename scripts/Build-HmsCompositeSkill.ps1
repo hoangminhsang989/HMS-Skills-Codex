@@ -105,7 +105,7 @@ function Test-ExactHeadLifecycleCaller {
                 throw "Lifecycle caller bytes could not be hashed with Git clean semantics: $relative"
             }
             if ($actualCaller -cne $expectedCaller) {
-                throw "Lifecycle caller bytes do not match HMS HEAD $head; refusing inherited composite-lock ownership. Expected $expectedCaller, found $actualCaller: $relative"
+                throw "Lifecycle caller bytes do not match HMS HEAD $head; refusing inherited composite-lock ownership. Expected $expectedCaller, found $actualCaller: ${relative}"
             }
             return $true
         }
