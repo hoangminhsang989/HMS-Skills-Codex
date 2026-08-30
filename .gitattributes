@@ -4,3 +4,9 @@
 install.ps1 text eol=lf
 update.ps1 text eol=lf
 scripts/Build-HmsCompositeSkill.ps1 text eol=lf
+manager/HmsSuperpowersManager.ps1 text eol=lf
+manager/HmsSuperpowersManager.utf8.ps1 text eol=lf
+scripts/Read-HmsCompositeModuleState.ps1 text eol=lf
+manager/HmsModelSettings.ps1 text eol=lf
+manager/HmsModelSettings.utf8.ps1 text eol=lf
+scripts/Resolve-HmsModelRoute.ps1 text eol=lf
