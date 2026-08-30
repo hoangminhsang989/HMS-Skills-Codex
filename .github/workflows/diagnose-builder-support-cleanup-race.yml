@@ -16,108 +16,81 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      - name: Probe foreign replacement at builder support cleanup boundary
+      - name: Qualify exact filesystem identity cleanup boundary
         shell: pwsh
         run: |
-          Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
-
+          Set-StrictMode -Version Latest
           $workspace = $env:GITHUB_WORKSPACE
-          $tempRoot = [IO.Path]::GetTempPath()
-          $existing = @(
-            Get-ChildItem -LiteralPath $tempRoot -Directory -Filter 'hms-builder-support-*' -ErrorAction SilentlyContinue |
-              ForEach-Object { $_.FullName }
-          )
-          $outputRoot = Join-Path $env:RUNNER_TEMP ('hms-support-race-output-' + [guid]::NewGuid().ToString('N'))
-          $skillsRoot = Join-Path $env:RUNNER_TEMP ('hms-support-race-skills-' + [guid]::NewGuid().ToString('N'))
 
-          $watcher = Start-Job -ScriptBlock {
-            param($TempRoot,$Existing)
-            Set-StrictMode -Version Latest
-            $ErrorActionPreference = 'Stop'
-            $deadline = [DateTime]::UtcNow.AddSeconds(90)
-            $root = $null
-            while ([DateTime]::UtcNow -lt $deadline) {
-              $candidates = @(
-                Get-ChildItem -LiteralPath $TempRoot -Directory -Filter 'hms-builder-support-*' -ErrorAction SilentlyContinue |
-                  Where-Object { $Existing -notcontains $_.FullName } |
-                  Sort-Object LastWriteTimeUtc -Descending
-              )
-              if ($candidates.Count -gt 0) { $root = $candidates[0].FullName; break }
-              Start-Sleep -Milliseconds 2
+          foreach ($relative in @('scripts\Build-HmsCompositeSkill.ps1','scripts\Copy-HmsCommittedGitPath.ps1')) {
+            $path = Join-Path $workspace $relative
+            $text = [IO.File]::ReadAllText($path)
+            foreach ($literal in @(
+              'function Open-HmsOwnedDirectoryIdentityHandle',
+              'function Get-HmsOwnedDirectoryIdentity',
+              'function New-HmsOwnedTempDirectory',
+              'function Remove-HmsOwnedTempDirectory',
+              "'.hms-owned-temp-quarantine-'",
+              '-ShareMode ([uint32]3)'
+            )) {
+              if ($text -notmatch [regex]::Escape($literal)) { throw "$relative is missing owned-temp identity contract: $literal" }
             }
-            if ([string]::IsNullOrWhiteSpace($root)) { throw 'Diagnostic did not observe a fresh hms-builder-support root.' }
-
-            $runtime = Join-Path $root 'Build-HmsCompositeSkill.runtime.ps1'
-            while (-not (Test-Path -LiteralPath $runtime -PathType Leaf) -and [DateTime]::UtcNow -lt $deadline) {
-              Start-Sleep -Milliseconds 1
+            if ($text -match [regex]::Escape('Remove-Item -LiteralPath $transportRoot -Recurse -Force -ErrorAction SilentlyContinue')) {
+              throw "$relative still recursively deletes a transport pathname without identity binding."
             }
-            if (-not (Test-Path -LiteralPath $runtime -PathType Leaf)) { throw 'Diagnostic support root never published the runtime implementation.' }
+          }
 
-            $moved = $root + '-owned-original-' + [guid]::NewGuid().ToString('N')
-            $movedLeaf = Split-Path -Leaf $moved
-            $renamed = $false
-            while (-not $renamed -and [DateTime]::UtcNow -lt $deadline) {
-              try {
-                Rename-Item -LiteralPath $root -NewName $movedLeaf -ErrorAction Stop
-                $renamed = $true
-              }
-              catch { Start-Sleep -Milliseconds 1 }
-            }
-            if (-not $renamed) { throw 'Diagnostic could not move the owned support root before cleanup.' }
+          # Extract the exact production helper prelude from the public builder and execute it in isolation.
+          $builderPath = Join-Path $workspace 'scripts\Build-HmsCompositeSkill.ps1'
+          $source = [IO.File]::ReadAllText($builderPath)
+          $start = $source.IndexOf("if (-not ('HmsOwnedTempNative' -as [type])) {")
+          $endMarker = "`n`n`n`$repoRoot = Split-Path -Parent `$PSScriptRoot"
+          $end = $source.IndexOf($endMarker,$start)
+          if ($start -lt 0 -or $end -lt 0) { throw 'Could not isolate production owned-temp helper prelude.' }
+          $helperText = $source.Substring($start,$end-$start)
+          $helperPath = Join-Path $env:RUNNER_TEMP ('hms-owned-temp-helper-' + [guid]::NewGuid().ToString('N') + '.ps1')
+          [IO.File]::WriteAllText($helperPath,$helperText,(New-Object Text.UTF8Encoding($false)))
+          . $helperPath
 
-            New-Item -ItemType Directory -Force -Path $root | Out-Null
-            $sentinel = Join-Path $root 'FOREIGN-PRESERVE.txt'
-            Set-Content -LiteralPath $sentinel -Value 'foreign replacement must not be recursively deleted' -Encoding UTF8
-            [pscustomobject]@{ Original=$root; Moved=$moved; Sentinel=$sentinel }
-          } -ArgumentList $tempRoot,$existing
-
-          $builderError = $null
+          # Case A: active guard must deny rename/delete sharing by a non-cooperating process.
+          $ownedA = New-HmsOwnedTempDirectory -Prefix 'hms-owned-temp-active-' -Label 'active-guard regression'
+          $movedA = ([string]$ownedA.Path) + '-moved'
+          $renameBlocked = $false
           try {
-            & (Join-Path $workspace 'scripts\Build-HmsCompositeSkill.ps1') `
-              -InstallRoot $workspace `
-              -OutputRoot $outputRoot `
-              -SkillsRoot $skillsRoot `
-              -Hms $true `
-              -Superpowers $false `
-              -Taste $false `
-              -Impeccable $false
-          }
-          catch {
-            $builderError = $_
-            Write-Host ('Builder terminated during injected support-root replacement: ' + $_.Exception.Message)
-          }
-
-          $null = Wait-Job -Job $watcher -Timeout 100
-          if ($watcher.State -ne 'Completed') {
-            $state = $watcher.State
-            $jobError = ($watcher.ChildJobs[0].JobStateInfo.Reason | Out-String).Trim()
-            throw "Support-root watcher did not complete. State=$state Error=$jobError"
-          }
-          $probe = Receive-Job -Job $watcher -ErrorAction Stop
-          if ($null -eq $probe) { throw 'Support-root watcher returned no probe evidence.' }
-
-          $sentinelSurvived = Test-Path -LiteralPath ([string]$probe.Sentinel) -PathType Leaf
-          Write-Host "SUPPORT_ROOT=$($probe.Original)"
-          Write-Host "OWNED_MOVED_ROOT=$($probe.Moved)"
-          Write-Host "FOREIGN_SENTINEL_SURVIVED=$sentinelSurvived"
-          if ($null -ne $builderError) { Write-Host 'BUILDER_ERROR_OBSERVED=YES' } else { Write-Host 'BUILDER_ERROR_OBSERVED=NO' }
-
-          try {
-            if (-not $sentinelSurvived) {
-              Write-Host 'DEFECT_CONFIRMED=YES'
-              Write-Host 'The public builder finally block recursively deleted a foreign replacement placed at the original hms-builder-support pathname.'
-            }
-            else {
-              Write-Host 'DEFECT_CONFIRMED=NO'
-              throw 'Foreign support-root replacement survived; the suspected cleanup race was not reproduced.'
-            }
+            try { Rename-Item -LiteralPath ([string]$ownedA.Path) -NewName (Split-Path -Leaf $movedA) -ErrorAction Stop }
+            catch { $renameBlocked = $true }
+            if (-not $renameBlocked) { throw 'Active owned-temp guard allowed the root to be renamed.' }
+            Remove-HmsOwnedTempDirectory -Owned $ownedA -Label 'active-guard regression'
+            if (Test-Path -LiteralPath ([string]$ownedA.Path)) { throw 'Exact owned temp root remained after normal identity-bound cleanup.' }
           }
           finally {
-            Remove-Job -Job $watcher -Force -ErrorAction SilentlyContinue
-            foreach ($cleanup in @([string]$probe.Moved,[string]$probe.Original,$outputRoot,$skillsRoot)) {
-              if (-not [string]::IsNullOrWhiteSpace($cleanup) -and (Test-Path -LiteralPath $cleanup)) {
-                Remove-Item -LiteralPath $cleanup -Recurse -Force -ErrorAction SilentlyContinue
-              }
-            }
+            if ($null -ne $ownedA.Guard) { $ownedA.Guard.Dispose(); $ownedA.Guard=$null }
+            foreach ($p in @([string]$ownedA.Path,$movedA)) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } }
           }
+
+          # Case B: after guard release, replace the pathname and prove cleanup rejects the foreign object.
+          $ownedB = New-HmsOwnedTempDirectory -Prefix 'hms-owned-temp-replace-' -Label 'foreign-replacement regression'
+          $originalB = [string]$ownedB.Path
+          $movedB = $originalB + '-owned-original'
+          $sentinelB = Join-Path $originalB 'FOREIGN-PRESERVE.txt'
+          try {
+            $ownedB.Guard.Dispose(); $ownedB.Guard=$null
+            Rename-Item -LiteralPath $originalB -NewName (Split-Path -Leaf $movedB) -ErrorAction Stop
+            New-Item -ItemType Directory -Path $originalB -ErrorAction Stop | Out-Null
+            [IO.File]::WriteAllText($sentinelB,'foreign replacement must survive',(New-Object Text.UTF8Encoding($false)))
+            $rejected = $false
+            try { Remove-HmsOwnedTempDirectory -Owned $ownedB -Label 'foreign-replacement regression' }
+            catch {
+              if ($_.Exception.Message -match 'cleanup rejected a foreign pathname replacement') { $rejected = $true }
+              else { throw }
+            }
+            if (-not $rejected) { throw 'Identity-bound cleanup accepted a foreign pathname replacement.' }
+            if (-not (Test-Path -LiteralPath $sentinelB -PathType Leaf)) { throw 'Identity-bound cleanup deleted the foreign replacement.' }
+            if (-not (Test-Path -LiteralPath $movedB -PathType Container)) { throw 'Original exact owned directory disappeared during foreign-replacement regression.' }
+          }
+          finally {
+            foreach ($p in @($originalB,$movedB,$helperPath)) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } }
+          }
+
+          Write-Host 'PASS: active filesystem guard blocks support-root rename and identity-bound cleanup rejects/deletes no foreign pathname replacement.'
