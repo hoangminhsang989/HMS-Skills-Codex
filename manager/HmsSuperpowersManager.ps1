@@ -36,7 +36,7 @@ $source = $source.Replace($needle, $replacement)
 
 # The UTF-8 implementation retains its legacy parser for source readability, but
 # the public runtime replaces that entry point with the shared strict manifest
-# reader. This prevents PowerShell coercion of values such as JSON "false" to true.
+# reader. Keep [CmdletBinding()]/param as the first statements in the dynamic source.
 $stateNeedle = 'function Get-CurrentModuleState {'
 $stateOccurrences = [regex]::Matches($source, [regex]::Escape($stateNeedle)).Count
 if ($stateOccurrences -ne 1) {
@@ -55,7 +55,12 @@ function Get-CurrentModuleState {
 }
 '@
 $strictWrapper = $strictWrapper.Replace('__STRICT_READER__', $escapedStrictReader)
-$source = $strictWrapper + "`r`n" + $source
+$insertMarker = 'function Assert-BuilderAvailable {'
+$insertOccurrences = [regex]::Matches($source, [regex]::Escape($insertMarker)).Count
+if ($insertOccurrences -ne 1) {
+    throw "Manager strict-reader insertion contract mismatch: expected one Assert-BuilderAvailable declaration, found $insertOccurrences."
+}
+$source = $source.Replace($insertMarker, $strictWrapper + "`r`n" + $insertMarker)
 
 try {
     $implementation = [ScriptBlock]::Create($source)
