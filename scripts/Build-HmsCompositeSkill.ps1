@@ -84,6 +84,35 @@ function Assert-GitSourceIdentity {
     return $head
 }
 
+function Assert-CopyTreeContainsCommittedBytesOnly {
+    param([Parameter(Mandatory)][string]$Source)
+
+    $sourceRoot = Get-CanonicalPath -Path $Source
+    $repoTopRaw = ((& git -C $Source rev-parse --show-toplevel 2>$null) -join '').Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoTopRaw)) {
+        throw "Copy source is not inside a readable Git checkout: $Source"
+    }
+    $repoRoot = Get-CanonicalPath -Path $repoTopRaw
+    $prefix = $repoRoot + '\'
+    if ($sourceRoot -ieq $repoRoot) {
+        $pathSpec = '.'
+    }
+    elseif ($sourceRoot.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        $pathSpec = $sourceRoot.Substring($prefix.Length).Replace('\','/')
+    }
+    else {
+        throw "Copy source escaped its Git repository root: $Source"
+    }
+
+    # `git status --ignored` is deliberate. Ordinary clean checks omit ignored files,
+    # but Copy-Item -Recurse would otherwise publish those local-only bytes.
+    $status = (& git -C $repoRoot status --porcelain=v1 --untracked-files=all --ignored -- $pathSpec 2>$null) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw "Copy-tree Git status failed: $Source" }
+    if (-not [string]::IsNullOrWhiteSpace($status)) {
+        throw "Copy tree contains non-committed or ignored content; refusing to publish local-only bytes: $Source"
+    }
+}
+
 function Read-SuperpowersLock {
     if (-not (Test-Path -LiteralPath $SuperpowersLockPath)) { throw "Superpowers lock file not found: $SuperpowersLockPath" }
     try { $lock = Get-Content -LiteralPath $SuperpowersLockPath -Raw | ConvertFrom-Json }
@@ -109,15 +138,30 @@ function Read-UiLock {
 function Assert-SelectedSourceIdentities {
     param([Parameter(Mandatory)]$SuperLock,[Parameter(Mandatory)]$UiLock)
 
-    $null = Assert-GitSourceIdentity -Path $InstallRoot -ExpectedRepository $CanonicalHmsRemote -Label 'HMS Skills Codex'
+    $heads = [ordered]@{
+        hms = (Assert-GitSourceIdentity -Path $InstallRoot -ExpectedRepository $CanonicalHmsRemote -Label 'HMS Skills Codex')
+        superpowers = $null
+        taste = $null
+        impeccable = $null
+    }
     if ($Superpowers) {
-        $null = Assert-GitSourceIdentity -Path $SuperpowersRoot -ExpectedRepository ([string]$SuperLock.repository) -ExpectedCommit ([string]$SuperLock.commit) -Label 'Superpowers'
+        $heads['superpowers'] = Assert-GitSourceIdentity -Path $SuperpowersRoot -ExpectedRepository ([string]$SuperLock.repository) -ExpectedCommit ([string]$SuperLock.commit) -Label 'Superpowers'
     }
     if ($Taste) {
-        $null = Assert-GitSourceIdentity -Path $TasteRoot -ExpectedRepository ([string]$UiLock.taste.repository) -ExpectedCommit ([string]$UiLock.taste.commit) -Label 'GPT Taste'
+        $heads['taste'] = Assert-GitSourceIdentity -Path $TasteRoot -ExpectedRepository ([string]$UiLock.taste.repository) -ExpectedCommit ([string]$UiLock.taste.commit) -Label 'GPT Taste'
     }
     if ($Impeccable) {
-        $null = Assert-GitSourceIdentity -Path $ImpeccableRoot -ExpectedRepository ([string]$UiLock.impeccable.repository) -ExpectedCommit ([string]$UiLock.impeccable.commit) -Label 'Impeccable'
+        $heads['impeccable'] = Assert-GitSourceIdentity -Path $ImpeccableRoot -ExpectedRepository ([string]$UiLock.impeccable.repository) -ExpectedCommit ([string]$UiLock.impeccable.commit) -Label 'Impeccable'
+    }
+    return $heads
+}
+
+function Assert-SourceSnapshotsEqual {
+    param([Parameter(Mandatory)]$Before,[Parameter(Mandatory)]$After)
+    foreach ($key in @('hms','superpowers','taste','impeccable')) {
+        if ([string]$Before[$key] -cne [string]$After[$key]) {
+            throw "Source identity changed during composite compilation for '$key'. Before=$($Before[$key]) After=$($After[$key])"
+        }
     }
 }
 
@@ -192,6 +236,7 @@ function Assert-OwnedCompositeRoot {
 function Copy-SkillModule {
     param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Destination)
     if (-not (Test-Path -LiteralPath (Join-Path $Source 'SKILL.md'))) { throw "Skill source does not contain SKILL.md: $Source" }
+    Assert-CopyTreeContainsCommittedBytesOnly -Source $Source
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Destination) | Out-Null
     Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
     foreach ($skillFile in @(Get-ChildItem -LiteralPath $Destination -Filter 'SKILL.md' -File -Recurse -ErrorAction SilentlyContinue)) {
@@ -299,7 +344,6 @@ function Write-CompositeSkill {
     $lines += 'Pass the required floor directly to the dispatcher. It reads the model pool and safely reassigns work only to an equal-or-stronger enabled model.'
     $lines += ('- ' + $ModelDispatcherReference)
     $lines += ''
-
     if ([bool]$Modules['hms']) {
         $lines += '### HMS Core'
         $lines += 'HMS Core owns governance and final arbitration. Read references/hms/hms-superpowers/MODULE.md first, then load only supporting HMS MODULE.md files required by the current gate.'
@@ -347,12 +391,9 @@ try {
     }
     if (-not $mutexOwned) { throw "Timed out waiting for composite build lock: $BuildMutexName" }
 
-    # The HMS checkout contains the compiler, internal model routing sources, and lock
-    # files. Refuse dirty/foreign source before any bundle or discovery mutation.
-    $null = Assert-GitSourceIdentity -Path $InstallRoot -ExpectedRepository $CanonicalHmsRemote -Label 'HMS Skills Codex'
     $superLock = Read-SuperpowersLock
     $uiLock = Read-UiLock
-    Assert-SelectedSourceIdentities -SuperLock $superLock -UiLock $uiLock
+    $sourceHeadsBefore = Assert-SelectedSourceIdentities -SuperLock $superLock -UiLock $uiLock
 
     $modules = [ordered]@{ hms=[bool]$Hms; superpowers=[bool]$Superpowers; taste=[bool]$Taste; impeccable=[bool]$Impeccable }
     if (-not (Test-Path -LiteralPath (Join-Path $ModelRouterSource 'SKILL.md'))) { throw 'Dedicated model router source is missing.' }
@@ -411,30 +452,44 @@ try {
     if ($Taste) { Copy-SkillModule -Source $tasteSource -Destination (Join-Path $refsRoot 'taste'); $tasteRef = 'references/taste/MODULE.md' }
     if ($Impeccable) { Copy-SkillModule -Source $impeccableSource -Destination (Join-Path $refsRoot 'impeccable'); $impeccableRef = 'references/impeccable/MODULE.md' }
 
-    # Detect a source checkout changing while it was being copied. A mismatch/dirty
-    # source aborts before the staged bundle can become active.
-    Assert-SelectedSourceIdentities -SuperLock $superLock -UiLock $uiLock
+    $sourceHeadsAfter = Assert-SelectedSourceIdentities -SuperLock $superLock -UiLock $uiLock
+    Assert-SourceSnapshotsEqual -Before $sourceHeadsBefore -After $sourceHeadsAfter
 
     Write-CompositeSkill -StageRoot $stage -Modules $modules -ModelRouterReference $modelRouterRef -ModelDispatcherReference $modelDispatcherRef -HmsReferences $hmsRefs -SuperpowersReferences $superRefs -TasteReference $tasteRef -ImpeccableReference $impeccableRef
 
     $enabled = @($modules.Keys | Where-Object { [bool]$modules[$_] })
     $manifest = [ordered]@{
         schema_version=1; managed_by=$ManagedBy; artifact=$Artifact; composite_skill=$CompositeName; generated_at_utc=[DateTime]::UtcNow.ToString('o'); modules=$modules; enabled_modules=$enabled
-        source_heads=[ordered]@{ hms=(Get-GitHeadOrNull -Path $InstallRoot); superpowers=(Get-GitHeadOrNull -Path $SuperpowersRoot); taste=(Get-GitHeadOrNull -Path $TasteRoot); impeccable=(Get-GitHeadOrNull -Path $ImpeccableRoot) }
+        source_heads=[ordered]@{ hms=$sourceHeadsAfter['hms']; superpowers=$sourceHeadsAfter['superpowers']; taste=$sourceHeadsAfter['taste']; impeccable=$sourceHeadsAfter['impeccable'] }
         routing_contract=[ordered]@{
             governance='hms'; engineering_method='superpowers'; visual_direction='taste'; ui_audit_polish='impeccable'; concurrency='one-primary-owner-per-task-slice'; composite_build_lock=$BuildMutexName; model_router='always-internal'; model_dispatcher='always-internal'; model_fallback='upward-only'; model_settings=$ModelSettingsPath
         }
     }
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stage 'manifest.json') -Encoding UTF8
 
-    if (Test-Path -LiteralPath $FinalRoot) { Rename-Item -LiteralPath $FinalRoot -NewName (Split-Path -Leaf $backup) -ErrorAction Stop }
-    Rename-Item -LiteralPath $stage -NewName (Split-Path -Leaf $FinalRoot) -ErrorAction Stop
-    $stage = $null
-
-    $removedLegacy = @(); $createdComposite = $false
+    $removedLegacy = @()
+    $createdComposite = $false
+    $oldMovedToBackup = $false
+    $newActivated = $false
     try {
+        if (Test-Path -LiteralPath $FinalRoot) {
+            Rename-Item -LiteralPath $FinalRoot -NewName (Split-Path -Leaf $backup) -ErrorAction Stop
+            $oldMovedToBackup = $true
+        }
+
+        if ($env:HMS_TEST_FAIL_STAGE_ACTIVATION -ceq '1') {
+            throw 'Injected staged-root activation failure for rollback qualification.'
+        }
+
+        Rename-Item -LiteralPath $stage -NewName (Split-Path -Leaf $FinalRoot) -ErrorAction Stop
+        $newActivated = $true
+        $stage = $null
+
         foreach ($entry in $legacy) {
-            if ($null -ne (Get-Item -LiteralPath $entry.Link -Force -ErrorAction SilentlyContinue)) { Remove-ExactJunction -Link $entry.Link -Target $entry.Target; $removedLegacy += $entry }
+            if ($null -ne (Get-Item -LiteralPath $entry.Link -Force -ErrorAction SilentlyContinue)) {
+                Remove-ExactJunction -Link $entry.Link -Target $entry.Target
+                $removedLegacy += $entry
+            }
         }
         if ($enabled.Count -gt 0) {
             $before = Get-ExactJunctionState -Link $CompositeLink -Target $FinalRoot
@@ -448,21 +503,48 @@ try {
         }
     }
     catch {
-        $mutationError = $_; $rollbackErrors = @()
-        try { if ($createdComposite -and (Test-Path -LiteralPath $FinalRoot)) { Remove-ExactJunction -Link $CompositeLink -Target $FinalRoot } } catch { $rollbackErrors += $_.Exception.Message }
-        foreach ($entry in $removedLegacy) { try { Ensure-ExactJunction -Link $entry.Link -Target $entry.Target } catch { $rollbackErrors += $_.Exception.Message } }
+        $mutationError = $_
+        $rollbackErrors = @()
+
         try {
-            if (Test-Path -LiteralPath $FinalRoot) { Remove-Item -LiteralPath $FinalRoot -Recurse -Force }
-            if (Test-Path -LiteralPath $backup) { Rename-Item -LiteralPath $backup -NewName (Split-Path -Leaf $FinalRoot) -ErrorAction Stop }
+            if ($createdComposite -and (Test-Path -LiteralPath $FinalRoot)) {
+                Remove-ExactJunction -Link $CompositeLink -Target $FinalRoot
+            }
         }
         catch { $rollbackErrors += $_.Exception.Message }
-        if ($rollbackErrors.Count -gt 0) { throw "Composite activation failed and rollback was incomplete. Original: $($mutationError.Exception.Message). Rollback: $($rollbackErrors -join ' | ')" }
+
+        foreach ($entry in $removedLegacy) {
+            try { Ensure-ExactJunction -Link $entry.Link -Target $entry.Target }
+            catch { $rollbackErrors += $_.Exception.Message }
+        }
+
+        try {
+            if ($newActivated) {
+                if (Test-Path -LiteralPath $FinalRoot) {
+                    Assert-OwnedCompositeRoot -Path $FinalRoot
+                    Remove-Item -LiteralPath $FinalRoot -Recurse -Force
+                }
+            }
+            elseif (Test-Path -LiteralPath $FinalRoot) {
+                throw "Cannot restore previous composite because FinalRoot became occupied before staged activation completed: $FinalRoot"
+            }
+
+            if ($oldMovedToBackup) {
+                if (-not (Test-Path -LiteralPath $backup)) { throw "Previous composite backup disappeared during rollback: $backup" }
+                Rename-Item -LiteralPath $backup -NewName (Split-Path -Leaf $FinalRoot) -ErrorAction Stop
+            }
+        }
+        catch { $rollbackErrors += $_.Exception.Message }
+
+        if ($rollbackErrors.Count -gt 0) {
+            throw "Composite activation failed and rollback was incomplete. Original: $($mutationError.Exception.Message). Rollback: $($rollbackErrors -join ' | ')"
+        }
         throw $mutationError
     }
 
     if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
     $enabledText = if ($enabled.Count -eq 0) { 'none' } else { $enabled -join ', ' }
-    Write-Host "PASS: compiled one Codex skill '$CompositeName' from enabled work modules: $enabledText; dedicated model router and dispatcher embedded under serialized exact-source compilation."
+    Write-Host "PASS: compiled one Codex skill '$CompositeName' from enabled work modules: $enabledText; committed-only source trees, stable source snapshots, serialized activation, and rollback-qualified bundle swap verified."
     Write-Host "Composite bundle: $FinalRoot"
     if ($enabled.Count -gt 0) { Write-Host "Codex discovery: $CompositeLink" } else { Write-Host 'Codex discovery disabled because no work modules are enabled.' }
 }
