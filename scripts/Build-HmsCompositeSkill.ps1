@@ -12,11 +12,39 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$repoRoot = Split-Path -Parent $PSScriptRoot
 $implementationPath = Join-Path $PSScriptRoot 'Build-HmsCompositeSkill.impl.ps1'
 $committedCopyHelper = Join-Path $PSScriptRoot 'Copy-HmsCommittedGitPath.ps1'
 foreach ($requiredPath in @($implementationPath,$committedCopyHelper)) {
     if (-not (Test-Path -LiteralPath $requiredPath)) { throw "Composite build support file is missing: $requiredPath" }
 }
+
+function Assert-CommittedSupportFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$RelativePath,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    $head = ((& git -C $repoRoot rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') {
+        throw "$Label support verification could not resolve a canonical repository HEAD."
+    }
+    $expected = ((& git -C $repoRoot rev-parse "$head`:$RelativePath" 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $expected -notmatch '^[0-9a-f]{40}$') {
+        throw "$Label support verification could not resolve the committed blob: $RelativePath"
+    }
+    $actual = ((& git -C $repoRoot hash-object --no-filters -- $Path 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $actual -notmatch '^[0-9a-f]{40}$') {
+        throw "$Label support verification could not hash the live support file: $Path"
+    }
+    if ($actual -cne $expected) {
+        throw "$Label support file does not match exact HEAD blob. Expected $expected, found $actual. Refusing hidden worktree/index substitution."
+    }
+}
+
+Assert-CommittedSupportFile -Path $implementationPath -RelativePath 'scripts/Build-HmsCompositeSkill.impl.ps1' -Label 'Composite implementation'
+Assert-CommittedSupportFile -Path $committedCopyHelper -RelativePath 'scripts/Copy-HmsCommittedGitPath.ps1' -Label 'Committed-copy helper'
 
 $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
 try { $source = [IO.File]::ReadAllText($implementationPath, $utf8Strict) }
@@ -71,4 +99,4 @@ if ($generatedText -notmatch [regex]::Escape('Project-specific authority never b
     throw 'Generated composite did not preserve the project-authority safety boundary.'
 }
 
-Write-Host 'PASS: composite source copies are Git-object-derived and generated authority precedence is pinned below HMS checkpoint/safety/model-floor gates.'
+Write-Host 'PASS: composite support bytes and source copies are exact-HEAD Git-object-derived; generated authority precedence is pinned below HMS checkpoint/safety/model-floor gates.'
