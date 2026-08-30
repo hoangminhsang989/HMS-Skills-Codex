@@ -125,15 +125,9 @@ function Sync-PinnedRepository {
 
 function Get-ModuleState {
     if (Test-Path -LiteralPath $CompositeManifest) {
-        try { $manifest = Get-Content -LiteralPath $CompositeManifest -Raw | ConvertFrom-Json }
-        catch { throw "Composite manifest is invalid JSON: $($_.Exception.Message)" }
-        if ([string]$manifest.managed_by -cne 'HMS-Skills-Codex' -or [string]$manifest.artifact -cne 'hms-superpowers-composite') { throw 'Composite manifest ownership mismatch.' }
-        return [ordered]@{
-            hms = [bool]$manifest.modules.hms
-            superpowers = [bool]$manifest.modules.superpowers
-            taste = [bool]$manifest.modules.taste
-            impeccable = [bool]$manifest.modules.impeccable
-        }
+        $reader = Join-Path $InstallRoot 'scripts\Read-HmsCompositeModuleState.ps1'
+        if (-not (Test-Path -LiteralPath $reader)) { throw "Strict composite manifest reader is missing: $reader" }
+        return & $reader -ManifestPath $CompositeManifest
     }
 
     $legacy = [ordered]@{
@@ -149,8 +143,8 @@ function Get-ModuleState {
         $state[$key] = $exists
         if ($exists) { $legacyFound = $true }
     }
-    if ($legacyFound) { return $state }
-    return [ordered]@{
+    if ($legacyFound) { return [pscustomobject]$state }
+    return [pscustomobject][ordered]@{
         hms = $true
         superpowers = (-not $SkipSuperpowers)
         taste = (-not $SkipTaste)
@@ -204,7 +198,7 @@ try {
 
     Write-Host 'HMS Skills Codex installation PASS.'
     Write-Host 'Codex public skill: $hms-superpowers'
-    Write-Host ('Enabled modules: ' + (@($state.Keys | Where-Object { [bool]$state[$_] }) -join ', '))
+    Write-Host ('Enabled modules: ' + (@(('hms','superpowers','taste','impeccable') | Where-Object { [bool]$state.$_ }) -join ', '))
     if (-not $SkipCodeGraph) { Write-Host 'CodeGraph remains an MCP tool, not a separate public skill.' }
     Write-Host 'Restart Codex to refresh discovery.'
 }
