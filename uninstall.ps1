@@ -98,7 +98,7 @@ function Get-ExactJunctionState {
 function Restore-Quarantine {
     param([string]$Original,[string]$Quarantine)
     if ($null -eq (Get-Item -LiteralPath $Quarantine -Force -ErrorAction SilentlyContinue)) { return }
-    if ($null -ne (Get-Item -LiteralPath $Original -Force -ErrorAction SilentlyContinue)) { throw "Cannot restore quarantined Junction because original path is occupied: $Original" }
+    if ($null -ne (Get-Item -LiteralPath $Original -Force -ErrorAction SilentlyContinue)) { throw "Cannot restore quarantined path because original path is occupied: $Original" }
     Rename-Item -LiteralPath $Quarantine -NewName (Split-Path -Leaf $Original) -ErrorAction Stop
 }
 
@@ -121,6 +121,43 @@ function Remove-VerifiedJunction {
         $e = $_
         try { Restore-Quarantine -Original $Path -Quarantine $quarantine }
         catch { throw "Junction removal failed and rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)" }
+        throw $e
+    }
+}
+
+function Remove-VerifiedClone {
+    param(
+        [string]$Path,
+        [string]$ExpectedRemote,
+        [string]$MarkerRelativePath,
+        [string]$Action
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-CloneIdentity -Path $Path -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
+    if (-not $PSCmdlet.ShouldProcess($Path, $Action)) { return }
+
+    $parent = Split-Path -Parent $Path
+    $leaf = '.hms-clone-removing-' + [guid]::NewGuid().ToString('N')
+    $quarantine = Join-Path $parent $leaf
+    $deleteStarted = $false
+    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    try {
+        # Destructive-boundary identity check: only the exact quarantined Git clone
+        # with the reviewed origin and marker may cross into recursive deletion.
+        Assert-CloneIdentity -Path $quarantine -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
+        $deleteStarted = $true
+        Remove-Item -LiteralPath $quarantine -Recurse -Force
+        if (Test-Path -LiteralPath $quarantine) { throw "Clone removal did not complete: $quarantine" }
+    }
+    catch {
+        $e = $_
+        if (-not $deleteStarted) {
+            try { Restore-Quarantine -Original $Path -Quarantine $quarantine }
+            catch { throw "Clone removal preflight failed and rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)" }
+        }
+        elseif (Test-Path -LiteralPath $quarantine) {
+            throw "Clone deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+        }
         throw $e
     }
 }
@@ -188,16 +225,16 @@ try {
 
     if ($RemoveClones) {
         Remove-VerifiedDirectory -Path $compositeRoot -Action 'Remove verified HMS composite bundle'
-        if ($IncludeSuperpowers) { Remove-VerifiedDirectory -Path $superpowersClone -Action 'Remove verified Superpowers clone' }
+        if ($IncludeSuperpowers) { Remove-VerifiedClone -Path $superpowersClone -ExpectedRemote $SuperpowersRemote -MarkerRelativePath 'skills\brainstorming\SKILL.md' -Action 'Remove verified Superpowers clone' }
         if ($IncludeUiSkills) {
-            Remove-VerifiedDirectory -Path $tasteClone -Action 'Remove verified Taste clone'
-            Remove-VerifiedDirectory -Path $impeccableClone -Action 'Remove verified Impeccable clone'
+            Remove-VerifiedClone -Path $tasteClone -ExpectedRemote $TasteRemote -MarkerRelativePath 'skills\gpt-tasteskill\SKILL.md' -Action 'Remove verified Taste clone'
+            Remove-VerifiedClone -Path $impeccableClone -ExpectedRemote $ImpeccableRemote -MarkerRelativePath '.agents\skills\impeccable\SKILL.md' -Action 'Remove verified Impeccable clone'
         }
         if ($IncludeDeliveryTools) {
-            Remove-VerifiedDirectory -Path $threeLevelClone -Action 'Remove verified Three-Level Delivery clone'
+            Remove-VerifiedClone -Path $threeLevelClone -ExpectedRemote $ThreeLevelRemote -MarkerRelativePath 'three-level-delivery\SKILL.md' -Action 'Remove verified Three-Level Delivery clone'
             Remove-VerifiedDirectory -Path $codeGraphRoot -Action 'Remove verified HMS CodeGraph directory'
         }
-        Remove-VerifiedDirectory -Path $hmsClone -Action 'Remove verified HMS clone'
+        Remove-VerifiedClone -Path $hmsClone -ExpectedRemote $HmsRemote -MarkerRelativePath 'skills\hms-superpowers\SKILL.md' -Action 'Remove verified HMS clone'
     }
 
     Write-Host 'Requested HMS Skills Codex uninstall actions completed.'
