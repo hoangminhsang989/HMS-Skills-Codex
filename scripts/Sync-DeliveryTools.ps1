@@ -219,10 +219,10 @@ function Remove-CodeGraphTransactionBundle {
     catch {
         $e = $_
         if (-not $deleteStarted -and (Test-Path -LiteralPath $quarantine) -and -not (Test-Path -LiteralPath $Path)) {
-  try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
+            try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
         }
         elseif ($deleteStarted -and (Test-Path -LiteralPath $quarantine)) {
-  throw "CodeGraph transaction deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+            throw "CodeGraph transaction deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
         }
         throw $e
     }
@@ -268,10 +268,10 @@ function Remove-CodeGraphTempRoot {
     catch {
         $e = $_
         if (-not $deleteStarted -and (Test-Path -LiteralPath $quarantine) -and -not (Test-Path -LiteralPath $Path)) {
-  try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
+            try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
         }
         elseif ($deleteStarted -and (Test-Path -LiteralPath $quarantine)) {
-  throw "CodeGraph temporary deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+            throw "CodeGraph temporary deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
         }
         throw $e
     }
@@ -291,7 +291,7 @@ function Restore-CodeGraphManifestAfterFailure {
     catch { throw "CodeGraph candidate manifest is invalid during rollback: $($_.Exception.Message)" }
     foreach ($field in @('managed_by','version','tag','commit','asset','sha256')) {
         if ([string]$currentManifest.$field -cne [string]$CandidateManifest[$field]) {
-  throw "CodeGraph candidate manifest changed before rollback for '$field'; refusing to overwrite it."
+            throw "CodeGraph candidate manifest changed before rollback for '$field'; refusing to overwrite it."
         }
     }
     if ($HadPrevious) {
@@ -300,17 +300,118 @@ function Restore-CodeGraphManifestAfterFailure {
         $temp = Join-Path $parent ('.hms-codegraph-manifest-restore-' + [guid]::NewGuid().ToString('N') + '.tmp')
         $discard = Join-Path $parent ('.hms-codegraph-manifest-discard-' + [guid]::NewGuid().ToString('N') + '.tmp')
         try {
-  [IO.File]::WriteAllBytes($temp, $PreviousBytes)
-  [IO.File]::Replace($temp, $CodeGraphManifest, $discard, $true)
+            [IO.File]::WriteAllBytes($temp, $PreviousBytes)
+            [IO.File]::Replace($temp, $CodeGraphManifest, $discard, $true)
         }
         finally {
-  foreach ($cleanup in @($temp,$discard)) { if (Test-Path -LiteralPath $cleanup) { Remove-Item -LiteralPath $cleanup -Force -ErrorAction SilentlyContinue } }
+            foreach ($cleanup in @($temp,$discard)) { if (Test-Path -LiteralPath $cleanup) { Remove-Item -LiteralPath $cleanup -Force -ErrorAction SilentlyContinue } }
         }
     }
     else {
         Remove-Item -LiteralPath $CodeGraphManifest -Force
     }
 }
+
+function Repair-CodeGraphRollbackState {
+    param(
+        [Parameter(Mandatory)][string]$CurrentPath,
+        [string]$BackupPath,
+        [Parameter(Mandatory)]$CandidateIdentity,
+        $BackupIdentity,
+        [Parameter(Mandatory)][bool]$ManifestPublished,
+        $PublishedManifest,
+        [byte[]]$PreviousManifestBytes,
+        [Parameter(Mandatory)][bool]$HadPrevious,
+        [scriptblock]$CandidateRemovalAction
+    )
+
+    $rollbackErrors = @()
+    $candidateRemovalCompleted = $false
+    $backupActivated = $false
+    $candidatePreserved = $false
+    $currentBundleState = 'absent'
+    $canRestorePrevious = $HadPrevious -and $null -ne $BackupIdentity -and -not [string]::IsNullOrWhiteSpace($BackupPath) -and (Test-Path -LiteralPath $BackupPath)
+
+    if ($canRestorePrevious -or -not $HadPrevious) {
+        try {
+            if (Test-Path -LiteralPath $CurrentPath) {
+                if ($null -ne $CandidateRemovalAction) {
+                    & $CandidateRemovalAction $CurrentPath $CandidateIdentity
+                }
+                else {
+                    Remove-CodeGraphTransactionBundle -Path $CurrentPath -Identity $CandidateIdentity
+                }
+            }
+            $candidateRemovalCompleted = -not (Test-Path -LiteralPath $CurrentPath)
+        }
+        catch {
+            $rollbackErrors += $_.Exception.Message
+            $candidateRemovalCompleted = -not (Test-Path -LiteralPath $CurrentPath)
+        }
+    }
+
+    if ($canRestorePrevious -and $candidateRemovalCompleted) {
+        try {
+            if (-not (Test-Path -LiteralPath $BackupPath)) { throw "CodeGraph backup disappeared before rollback activation: $BackupPath" }
+            if (Test-Path -LiteralPath $CurrentPath) { throw "Cannot restore CodeGraph backup because current became occupied: $CurrentPath" }
+            Move-Item -LiteralPath $BackupPath -Destination $CurrentPath
+            Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
+            $backupActivated = $true
+        }
+        catch { $rollbackErrors += $_.Exception.Message }
+    }
+
+    if (Test-Path -LiteralPath $CurrentPath) {
+        try {
+            Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $CandidateIdentity
+            $currentBundleState = 'candidate'
+            $candidatePreserved = $true
+        }
+        catch {
+            if ($HadPrevious -and $null -ne $BackupIdentity) {
+                try {
+                    Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
+                    $currentBundleState = 'previous'
+                    $backupActivated = $true
+                }
+                catch {
+                    $rollbackErrors += "Active CodeGraph current bundle matches neither candidate nor previous transaction identity: $($_.Exception.Message)"
+                    $currentBundleState = 'unknown'
+                }
+            }
+            else {
+                $rollbackErrors += "Active CodeGraph current bundle does not match the candidate transaction identity: $($_.Exception.Message)"
+                $currentBundleState = 'unknown'
+            }
+        }
+    }
+
+    if ($ManifestPublished) {
+        try {
+            if ($currentBundleState -ceq 'previous') {
+                Restore-CodeGraphManifestAfterFailure -CandidateManifest $PublishedManifest -PreviousBytes $PreviousManifestBytes -HadPrevious $true
+            }
+            elseif ($currentBundleState -ceq 'candidate') {
+                # Candidate remains the active verified bundle, so its already-published manifest remains authoritative.
+            }
+            else {
+                # No verified active bundle corresponds to the candidate manifest. Remove that manifest rather than
+                # advertising metadata for an absent or foreign current pathname.
+                Restore-CodeGraphManifestAfterFailure -CandidateManifest $PublishedManifest -PreviousBytes $null -HadPrevious $false
+            }
+        }
+        catch { $rollbackErrors += $_.Exception.Message }
+    }
+
+    return [pscustomobject]@{
+        RollbackErrors = @($rollbackErrors)
+        CandidateRemovalCompleted = $candidateRemovalCompleted
+        BackupActivated = $backupActivated
+        CandidatePreserved = $candidatePreserved
+        CurrentBundleState = $currentBundleState
+    }
+}
+
 function Assert-CodeGraphBundleAgainstManifest {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Manifest)
     Assert-RegularCodeGraphBundle -Path $Path -Label 'Existing HMS CodeGraph bundle'
@@ -402,43 +503,26 @@ function Sync-CodeGraphBundle {
                 Assert-CodeGraphTransactionBundle -Path $current -Identity $candidateIdentity
                 Assert-CodeGraphVersion -CommandPath $command -ExpectedVersion ([string]$Spec.version)
                 $publishedManifest = [ordered]@{
-          managed_by = $ManagedBy
-          version = [string]$Spec.version
-          tag = [string]$Spec.tag
-          commit = [string]$Spec.commit
-          asset = $assetName
-          sha256 = $expectedSha
-      }
-      $manifestTemp = Join-Path $CodeGraphRoot ('.hms-codegraph-manifest-' + $transactionId + '.tmp')
-      $publishedManifest | ConvertTo-Json | Set-Content -LiteralPath $manifestTemp -Encoding UTF8
-      if ($wasInstalled) { [IO.File]::Replace($manifestTemp, $CodeGraphManifest, $null, $true) }
-      else { [IO.File]::Move($manifestTemp, $CodeGraphManifest) }
-      $manifestPublished = $true
+                    managed_by = $ManagedBy
+                    version = [string]$Spec.version
+                    tag = [string]$Spec.tag
+                    commit = [string]$Spec.commit
+                    asset = $assetName
+                    sha256 = $expectedSha
+                }
+                $manifestTemp = Join-Path $CodeGraphRoot ('.hms-codegraph-manifest-' + $transactionId + '.tmp')
+                $publishedManifest | ConvertTo-Json | Set-Content -LiteralPath $manifestTemp -Encoding UTF8
+                if ($wasInstalled) { [IO.File]::Replace($manifestTemp, $CodeGraphManifest, $null, $true) }
+                else { [IO.File]::Move($manifestTemp, $CodeGraphManifest) }
+                $manifestPublished = $true
                 if ($null -ne $backup -and (Test-Path -LiteralPath $backup)) {
                     Remove-CodeGraphTransactionBundle -Path $backup -Identity $backupIdentity
                 }
             }
             catch {
                 $installError = $_
-                $rollbackErrors = @()
-                try {
-                    if (Test-Path -LiteralPath $current) {
-                        Remove-CodeGraphTransactionBundle -Path $current -Identity $candidateIdentity
-                    }
-                }
-                catch { $rollbackErrors += $_.Exception.Message }
-                try {
-                    if ($null -ne $backup -and (Test-Path -LiteralPath $backup)) {
-                        Assert-CodeGraphTransactionBundle -Path $backup -Identity $backupIdentity
-                        if (Test-Path -LiteralPath $current) { throw "Cannot restore CodeGraph backup because current became occupied: $current" }
-                        Move-Item -LiteralPath $backup -Destination $current
-                    }
-                }
-                catch { $rollbackErrors += $_.Exception.Message }
-                try {
-                    if ($rollbackErrors.Count -eq 0 -and $manifestPublished) { Restore-CodeGraphManifestAfterFailure -CandidateManifest $publishedManifest -PreviousBytes $existingManifestBytes -HadPrevious $wasInstalled }
-                }
-                catch { $rollbackErrors += $_.Exception.Message }
+                $rollback = Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup -CandidateIdentity $candidateIdentity -BackupIdentity $backupIdentity -ManifestPublished $manifestPublished -PublishedManifest $publishedManifest -PreviousManifestBytes $existingManifestBytes -HadPrevious $wasInstalled
+                $rollbackErrors = @($rollback.RollbackErrors)
                 if ($rollbackErrors.Count -gt 0) {
                     throw "CodeGraph installation failed and rollback was incomplete. Original: $($installError.Exception.Message). Rollback: $($rollbackErrors -join ' | ')"
                 }
