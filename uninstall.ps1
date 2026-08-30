@@ -75,11 +75,15 @@ function Assert-OwnedCompositeRoot {
 
 function Assert-ManagedCodeGraphRoot {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
     Assert-SafeRemovalPath -Path $Path
+    if (-not [bool]$item.PSIsContainer) { throw "Refusing to remove non-directory CodeGraph path: $Path" }
+    if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Refusing to remove CodeGraph reparse point: $Path" }
     $manifestPath = Join-Path $Path 'hms-codegraph-install.json'
-    if (-not (Test-Path -LiteralPath $manifestPath)) { throw "Refusing to remove CodeGraph directory without HMS ownership manifest: $Path" }
-    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "Refusing to remove CodeGraph directory without HMS ownership manifest: $Path" }
+    try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json }
+    catch { throw "Refusing to remove CodeGraph directory with invalid HMS ownership manifest: $($_.Exception.Message)" }
     if ([string]$manifest.managed_by -cne 'HMS-Skills-Codex') { throw "Unexpected CodeGraph owner: $Path" }
 }
 
@@ -198,6 +202,38 @@ function Remove-VerifiedCompositeRoot {
     }
 }
 
+function Remove-VerifiedCodeGraphRoot {
+    param([string]$Path,[string]$Action)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-ManagedCodeGraphRoot -Path $Path
+    if (-not $PSCmdlet.ShouldProcess($Path, $Action)) { return }
+
+    $parent = Split-Path -Parent $Path
+    $leaf = '.hms-codegraph-removing-' + [guid]::NewGuid().ToString('N')
+    $quarantine = Join-Path $parent $leaf
+    $deleteStarted = $false
+    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    try {
+        # Only a freshly quarantined regular HMS-owned CodeGraph root can cross the destructive boundary.
+        # A foreign replacement at the original pathname is never the recursive deletion target.
+        Assert-ManagedCodeGraphRoot -Path $quarantine
+        $deleteStarted = $true
+        Remove-Item -LiteralPath $quarantine -Recurse -Force
+        if (Test-Path -LiteralPath $quarantine) { throw "CodeGraph removal did not complete: $quarantine" }
+    }
+    catch {
+        $e = $_
+        if (-not $deleteStarted) {
+            try { Restore-Quarantine -Original $Path -Quarantine $quarantine }
+            catch { throw "CodeGraph removal preflight failed and rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)" }
+        }
+        elseif (Test-Path -LiteralPath $quarantine) {
+            throw "CodeGraph deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+        }
+        throw $e
+    }
+}
+
 function Remove-VerifiedDirectory {
     param([string]$Path,[string]$Action)
     if (-not (Test-Path -LiteralPath $Path)) { return }
@@ -268,7 +304,7 @@ try {
         }
         if ($IncludeDeliveryTools) {
             Remove-VerifiedClone -Path $threeLevelClone -ExpectedRemote $ThreeLevelRemote -MarkerRelativePath 'three-level-delivery\SKILL.md' -Action 'Remove verified Three-Level Delivery clone'
-            Remove-VerifiedDirectory -Path $codeGraphRoot -Action 'Remove verified HMS CodeGraph directory'
+            Remove-VerifiedCodeGraphRoot -Path $codeGraphRoot -Action 'Remove verified HMS CodeGraph directory'
         }
         Remove-VerifiedClone -Path $hmsClone -ExpectedRemote $HmsRemote -MarkerRelativePath 'skills\hms-superpowers\SKILL.md' -Action 'Remove verified HMS clone'
     }
