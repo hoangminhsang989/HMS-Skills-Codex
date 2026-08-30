@@ -1,0 +1,172 @@
+name: Validate HMS composite trust regressions
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  windows-composite-trust:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Qualify committed-only copy update serialization and swap rollback
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedSha = $env:CANDIDATE_SHA.ToLowerInvariant()
+          $workspaceHead = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $workspaceHead -ne $expectedSha) {
+            throw "Workflow checkout identity mismatch. Expected $expectedSha, found $workspaceHead"
+          }
+
+          $runnerHome = $env:USERPROFILE
+          $originalHome = $env:HOME
+          $originalCodexHome = $env:CODEX_HOME
+          try {
+            $env:HOME = $runnerHome
+            $env:CODEX_HOME = Join-Path $runnerHome '.codex'
+
+            $installPath = Join-Path $env:GITHUB_WORKSPACE 'install.ps1'
+            $updatePath = Join-Path $env:GITHUB_WORKSPACE 'update.ps1'
+            $builderPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.ps1'
+            & $installPath -InstallRoot $env:GITHUB_WORKSPACE -SkipCodeGraph -SkipThreeLevelDelivery
+
+            $skillsRoot = Join-Path $runnerHome '.agents\skills'
+            $compositeLink = Join-Path $skillsRoot 'hms-superpowers'
+            $outputRoot = Join-Path $runnerHome '.codex\hms-composite'
+            $compositeRoot = Join-Path $outputRoot 'hms-superpowers'
+            $manifestPath = Join-Path $compositeRoot 'manifest.json'
+            $uiLock = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'ui-skills.lock.json') -Raw | ConvertFrom-Json
+            $tasteRoot = Join-Path $runnerHome '.codex\taste-skill'
+            $tasteSkillRelative = ([string]$uiLock.taste.skill_path).TrimEnd('/') + '/SKILL.md'
+            $tasteSkillPath = Join-Path $tasteRoot ($tasteSkillRelative -replace '/', '\')
+            $buildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
+
+            if (-not (Test-Path -LiteralPath $manifestPath)) { throw 'Baseline composite manifest is missing.' }
+            if (-not (Test-Path -LiteralPath $compositeLink)) { throw 'Baseline composite discovery Junction is missing.' }
+
+            # P1 regression: an ignored local file beneath a copied skill must not be publishable.
+            $ignoreFile = Join-Path $tasteRoot '.git\info\exclude'
+            $originalIgnore = [IO.File]::ReadAllText($ignoreFile)
+            $ignoredRelative = ([string]$uiLock.taste.skill_path).TrimEnd('/') + '/.hms-ci-ignored-sentinel'
+            $ignoredPath = Join-Path $tasteRoot ($ignoredRelative -replace '/', '\')
+            $manifestHashBeforeIgnored = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+            try {
+              [IO.File]::AppendAllText($ignoreFile, "`r`n/$ignoredRelative`r`n")
+              [IO.File]::WriteAllText($ignoredPath, 'ignored-local-only-byte')
+
+              $ordinaryStatus = ((& git -C $tasteRoot status --porcelain=v1 --untracked-files=all) -join "`n")
+              if ($LASTEXITCODE -ne 0) { throw 'Ordinary Taste clean-state probe failed.' }
+              if (-not [string]::IsNullOrWhiteSpace($ordinaryStatus)) {
+                throw "Ignored sentinel unexpectedly appeared in the ordinary clean-state probe: $ordinaryStatus"
+              }
+
+              $ignoredStatus = ((& git -C $tasteRoot status --porcelain=v1 --untracked-files=all --ignored -- $ignoredRelative) -join "`n")
+              if ($LASTEXITCODE -ne 0 -or $ignoredStatus -notmatch '!!') {
+                throw "Ignored sentinel was not proven ignored by Git: $ignoredStatus"
+              }
+
+              $ignoredRejected = $false
+              try {
+                & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -Hms $true -Superpowers $true -Taste $true -Impeccable $true
+              }
+              catch {
+                if ($_.Exception.Message -match 'non-committed or ignored content') { $ignoredRejected = $true } else { throw }
+              }
+              if (-not $ignoredRejected) { throw 'Composite compiler published or accepted an ignored local source file.' }
+              $manifestHashAfterIgnored = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+              if ($manifestHashAfterIgnored -cne $manifestHashBeforeIgnored) { throw 'Ignored-source rejection mutated the active composite manifest.' }
+            }
+            finally {
+              Remove-Item -LiteralPath $ignoredPath -Force -ErrorAction SilentlyContinue
+              [IO.File]::WriteAllText($ignoreFile, $originalIgnore)
+            }
+            $cleanAfterIgnored = ((& git -C $tasteRoot status --porcelain=v1 --untracked-files=all) -join "`n")
+            if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($cleanAfterIgnored)) { throw "Taste source did not return to clean state after ignored-file qualification: $cleanAfterIgnored" }
+            Write-Host 'PASS: ignored local files beneath copied skills are rejected before composite activation.'
+
+            # P2 regression: failure after old FinalRoot -> backup but before stage -> FinalRoot must restore the old bundle.
+            $manifestHashBeforeSwapFailure = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+            $swapFailureObserved = $false
+            try {
+              $env:HMS_TEST_FAIL_STAGE_ACTIVATION = '1'
+              & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -Hms $true -Superpowers $true -Taste $true -Impeccable $true
+            }
+            catch {
+              if ($_.Exception.Message -match 'Injected staged-root activation failure') { $swapFailureObserved = $true } else { throw }
+            }
+            finally {
+              Remove-Item Env:HMS_TEST_FAIL_STAGE_ACTIVATION -ErrorAction SilentlyContinue
+            }
+            if (-not $swapFailureObserved) { throw 'Injected staged-root activation failure did not execute the rollback branch.' }
+            if (-not (Test-Path -LiteralPath $manifestPath)) { throw 'Previous composite manifest was not restored after staged-root activation failure.' }
+            $manifestHashAfterSwapFailure = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+            if ($manifestHashAfterSwapFailure -cne $manifestHashBeforeSwapFailure) { throw 'Previous composite bytes changed after staged-root activation rollback.' }
+            if (-not (Test-Path -LiteralPath $compositeLink)) { throw 'Composite discovery Junction became dangling/absent after staged-root activation rollback.' }
+            $swapLeftovers = @(Get-ChildItem -LiteralPath $outputRoot -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.stage-*' -or $_.Name -like '.backup-*' })
+            if ($swapLeftovers.Count -ne 0) { throw 'Staged-root activation rollback left stage/backup artifacts.' }
+            Write-Host 'PASS: pre-discovery staged-root activation failure restores the previous bundle and discovery path.'
+
+            # P1 regression: updater must wait on the same mutex before inspecting/updating source trees.
+            $updateJob = $null
+            $mutex = New-Object System.Threading.Mutex($false, $buildMutexName)
+            $mutexOwned = $false
+            try {
+              Add-Content -LiteralPath $tasteSkillPath -Value "`n<!-- HMS CI updater-lock dirty sentinel -->"
+              $mutexOwned = $mutex.WaitOne([TimeSpan]::FromSeconds(30))
+              if (-not $mutexOwned) { throw 'Failed to acquire parent composite mutex for updater serialization qualification.' }
+
+              $updateJob = Start-Job -ScriptBlock {
+                param($UpdatePath,$InstallRoot)
+                $ErrorActionPreference = 'Stop'
+                & $UpdatePath -InstallRoot $InstallRoot -SkipCodeGraph -SkipThreeLevelDelivery
+              } -ArgumentList $updatePath,$env:GITHUB_WORKSPACE
+
+              Start-Sleep -Seconds 3
+              if ($updateJob.State -notin @('Running','NotStarted')) {
+                $premature = (Receive-Job -Job $updateJob -Keep -ErrorAction SilentlyContinue) -join "`n"
+                throw "Updater crossed source reconciliation before the shared mutex was released. State=$($updateJob.State) Output=$premature"
+              }
+
+              $mutex.ReleaseMutex()
+              $mutexOwned = $false
+              $null = Wait-Job -Job $updateJob -Timeout 120
+              if ($updateJob.State -ne 'Failed') {
+                $unexpected = (Receive-Job -Job $updateJob -Keep -ErrorAction SilentlyContinue) -join "`n"
+                throw "Updater did not fail on the deliberately dirty Taste source after lock release. State=$($updateJob.State) Output=$unexpected"
+              }
+            }
+            finally {
+              if ($mutexOwned) { try { $mutex.ReleaseMutex() } catch { } }
+              $mutex.Dispose()
+              if ($null -ne $updateJob) { Remove-Job -Job $updateJob -Force -ErrorAction SilentlyContinue }
+              & git -C $tasteRoot restore --worktree -- $tasteSkillRelative
+              if ($LASTEXITCODE -ne 0) { throw 'Failed to restore Taste source after updater serialization qualification.' }
+            }
+            $cleanAfterUpdateLock = ((& git -C $tasteRoot status --porcelain=v1 --untracked-files=all) -join "`n")
+            if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($cleanAfterUpdateLock)) { throw "Taste source did not return to clean state after updater-lock qualification: $cleanAfterUpdateLock" }
+            Write-Host 'PASS: updater source reconciliation is serialized by the composite build mutex.'
+
+            # Normal update proves same-thread nested/reentrant acquisition does not deadlock.
+            & $updatePath -InstallRoot $env:GITHUB_WORKSPACE -SkipCodeGraph -SkipThreeLevelDelivery
+            if (-not (Test-Path -LiteralPath $manifestPath)) { throw 'Normal serialized updater did not leave a valid composite manifest.' }
+            if (-not (Test-Path -LiteralPath $compositeLink)) { throw 'Normal serialized updater lost the composite discovery Junction.' }
+            Write-Host 'PASS: serialized install/update -> builder nested mutex path completed without deadlock.'
+
+            Write-Host 'PASS: exact-SHA committed-only copy, source-update serialization, and staged-root rollback regressions qualified.'
+          }
+          finally {
+            $env:HOME = $originalHome
+            $env:CODEX_HOME = $originalCodexHome
+          }
