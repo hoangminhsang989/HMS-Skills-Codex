@@ -67,3 +67,5 @@ jobs:
           git add scripts/Sync-DeliveryTools.ps1
           git commit -m 'Exclude CodeGraph marker by canonical full path'
           git push origin HEAD:stage/hms-superpowers-v0.2.0-ui-design-authority
+
+# exact-authoring-trigger-v2
