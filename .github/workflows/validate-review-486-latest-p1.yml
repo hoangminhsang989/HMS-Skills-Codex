@@ -1,17 +1,18 @@
 name: Apply CodeGraph rollback-order hardening
 
 on:
-  pull_request:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.2.0-ui-design-authority
 
 permissions:
   contents: write
 
 env:
-  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
+  CANDIDATE_SHA: ${{ github.sha }}
 
 jobs:
   harden-rollback-order:
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: windows-latest
     steps:
       - name: Checkout exact trigger SHA
@@ -24,7 +25,7 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           $message=((& git log -1 --format=%s)-join '').Trim()
-          if($message -cne 'chore: trigger CodeGraph rollback-order hardening'){
+          if($message -cne 'chore: trigger CodeGraph rollback-order hardening push'){
             Write-Host "No hardening for head message: $message"
             exit 0
           }
