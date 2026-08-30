@@ -237,22 +237,36 @@ function Assert-OwnedCompositeRoot {
     if ([string]$manifest.managed_by -cne $ManagedBy -or [string]$manifest.artifact -cne $Artifact) { throw "Refusing to replace composite directory with unexpected ownership: $Path" }
 }
 
+function Add-OwnedCompositeTreeRecords {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$LogicalPrefix,
+        [Parameter(Mandatory)]$Records
+    )
+    foreach ($item in @(Get-ChildItem -LiteralPath $Directory -Force -ErrorAction Stop)) {
+        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Composite tree contains a reparse point: $($item.FullName)"
+        }
+        $logical = if ([string]::IsNullOrEmpty($LogicalPrefix)) { [string]$item.Name } else { $LogicalPrefix + "/" + [string]$item.Name }
+        if ([bool]$item.PSIsContainer) {
+            Add-OwnedCompositeTreeRecords -Directory $item.FullName -LogicalPrefix $logical -Records $Records
+            continue
+        }
+        $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $Records.Add($logical + "`t" + $hash)
+    }
+}
+
 function Get-OwnedCompositeTreeSha256 {
     param([Parameter(Mandatory)][string]$Path)
     Assert-OwnedCompositeRoot -Path $Path
-    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\')
+    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
     $records = New-Object System.Collections.Generic.List[string]
-    foreach ($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)) {
-        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-  throw "Composite tree contains a reparse point: $($item.FullName)"
-        }
-        if ([bool]$item.PSIsContainer) { continue }
-        $relative = $item.FullName.Substring($root.Length).TrimStart('\').Replace('\','/')
-        $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-        $records.Add($relative + "`t" + $hash)
-    }
+    Add-OwnedCompositeTreeRecords -Directory $root -LogicalPrefix "" -Records $records
     if ($records.Count -eq 0) { throw "Composite tree contains no authenticated files: $Path" }
-    $payload = [string]::Join("`n", @($records | Sort-Object))
+    $sorted = [string[]]@($records)
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    $payload = [string]::Join("`n", $sorted)
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
