@@ -159,7 +159,14 @@ jobs:
           Write-Host 'PASS: failed-stage cleanup quarantines and revalidates the owned stage while preserving a foreign replacement pathname.'
 
           $deliveryText=[IO.File]::ReadAllText($delivery)
-          foreach ($literal in @('function Remove-CodeGraphTransactionBundle','.hms-codegraph-bundle.json','Remove-CodeGraphTransactionBundle -Path $backup -Identity $backupIdentity','Remove-CodeGraphTransactionBundle -Path $current -Identity $candidateIdentity')) {
+          foreach ($literal in @(
+            'function Remove-CodeGraphTransactionBundle',
+            'function Repair-CodeGraphRollbackState',
+            '.hms-codegraph-bundle.json',
+            'Remove-CodeGraphTransactionBundle -Path $backup -Identity $backupIdentity',
+            'Remove-CodeGraphTransactionBundle -Path $CurrentPath -Identity $CandidateIdentity',
+            'Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup'
+          )) {
             if ($deliveryText -notmatch [regex]::Escape($literal)) { throw "CodeGraph transaction cleanup contract is missing: $literal" }
           }
           if ($deliveryText -match [regex]::Escape('Remove-Item -LiteralPath $backup -Recurse -Force') -or $deliveryText -match [regex]::Escape('Remove-Item -LiteralPath $current -Recurse -Force')) { throw 'CodeGraph transaction still contains pathname recursive deletion for backup/current.' }
