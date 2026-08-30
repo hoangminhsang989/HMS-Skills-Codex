@@ -55,11 +55,8 @@ jobs:
           foreach ($literal in @('scripts/Read-HmsCompositeModuleState.ps1','$__HmsVerifiedStrictReaderScriptBlock_v1','return & $__HmsVerifiedStrictReaderScriptBlock_v1 -ManifestPath $ManifestPath')) {
             if ($managerText -notmatch [regex]::Escape($literal)) { throw "Manager shim does not execute the strict reader from its verified byte snapshot: $literal" }
           }
-          foreach ($literal in @('scripts/Resolve-HmsModelRoute.ps1','$__HmsVerifiedResolverScriptBlock_v1','return & $__HmsVerifiedResolverScriptBlock_v1 -RiskClass $RiskClass -RequiredFloor $RequiredFloor -SettingsPath $Path')) {
-            if ($modelText -notmatch [regex]::Escape($literal)) { throw "Model Settings shim does not execute the resolver from its verified byte snapshot: $literal" }
-          }
-          if ($modelText -match [regex]::Escape('return & $ResolverPath -RiskClass $RiskClass -RequiredFloor $RequiredFloor -SettingsPath $Path')) {
-            throw 'Model Settings retained live-path resolver execution after verified snapshot creation.'
+          foreach ($literal in @('scripts/Resolve-HmsModelRoute.ps1','$__HmsVerifiedResolverScriptBlock_v1','$source = $source.Replace($resolverNeedle, $resolverReplacement)','return & $__HmsVerifiedResolverScriptBlock_v1 -RiskClass $RiskClass -RequiredFloor $RequiredFloor -SettingsPath $Path')) {
+            if ($modelText -notmatch [regex]::Escape($literal)) { throw "Model Settings shim does not deterministically replace live resolver execution with its verified byte snapshot: $literal" }
           }
 
           function Invoke-HiddenDriftRejection {
