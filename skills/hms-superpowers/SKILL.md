@@ -20,7 +20,7 @@ HMS Core exclusively owns:
 - integration/release authorization;
 - durable checkpoint and handoff state.
 
-HMS Core does not choose an enabled runtime model directly. `hms-model-router` classifies risk and required floor; the dedicated always-internal `hms-model-dispatcher` maps that floor onto the model pool configured by the Model Settings popup.
+HMS Core does not choose an enabled runtime model directly. The always-internal `references/model-router/MODULE.md` classifies risk and emits the exact required floor; the always-internal `references/model-dispatcher/MODULE.md` maps that floor onto the model pool configured by Model Settings.
 
 ## Precedence
 
@@ -44,12 +44,13 @@ Treat non-trivial work as bounded task slices rather than assigning one model to
 
 Before each material slice:
 
-1. assign exactly one primary module owner;
-2. if HMS Core is enabled, load `references/hms/hms-model-router/MODULE.md` to classify risk and required floor;
-3. load the always-internal `references/model-dispatcher/MODULE.md` to choose an enabled model from the configured pool;
-4. list only the supporting modules needed for that slice;
-5. bind the slice to an evidence, review, or release gate;
-6. re-dispatch whenever task type, uncertainty, blast radius, trust boundary, or release significance changes.
+1. assign exactly one enabled primary work-module owner;
+2. load `references/model-router/MODULE.md` and establish `RISK_CLASS` plus exact `REQUIRED_MODEL_FLOOR`;
+3. apply any higher-authority escalation by raising that floor, never lowering it;
+4. pass both values unchanged to `references/model-dispatcher/MODULE.md` and its resolver;
+5. list only the supporting enabled modules needed for that slice;
+6. bind the slice to an evidence, review, or release gate;
+7. re-dispatch whenever task type, uncertainty, blast radius, trust boundary, or release significance changes.
 
 Use this compact record when routing is material or changes:
 
@@ -57,7 +58,7 @@ Use this compact record when routing is material or changes:
 TASK_SLICE=<bounded work>
 PRIMARY_MODULE=<hms|superpowers|taste|impeccable>
 RISK_CLASS=<class>
-REQUIRED_MODEL_FLOOR=<floor>
+REQUIRED_MODEL_FLOOR=<LUNA_LOW_RISK|TERRA_MEDIUM_OR_STRONGER|TERRA_HIGH_OR_STRONGER|SOL_HIGH|SOL_XHIGH|SOL_MAX|SOL_MAX_AND_INDEPENDENT_REVIEW>
 ASSIGNED_MODEL=<gpt-5.6-luna|gpt-5.6-terra|gpt-5.6-sol|none>
 EFFORT=<maximum-available-for-luna|medium|high|xhigh|max|none>
 REASSIGNED=<true|false>
@@ -65,7 +66,7 @@ SUPPORTING_MODULES=<enabled modules or none>
 COMPLETION_GATE=<gate>
 ```
 
-The model pool is controlled independently from module ON/OFF state by `%USERPROFILE%\.codex\hms-composite\model-settings.json` through the Model Settings popup.
+The model pool is controlled independently from work-module ON/OFF state by `%USERPROFILE%\.codex\hms-composite\model-settings.json` through the Model Settings popup.
 
 Safe fallback is upward only:
 
@@ -76,9 +77,9 @@ Safe fallback is upward only:
 
 Never downgrade a mandatory capability floor merely to keep work moving. A stronger enabled model may satisfy a lower floor when authority permits.
 
-Model choice and module ownership are independent. GPT Taste does not automatically imply Sol, and Superpowers does not automatically imply Terra. Responsibility chooses the module; risk chooses the floor; the model dispatcher chooses the enabled model.
+Model choice and module ownership are independent. GPT Taste does not automatically imply Sol, and Superpowers does not automatically imply Terra. Responsibility chooses the work module; risk/authority chooses the floor; the model dispatcher chooses the enabled model.
 
-If the required primary module is disabled, report `MODULE_REQUIRED=<module>` and stop that material slice unless higher authority explicitly defines a fallback. If no enabled model satisfies the floor, stop that slice. Never claim a runtime model switch without observable evidence.
+If the required primary work module is disabled, report `MODULE_REQUIRED=<module>` and stop that material slice unless higher authority explicitly defines a fallback. Do not impersonate disabled HMS, Superpowers, Taste, or Impeccable responsibilities. If no enabled model satisfies the required floor, stop that slice. Never claim a runtime model switch without observable evidence.
 
 ## Internal module routing
 
@@ -86,44 +87,45 @@ Do not invoke child skills by `$name`. Load only the needed internal `MODULE.md`
 
 For ordinary HMS work:
 
-1. Load `references/model-dispatcher/MODULE.md` for every non-trivial model-routed slice.
+1. Load `references/model-router/MODULE.md` and `references/model-dispatcher/MODULE.md` for every non-trivial model-routed slice; pass the exact required floor directly to the bundled resolver.
 2. Load `references/hms/hms-authority-loader/MODULE.md` when prior HMS state matters.
 3. Establish current repository/runtime identity before material mutation.
 4. Load `references/hms/hms-authority-gate/MODULE.md` before changing production state.
 5. Load `references/hms/hms-scope-lock/MODULE.md` for implementation or remediation.
-6. Load `references/hms/hms-model-router/MODULE.md` to classify required floor when HMS Core is enabled.
-7. For material UI work, load `references/hms/hms-ui-design-authority/MODULE.md` before any design or production UI decision.
-8. When structural repository context is materially useful, load `references/hms/codegraph-context/MODULE.md`; CodeGraph remains an MCP/tool layer, not a public skill.
-9. When the owner explicitly requests Three-Level Delivery, load `references/hms/three-level-delivery/MODULE.md`; never infer that mode merely from task size or duration.
-10. If Superpowers is enabled, load only the relevant engineering-method reference under `references/superpowers/`.
-11. If UI advisors are enabled and UI authority leaves discretion, use `references/taste/MODULE.md` for visual direction and `references/impeccable/MODULE.md` for UI audit/polish. They are sequential advisors, not parallel owners.
-12. Load `references/hms/hms-evidence-gate/MODULE.md` before a PASS/completion claim.
-13. Load `references/hms/hms-independent-review/MODULE.md` for architecture, security, trust-boundary, critical-blocker, release, or final-stage gates.
-14. Load `references/hms/hms-release-gate/MODULE.md` before merge/push/release when those actions are in scope.
-15. Load `references/hms/hms-handoff/MODULE.md` after each material checkpoint.
+6. For material UI work, load `references/hms/hms-ui-design-authority/MODULE.md` before any design or production UI decision.
+7. When structural repository context is materially useful, load `references/hms/codegraph-context/MODULE.md`; CodeGraph remains an MCP/tool layer, not a public skill.
+8. When the owner explicitly requests Three-Level Delivery, load `references/hms/three-level-delivery/MODULE.md`; never infer that mode merely from task size or duration.
+9. If Superpowers is enabled, load only the relevant engineering-method reference under `references/superpowers/`.
+10. If UI advisors are enabled and UI authority leaves discretion, use `references/taste/MODULE.md` for visual direction and `references/impeccable/MODULE.md` for UI audit/polish. They are sequential advisors, not parallel owners.
+11. Load `references/hms/hms-evidence-gate/MODULE.md` before a PASS/completion claim.
+12. Load `references/hms/hms-independent-review/MODULE.md` for architecture, security, trust-boundary, critical-blocker, release, or final-stage gates.
+13. Load `references/hms/hms-release-gate/MODULE.md` before merge/push/release when those actions are in scope.
+14. Load `references/hms/hms-handoff/MODULE.md` after each material checkpoint.
+
+When HMS Core itself is OFF, its `references/hms/...` gates are absent and must not be invoked. The always-internal model router/dispatcher remain available for model assignment, but they do not inherit HMS governance/release authority.
 
 ## One-primary-owner rule
 
-Every task slice has exactly one primary owner:
+Every task slice has exactly one enabled primary work owner:
 
 - HMS Core: governance and final arbitration;
 - Superpowers: engineering method and implementation workflow;
 - GPT Taste: visual direction and aesthetic critique;
 - Impeccable: UI quality audit and polish.
 
-The Model Dispatcher is not a work-owner module. It only assigns an enabled model that satisfies the required capability floor.
+The Model Router and Model Dispatcher are not work-owner modules. They classify/assign model capability only.
 
 Supporting modules may advise, but they cannot independently redefine the same decision. Never allow Taste and Impeccable to run competing redesigns, and never allow two modules to mutate the same files or authority artifact concurrently.
 
 ## UI sequence
 
-When all relevant modules are enabled, use this sequence:
+Apply only enabled modules, sequentially, inside the current owner/project UI authority:
 
-1. owner/project/HMS UI authority fixes the constraints;
-2. GPT Taste proposes or critiques visual direction only where discretion remains;
-3. Impeccable audits and polishes the accepted direction;
-4. Superpowers owns implementation method;
-5. HMS Core owns evidence, independent-review criteria, and release gates.
+1. owner/project UI authority fixes the constraints; HMS UI authority participates only when HMS Core is enabled;
+2. GPT Taste proposes or critiques unresolved visual direction only when Taste is enabled;
+3. Impeccable audits and polishes the accepted direction only when Impeccable is enabled;
+4. Superpowers owns implementation method only when Superpowers is enabled;
+5. HMS Core owns HMS evidence, independent-review criteria, and release gates only when HMS Core is enabled.
 
 A frozen Penpot/DESIGN.md/tokens/component mapping contract cannot be silently replaced by Taste, Impeccable, upstream brainstorming, or agent preference.
 
@@ -151,4 +153,4 @@ Parallel read-only analysis is allowed for independent concerns. No two modules 
 
 ## Completion rule
 
-One public skill. One primary owner per task slice. One risk-classifier. One dedicated model dispatcher. Upward-only safe fallback. Evidence over claims. Authority over improvisation. Fail closed over assumption.
+One public skill. One enabled primary work owner per task slice. One always-internal risk classifier. One always-internal model dispatcher. Direct required-floor handoff. Upward-only safe fallback. Evidence over claims. Authority over improvisation. Fail closed over assumption.
