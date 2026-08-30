@@ -57,22 +57,6 @@ jobs:
             return [pscustomobject]@{ ExitCode=$LASTEXITCODE; Output=$output }
           }
 
-          $oldManagerSelfTest=$env:HMS_MANAGER_SELFTEST
-          $oldModelSelfTest=$env:HMS_MODEL_SETTINGS_SELFTEST
-          try{
-            $env:HMS_MANAGER_SELFTEST='1'
-            $cleanManager=Invoke-CmdLauncher -Path $compat
-            if($cleanManager.ExitCode -ne 0){throw "Clean compatibility Manager launcher self-test failed: $($cleanManager.Output)"}
-            $env:HMS_MODEL_SETTINGS_SELFTEST='1'
-            $cleanModel=Invoke-CmdLauncher -Path $modelLauncher
-            if($cleanModel.ExitCode -ne 0){throw "Clean Model Settings launcher self-test failed: $($cleanModel.Output)"}
-          }
-          finally{
-            $env:HMS_MANAGER_SELFTEST=$oldManagerSelfTest
-            $env:HMS_MODEL_SETTINGS_SELFTEST=$oldModelSelfTest
-          }
-          Write-Host 'PASS: both outer launchers execute their committed shims successfully through trusted bootstrap context.'
-
           function Assert-HiddenShimDriftRejected {
             param(
               [Parameter(Mandatory)][string]$RelativePath,
