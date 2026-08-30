@@ -19,7 +19,7 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           $message = ((& git log -1 --format=%s) -join '').Trim()
-          if($message -cne 'chore: invoke registered review 486 P1 remediation v3') {
+          if($message -cne 'chore: invoke registered review 486 P1 remediation v4') {
             Write-Host "No remediation action for head message: $message"
             exit 0
           }
@@ -34,6 +34,14 @@ jobs:
             if($line.Length -ge 10 -and $line.Substring(0,10) -ceq '          ') { $body.Add($line.Substring(10)) }
             else { $body.Add($line) }
           }
+          $oldPatch = "sync=replace_once(sync,old_remove,new_remove,'CodeGraph destructive helper block')"
+          $newPatch = "start=sync.index('function Remove-CodeGraphTransactionBundle {'); end=sync.index('`nfunction Assert-CodeGraphBundleAgainstManifest',start); sync=sync[:start]+new_remove+sync[end+1:]"
+          $patchIndex = $body.IndexOf($oldPatch)
+          if($patchIndex -lt 0) { throw 'Could not locate staged CodeGraph whole-function replacement.' }
+          $body[$patchIndex] = $newPatch
+          $pythonEnd = $body.IndexOf("'@ | python -")
+          if($pythonEnd -lt 0) { throw 'Could not locate staged Python patch invocation.' }
+          $body.Insert($pythonEnd+1,"if(`$LASTEXITCODE -ne 0){throw 'Python remediation patch failed'}")
           $script = Join-Path $env:RUNNER_TEMP 'apply-review-486-p1.ps1'
           [IO.File]::WriteAllLines($script,$body,(New-Object Text.UTF8Encoding($false)))
           & $script
