@@ -53,7 +53,7 @@ jobs:
           )) {
             if ($implText -notmatch [regex]::Escape($literal)) { throw "Builder source-commit binding is missing: $literal" }
           }
-          foreach ($literal in @('-ExpectedHead `$ExpectedHead',"-ExpectedHead ([string]`$sourceHeadsBefore['hms'])")) {
+          foreach ($literal in @('-ExpectedHead `$ExpectedHead','-ExpectedHead ([string]`$sourceHeadsBefore[''hms''])')) {
             if ($wrapperText -notmatch [regex]::Escape($literal)) { throw "Public builder wrapper source-commit binding is missing: $literal" }
           }
           if ($helperText -notmatch [regex]::Escape('[string]$ExpectedHead')) { throw 'Committed-copy helper lacks caller-qualified ExpectedHead.' }
