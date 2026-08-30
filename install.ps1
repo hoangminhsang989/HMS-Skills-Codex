@@ -17,6 +17,7 @@ $SuperpowersRoot = Join-Path $env:USERPROFILE '.codex\superpowers'
 $CompositeRoot = Join-Path $env:USERPROFILE '.codex\hms-composite\hms-superpowers'
 $CompositeManifest = Join-Path $CompositeRoot 'manifest.json'
 $SkillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
+$BuildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
 
 function Assert-Git {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }
@@ -157,38 +158,59 @@ function Get-ModuleState {
     }
 }
 
-Assert-Git
-Sync-Repository -Remote $HmsRemote -Path $InstallRoot
-$state = Get-ModuleState
+$buildMutex = New-Object System.Threading.Mutex($false, $BuildMutexName)
+$mutexOwned = $false
+try {
+    try {
+        $mutexOwned = $buildMutex.WaitOne([TimeSpan]::FromSeconds(120))
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        $mutexOwned = $true
+    }
+    if (-not $mutexOwned) { throw "Timed out waiting for composite build lock: $BuildMutexName" }
 
-& (Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1')
-& (Join-Path $InstallRoot 'scripts\Test-DeliveryTools.ps1')
+    Assert-Git
 
-if (-not $SkipSuperpowers) {
-    $superLock = Read-ValidatedSuperpowersLock
-    Sync-PinnedRepository -Remote ([string]$superLock.repository) -Path $SuperpowersRoot -Commit ([string]$superLock.commit)
+    # Source reconciliation and composite compilation are one cross-process transaction.
+    Sync-Repository -Remote $HmsRemote -Path $InstallRoot
+    $state = Get-ModuleState
+
+    & (Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1')
+    & (Join-Path $InstallRoot 'scripts\Test-DeliveryTools.ps1')
+
+    if (-not $SkipSuperpowers) {
+        $superLock = Read-ValidatedSuperpowersLock
+        Sync-PinnedRepository -Remote ([string]$superLock.repository) -Path $SuperpowersRoot -Commit ([string]$superLock.commit)
+    }
+
+    $uiArgs = @{}
+    if ($SkipTaste) { $uiArgs.SkipTaste = $true }
+    if ($SkipImpeccable) { $uiArgs.SkipImpeccable = $true }
+    & (Join-Path $InstallRoot 'scripts\Sync-UiSkills.ps1') @uiArgs
+
+    $deliveryArgs = @{}
+    if (-not $SkipCodeGraph) { $deliveryArgs.EnsureCodeGraphConfig = $true }
+    if ($SkipCodeGraph) { $deliveryArgs.SkipCodeGraph = $true }
+    if ($SkipThreeLevelDelivery) { $deliveryArgs.SkipThreeLevelDelivery = $true }
+    & (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') @deliveryArgs
+
+    # Build-HmsCompositeSkill acquires the same mutex reentrantly on this thread.
+    & (Join-Path $InstallRoot 'scripts\Build-HmsCompositeSkill.ps1') `
+        -InstallRoot $InstallRoot `
+        -Hms ([bool]$state.hms) `
+        -Superpowers ([bool]$state.superpowers) `
+        -Taste ([bool]$state.taste) `
+        -Impeccable ([bool]$state.impeccable)
+
+    Write-Host 'HMS Skills Codex installation PASS.'
+    Write-Host 'Codex public skill: $hms-superpowers'
+    Write-Host ('Enabled modules: ' + (@($state.Keys | Where-Object { [bool]$state[$_] }) -join ', '))
+    if (-not $SkipCodeGraph) { Write-Host 'CodeGraph remains an MCP tool, not a separate public skill.' }
+    Write-Host 'Restart Codex to refresh discovery.'
 }
-
-$uiArgs = @{}
-if ($SkipTaste) { $uiArgs.SkipTaste = $true }
-if ($SkipImpeccable) { $uiArgs.SkipImpeccable = $true }
-& (Join-Path $InstallRoot 'scripts\Sync-UiSkills.ps1') @uiArgs
-
-$deliveryArgs = @{}
-if (-not $SkipCodeGraph) { $deliveryArgs.EnsureCodeGraphConfig = $true }
-if ($SkipCodeGraph) { $deliveryArgs.SkipCodeGraph = $true }
-if ($SkipThreeLevelDelivery) { $deliveryArgs.SkipThreeLevelDelivery = $true }
-& (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') @deliveryArgs
-
-& (Join-Path $InstallRoot 'scripts\Build-HmsCompositeSkill.ps1') `
-    -InstallRoot $InstallRoot `
-    -Hms ([bool]$state.hms) `
-    -Superpowers ([bool]$state.superpowers) `
-    -Taste ([bool]$state.taste) `
-    -Impeccable ([bool]$state.impeccable)
-
-Write-Host 'HMS Skills Codex installation PASS.'
-Write-Host 'Codex public skill: $hms-superpowers'
-Write-Host ('Enabled modules: ' + (@($state.Keys | Where-Object { [bool]$state[$_] }) -join ', '))
-if (-not $SkipCodeGraph) { Write-Host 'CodeGraph remains an MCP tool, not a separate public skill.' }
-Write-Host 'Restart Codex to refresh discovery.'
+finally {
+    if ($mutexOwned) {
+        try { $buildMutex.ReleaseMutex() } catch { }
+    }
+    $buildMutex.Dispose()
+}
