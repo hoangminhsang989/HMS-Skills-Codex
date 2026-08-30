@@ -71,6 +71,33 @@ if (Test-Path -LiteralPath $modelDispatcherPath) {
 $modelLauncherPath = Join-Path $RepoRoot 'HMS-Model-Settings.cmd'
 if (-not (Test-Path -LiteralPath $modelLauncherPath)) { $errors.Add('Missing HMS-Model-Settings.cmd launcher.') }
 
+$manifestReaderPath = Join-Path $RepoRoot 'scripts\Read-HmsCompositeModuleState.ps1'
+if (-not (Test-Path -LiteralPath $manifestReaderPath)) { $errors.Add('Missing strict composite manifest reader.') }
+
+$managerShimPath = Join-Path $RepoRoot 'manager\HmsSuperpowersManager.ps1'
+if (Test-Path -LiteralPath $managerShimPath) {
+    $managerShimText = Get-Content -LiteralPath $managerShimPath -Raw
+    foreach ($literal in @('Read-HmsCompositeModuleState.ps1','Get-CurrentModuleState-Legacy')) {
+        if ($managerShimText -notmatch [regex]::Escape($literal)) { $errors.Add("Manager strict-state shim contract missing literal: $literal") }
+    }
+}
+
+$modelSettingsShimPath = Join-Path $RepoRoot 'manager\HmsModelSettings.ps1'
+if (Test-Path -LiteralPath $modelSettingsShimPath) {
+    $modelSettingsShimText = Get-Content -LiteralPath $modelSettingsShimPath -Raw
+    foreach ($literal in @('Local\HMS-Skills-Codex-ModelSettings-v1','Write-ModelState-Unserialized')) {
+        if ($modelSettingsShimText -notmatch [regex]::Escape($literal)) { $errors.Add("Model settings writer-serialization contract missing literal: $literal") }
+    }
+}
+
+$uninstallPath = Join-Path $RepoRoot 'uninstall.ps1'
+if (Test-Path -LiteralPath $uninstallPath) {
+    $uninstallText = Get-Content -LiteralPath $uninstallPath -Raw
+    foreach ($literal in @('function Remove-VerifiedClone','Assert-CloneIdentity -Path $quarantine')) {
+        if ($uninstallText -notmatch [regex]::Escape($literal)) { $errors.Add("Uninstall clone quarantine contract missing literal: $literal") }
+    }
+}
+
 $lockPath = Join-Path $RepoRoot 'superpowers.lock.json'
 if (-not (Test-Path -LiteralPath $lockPath)) { $errors.Add('Missing superpowers.lock.json') }
 else {
@@ -114,6 +141,7 @@ $powerShellScripts = @(
     (Join-Path $RepoRoot 'manager\HmsModelSettings.ps1'),
     (Join-Path $RepoRoot 'manager\HmsModelSettings.utf8.ps1'),
     (Join-Path $RepoRoot 'scripts\Build-HmsCompositeSkill.ps1'),
+    (Join-Path $RepoRoot 'scripts\Read-HmsCompositeModuleState.ps1'),
     (Join-Path $RepoRoot 'scripts\Resolve-HmsModelRoute.ps1'),
     (Join-Path $RepoRoot 'scripts\Sync-UiSkills.ps1'),
     (Join-Path $RepoRoot 'scripts\Test-CodexSkillDiscovery.ps1')
@@ -126,4 +154,4 @@ foreach ($scriptPath in $powerShellScripts) {
 }
 
 if ($errors.Count -gt 0) { throw ("HMS skill validation failed:`n - " + ($errors -join "`n - ")) }
-Write-Host "PASS: validated $($skillFiles.Count) source skills, unified composite architecture, dedicated model dispatcher/settings, PowerShell syntax, and pinned external source contracts."
+Write-Host "PASS: validated $($skillFiles.Count) source skills, unified composite architecture, strict module state, serialized model settings, clone quarantine safety, PowerShell syntax, and pinned external source contracts."
