@@ -1,0 +1,88 @@
+name: Temporary author three late P1 remediations
+
+on:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.2.0-ui-design-authority
+
+permissions:
+  contents: write
+
+jobs:
+  author:
+    if: github.event.head_commit.message == 'Add temporary late P1 author workflow'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout author head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Bind patcher to frozen ancestor plus exact production blobs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = Join-Path $env:GITHUB_WORKSPACE 'scripts\.tmp_patch_three_late_p1.py'
+          $text = [IO.File]::ReadAllText($path)
+          $old = 'require(git("rev-parse", "HEAD").lower() == EXPECTED_HEAD, "temporary patcher must run only on the frozen 7cca baseline")'
+          $new = 'require(subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", EXPECTED_HEAD, "HEAD"]).returncode == 0, "temporary patcher requires frozen 7cca ancestor")'
+          if (($text.Split($old).Count - 1) -ne 1) { throw 'Temporary patcher baseline guard contract changed.' }
+          [IO.File]::WriteAllText($path,$text.Replace($old,$new),(New-Object Text.UTF8Encoding($false)))
+
+      - name: Apply production remediation and permanent regressions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python scripts/.tmp_patch_three_late_p1.py
+
+      - name: Parse changed PowerShell
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($relative in @(
+            'scripts\Build-HmsCompositeSkill.ps1',
+            'scripts\Copy-HmsCommittedGitPath.ps1',
+            'manager\HmsModelSettings.utf8.ps1',
+            'scripts\Resolve-HmsModelRoute.ps1',
+            'scripts\Test-HmsOwnedTempCleanup.ps1',
+            'scripts\Test-HmsLateTrustBoundaries.ps1',
+            'scripts\Test-HmsSkills.ps1'
+          )) {
+            $path = Join-Path $env:GITHUB_WORKSPACE $relative
+            $tokens=$null; $errors=$null
+            [System.Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors) | Out-Null
+            if (@($errors).Count -ne 0) { throw "Parser rejected ${relative}: $((@($errors)|ForEach-Object Message)-join ' | ')" }
+          }
+
+      - name: Run permanent HMS validator including three late P1 regressions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File ./scripts/Test-HmsSkills.ps1
+
+      - name: Commit only qualified production and permanent-test changes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git restore --worktree -- scripts/.tmp_patch_three_late_p1.py
+          $allowed = @(
+            'scripts/Build-HmsCompositeSkill.ps1',
+            'scripts/Copy-HmsCommittedGitPath.ps1',
+            'manager/HmsModelSettings.utf8.ps1',
+            'scripts/Resolve-HmsModelRoute.ps1',
+            'scripts/Test-HmsOwnedTempCleanup.ps1',
+            'scripts/Test-HmsLateTrustBoundaries.ps1',
+            'scripts/Test-HmsSkills.ps1'
+          )
+          $changed = @(git status --porcelain=v1 | ForEach-Object { $_.Substring(3).Replace('\','/') })
+          $unexpected = @($changed | Where-Object { $_ -notin $allowed })
+          if ($unexpected.Count -ne 0) { throw "Unexpected author changes: $($unexpected -join ', ')" }
+          foreach ($path in $allowed) { git add -- $path }
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff --cached --check failed.' }
+          git config user.name 'hoangminhsang989'
+          git config user.email '121548965+hoangminhsang989@users.noreply.github.com'
+          git commit -m 'Remediate three late trust-boundary P1s'
+          if ($LASTEXITCODE -ne 0) { throw 'Production remediation commit failed.' }
+          git push origin HEAD:stage/hms-superpowers-v0.2.0-ui-design-authority
