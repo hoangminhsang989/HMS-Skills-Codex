@@ -53,18 +53,37 @@ jobs:
           [IO.File]::WriteAllText($helperPath,$helperText,(New-Object Text.UTF8Encoding($false)))
           . $helperPath
 
-          # Case A: active guard must deny rename/delete sharing by a non-cooperating process.
+          # Case A: the threat model is another process, not a second API call in the owner process.
+          # Keep the production guard alive and ask a separate PowerShell process to rename the root.
           $ownedA = New-HmsOwnedTempDirectory -Prefix 'hms-owned-temp-active-' -Label 'active-guard regression'
           $movedA = ([string]$ownedA.Path) + '-moved'
-          $renameBlocked = $false
+          $jobA = $null
           try {
-            try { Rename-Item -LiteralPath ([string]$ownedA.Path) -NewName (Split-Path -Leaf $movedA) -ErrorAction Stop }
-            catch { $renameBlocked = $true }
-            if (-not $renameBlocked) { throw 'Active owned-temp guard allowed the root to be renamed.' }
+            Write-Host "GUARD_IS_CLOSED=$($ownedA.Guard.IsClosed)"
+            Write-Host "GUARD_IS_INVALID=$($ownedA.Guard.IsInvalid)"
+            if ($ownedA.Guard.IsClosed -or $ownedA.Guard.IsInvalid) { throw 'Production owned-temp guard is not live before cross-process race.' }
+            $jobA = Start-Job -ScriptBlock {
+              param($Original,$Moved)
+              $ErrorActionPreference='Stop'
+              try {
+                Rename-Item -LiteralPath $Original -NewName (Split-Path -Leaf $Moved) -ErrorAction Stop
+                [pscustomobject]@{ Renamed=$true; Error='' }
+              }
+              catch {
+                [pscustomobject]@{ Renamed=$false; Error=$_.Exception.Message }
+              }
+            } -ArgumentList ([string]$ownedA.Path),$movedA
+            $null = Wait-Job -Job $jobA -Timeout 20
+            if ($jobA.State -ne 'Completed') { throw "Cross-process rename probe did not complete. State=$($jobA.State)" }
+            $probeA = Receive-Job -Job $jobA -ErrorAction Stop
+            Write-Host "CROSS_PROCESS_RENAMED=$($probeA.Renamed)"
+            Write-Host "CROSS_PROCESS_RENAME_ERROR=$($probeA.Error)"
+            if ([bool]$probeA.Renamed) { throw 'Active owned-temp guard allowed a separate process to rename the root.' }
             Remove-HmsOwnedTempDirectory -Owned $ownedA -Label 'active-guard regression'
             if (Test-Path -LiteralPath ([string]$ownedA.Path)) { throw 'Exact owned temp root remained after normal identity-bound cleanup.' }
           }
           finally {
+            if ($null -ne $jobA) { Remove-Job -Job $jobA -Force -ErrorAction SilentlyContinue }
             if ($null -ne $ownedA.Guard) { $ownedA.Guard.Dispose(); $ownedA.Guard=$null }
             foreach ($p in @([string]$ownedA.Path,$movedA)) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } }
           }
@@ -93,4 +112,4 @@ jobs:
             foreach ($p in @($originalB,$movedB,$helperPath)) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } }
           }
 
-          Write-Host 'PASS: active filesystem guard blocks support-root rename and identity-bound cleanup rejects/deletes no foreign pathname replacement.'
+          Write-Host 'PASS: cross-process filesystem guard blocks support-root rename and identity-bound cleanup rejects/deletes no foreign pathname replacement.'
