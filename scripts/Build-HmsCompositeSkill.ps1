@@ -37,20 +37,29 @@ function Get-ExpectedSupportBlob {
 function Assert-NoHiddenIndexState {
     param(
         [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$PathSpec,
         [Parameter(Mandatory)][string]$Label
     )
     if (-not (Test-Path -LiteralPath (Join-Path $Path '.git'))) {
         throw "$Label source is not a Git checkout while qualifying hidden index state: $Path"
     }
-    $lines = @(& git -C $Path ls-files -v 2>$null)
-    if ($LASTEXITCODE -ne 0) { throw "$Label Git index flags could not be inspected: $Path" }
+    if ([string]::IsNullOrWhiteSpace($PathSpec) -or $PathSpec.Contains('\') -or $PathSpec.StartsWith('/') -or $PathSpec -match '^[A-Za-z]:') {
+        throw "$Label hidden-index pathspec is unsafe: $PathSpec"
+    }
+    foreach ($segment in @($PathSpec -split '/')) {
+        if ([string]::IsNullOrEmpty($segment) -or $segment -eq '.' -or $segment -eq '..') {
+            throw "$Label hidden-index pathspec contains an unsafe segment: $PathSpec"
+        }
+    }
+    $lines = @(& git -C $Path ls-files -v -- $PathSpec 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "$Label Git index flags could not be inspected under '$PathSpec': $Path" }
     $hidden = @($lines | Where-Object {
         $text = [string]$_
         $text -match '^S ' -or $text -cmatch '^[a-z] '
     })
     if ($hidden.Count -ne 0) {
         $sample = (($hidden | Select-Object -First 8) -join '; ')
-        throw "$Label tracked files use skip-worktree/assume-unchanged index flags; refusing module selection from potentially hidden live paths: $sample"
+        throw "$Label enumerated skill-tree files use skip-worktree/assume-unchanged index flags; refusing live module selection under '$PathSpec': $sample"
     }
 }
 
@@ -180,13 +189,11 @@ if ($actualSelf -cne $expectedSelf) {
     throw "Public composite bootstrap bytes do not match HMS HEAD $head; refusing hidden worktree drift. Expected $expectedSelf, found $actualSelf."
 }
 
-# Module selection in the committed implementation still enumerates live child directories.
-# Reject Git index visibility overrides in every enabled source before that enumeration so a
-# committed SKILL.md cannot be hidden/deleted locally while status remains deceptively clean.
-Assert-NoHiddenIndexState -Path $InstallRoot -Label 'HMS Skills Codex'
-if ($Superpowers) { Assert-NoHiddenIndexState -Path (Join-Path $env:USERPROFILE '.codex\superpowers') -Label 'Superpowers' }
-if ($Taste) { Assert-NoHiddenIndexState -Path (Join-Path $env:USERPROFILE '.codex\taste-skill') -Label 'GPT Taste' }
-if ($Impeccable) { Assert-NoHiddenIndexState -Path (Join-Path $env:USERPROFILE '.codex\impeccable') -Label 'Impeccable' }
+# Only collection roots that the committed implementation enumerates from the live filesystem
+# need an index-visibility gate. Support files and single-skill sources remain authorized by exact
+# committed-object materialization / explicit presence checks and must not be globally rejected.
+if ($Hms) { Assert-NoHiddenIndexState -Path $InstallRoot -PathSpec 'skills' -Label 'HMS Skills Codex' }
+if ($Superpowers) { Assert-NoHiddenIndexState -Path (Join-Path $env:USERPROFILE '.codex\superpowers') -PathSpec 'skills' -Label 'Superpowers' }
 
 $lifecycleOwnsBuildMutex = Test-ExactHeadLifecycleCaller
 $supportRoot = $null
