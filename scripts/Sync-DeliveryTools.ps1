@@ -142,6 +142,8 @@ function Assert-CodeGraphVersion {
         [Parameter(Mandatory)][string]$ExpectedVersion
     )
     if (-not (Test-Path -LiteralPath $CommandPath)) { throw "CodeGraph launcher missing: $CommandPath" }
+    $item = Get-Item -LiteralPath $CommandPath -Force -ErrorAction Stop
+    if ([bool]$item.PSIsContainer -or [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "CodeGraph launcher must be a regular non-reparse file: $CommandPath" }
     $output = (& $CommandPath --version 2>&1) -join "`n"
     if ($LASTEXITCODE -ne 0) { throw "CodeGraph --version failed: $output" }
     if ($output -notmatch [regex]::Escape($ExpectedVersion)) { throw "Unexpected CodeGraph version output. Expected $ExpectedVersion, found: $output" }
@@ -154,6 +156,29 @@ function Assert-RegularCodeGraphBundle {
     if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$Label must not be a reparse point: $Path" }
 }
 
+function Get-CodeGraphBundleTreeSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    Assert-RegularCodeGraphBundle -Path $Path -Label 'CodeGraph bundle tree'
+    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\')
+    $records = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)) {
+        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "CodeGraph bundle tree contains a reparse point: $($item.FullName)" }
+        if ([bool]$item.PSIsContainer) { continue }
+        $relative = $item.FullName.Substring($root.Length).TrimStart('\').Replace('\','/')
+        if ($relative -ceq $CodeGraphBundleMarkerName) { continue }
+        $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $records.Add($relative + "`t" + $hash)
+    }
+    if ($records.Count -eq 0) { throw "CodeGraph bundle tree contains no authenticated files: $Path" }
+    $payload = [string]::Join("`n", @($records | Sort-Object))
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant()
+    }
+    finally { $sha.Dispose() }
+}
+
 function New-CodeGraphBundleIdentity {
     param(
         [Parameter(Mandatory)][string]$TransactionId,
@@ -162,7 +187,8 @@ function New-CodeGraphBundleIdentity {
         [Parameter(Mandatory)][string]$Tag,
         [Parameter(Mandatory)][string]$Commit,
         [Parameter(Mandatory)][string]$Asset,
-        [Parameter(Mandatory)][string]$Sha256
+        [Parameter(Mandatory)][string]$Sha256,
+        [string]$BundleTreeSha256
     )
     return [ordered]@{
         schema_version = 1
@@ -175,12 +201,19 @@ function New-CodeGraphBundleIdentity {
         commit = $Commit
         asset = $Asset
         sha256 = $Sha256
+        bundle_tree_sha256 = $BundleTreeSha256
     }
 }
 
 function Write-CodeGraphBundleMarker {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Identity)
     Assert-RegularCodeGraphBundle -Path $Path -Label 'CodeGraph transaction bundle'
+    $treeHash = [string]$Identity['bundle_tree_sha256']
+    if ([string]::IsNullOrWhiteSpace($treeHash)) {
+        $treeHash = Get-CodeGraphBundleTreeSha256 -Path $Path
+        $Identity['bundle_tree_sha256'] = $treeHash
+    }
+    if ($treeHash -notmatch '^[0-9a-f]{64}$') { throw "CodeGraph transaction identity has invalid bundle tree SHA-256: $treeHash" }
     $markerPath = Join-Path $Path $CodeGraphBundleMarkerName
     $Identity | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $markerPath -Encoding UTF8
 }
@@ -198,7 +231,13 @@ function Assert-CodeGraphTransactionBundle {
     foreach ($field in @('managed_by','artifact','transaction_id','role','version','tag','commit','asset','sha256')) {
         if ([string]$marker.$field -cne [string]$Identity[$field]) { throw "CodeGraph transaction marker mismatch for '$field': $Path" }
     }
-    Assert-CodeGraphVersion -CommandPath (Join-Path $Path 'bin\codegraph.cmd') -ExpectedVersion ([string]$Identity.version)
+    $expectedTree = [string]$Identity['bundle_tree_sha256']
+    if (-not [string]::IsNullOrWhiteSpace($expectedTree)) {
+        if ($expectedTree -notmatch '^[0-9a-f]{64}$') { throw "CodeGraph expected bundle tree SHA-256 is invalid: $Path" }
+        if ([string]$marker.bundle_tree_sha256 -cne $expectedTree) { throw "CodeGraph transaction marker tree SHA-256 mismatch: $Path" }
+        $actualTree = Get-CodeGraphBundleTreeSha256 -Path $Path
+        if ($actualTree -cne $expectedTree) { throw "CodeGraph bundle tree SHA-256 mismatch. Expected $expectedTree, found $actualTree : $Path" }
+    }
 }
 
 function Remove-CodeGraphTransactionBundle {
@@ -289,7 +328,7 @@ function Restore-CodeGraphManifestAfterFailure {
     }
     try { $currentManifest = Get-Content -LiteralPath $CodeGraphManifest -Raw | ConvertFrom-Json }
     catch { throw "CodeGraph candidate manifest is invalid during rollback: $($_.Exception.Message)" }
-    foreach ($field in @('managed_by','version','tag','commit','asset','sha256')) {
+    foreach ($field in @('managed_by','version','tag','commit','asset','sha256','bundle_transaction_id','bundle_tree_sha256')) {
         if ([string]$currentManifest.$field -cne [string]$CandidateManifest[$field]) {
             throw "CodeGraph candidate manifest changed before rollback for '$field'; refusing to overwrite it."
         }
@@ -434,8 +473,6 @@ function Repair-CodeGraphRollbackState {
                 # Candidate remains the active verified bundle, so its already-published manifest remains authoritative.
             }
             else {
-                # No verified active bundle corresponds to the candidate manifest. Remove that manifest rather than
-                # advertising metadata for an absent or foreign current pathname.
                 Restore-CodeGraphManifestAfterFailure -CandidateManifest $PublishedManifest -PreviousBytes $null -HadPrevious $false
             }
         }
@@ -455,10 +492,14 @@ function Repair-CodeGraphRollbackState {
 function Assert-CodeGraphBundleAgainstManifest {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Manifest)
     Assert-RegularCodeGraphBundle -Path $Path -Label 'Existing HMS CodeGraph bundle'
-    foreach ($field in @('version','tag','commit','asset','sha256')) {
+    foreach ($field in @('version','tag','commit','asset','sha256','bundle_transaction_id','bundle_tree_sha256')) {
         if ([string]::IsNullOrWhiteSpace([string]$Manifest.$field)) { throw "Managed CodeGraph manifest is missing '$field'." }
     }
-    Assert-CodeGraphVersion -CommandPath (Join-Path $Path 'bin\codegraph.cmd') -ExpectedVersion ([string]$Manifest.version)
+    if ([string]$Manifest.bundle_transaction_id -notmatch '^[0-9a-f]{32}$') { throw 'Managed CodeGraph manifest has an invalid bundle transaction ID.' }
+    if ([string]$Manifest.bundle_tree_sha256 -notmatch '^[0-9a-f]{64}$') { throw 'Managed CodeGraph manifest has an invalid bundle tree SHA-256.' }
+    $identity = New-CodeGraphBundleIdentity -TransactionId ([string]$Manifest.bundle_transaction_id) -Role 'candidate' -Version ([string]$Manifest.version) -Tag ([string]$Manifest.tag) -Commit ([string]$Manifest.commit) -Asset ([string]$Manifest.asset) -Sha256 ([string]$Manifest.sha256) -BundleTreeSha256 ([string]$Manifest.bundle_tree_sha256)
+    Assert-CodeGraphTransactionBundle -Path $Path -Identity $identity
+    return $identity
 }
 
 function Move-CodeGraphCurrentToRollbackBackup {
@@ -471,12 +512,13 @@ function Move-CodeGraphCurrentToRollbackBackup {
     if (-not (Test-Path -LiteralPath $CurrentPath)) { throw "CodeGraph current bundle disappeared before backup preparation: $CurrentPath" }
     if (Test-Path -LiteralPath $BackupPath) { throw "CodeGraph rollback backup path is already occupied: $BackupPath" }
 
-    # Qualify and transaction-mark the active previous bundle before crossing the rename boundary.
-    # Version/marker failures therefore leave the existing current pathname untouched.
-    Assert-CodeGraphBundleAgainstManifest -Path $CurrentPath -Manifest $ExistingManifest
+    # Authenticate the existing bundle from the root-manifest-pinned transaction marker and
+    # deterministic tree hash before touching or executing any bytes beneath current.
+    $null = Assert-CodeGraphBundleAgainstManifest -Path $CurrentPath -Manifest $ExistingManifest
     Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $BackupIdentity
     Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
     Move-Item -LiteralPath $CurrentPath -Destination $BackupPath
+    # Path-independent validation only. Never execute a launcher from a randomized backup path.
     Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity
 }
 
@@ -500,13 +542,13 @@ function Sync-CodeGraphBundle {
     $command = Join-Path $current 'bin\codegraph.cmd'
 
     $alreadyExact = $false
-    if ($wasInstalled -and (Test-Path -LiteralPath $command)) {
+    if ($wasInstalled -and (Test-Path -LiteralPath $current)) {
         if ([string]$existingManifest.version -ceq [string]$Spec.version -and
             [string]$existingManifest.tag -ceq [string]$Spec.tag -and
             [string]$existingManifest.commit -ceq [string]$Spec.commit -and
             [string]$existingManifest.asset -ceq $assetName -and
             [string]$existingManifest.sha256 -ceq $expectedSha) {
-            Assert-CodeGraphVersion -CommandPath $command -ExpectedVersion ([string]$Spec.version)
+            $null = Assert-CodeGraphBundleAgainstManifest -Path $current -Manifest $existingManifest
             $alreadyExact = $true
         }
     }
@@ -518,7 +560,7 @@ function Sync-CodeGraphBundle {
         $extract = Join-Path $temp 'extract'
         $candidate = $extract
         $backup = $null
-        $candidateIdentity = New-CodeGraphBundleIdentity -TransactionId $transactionId -Role 'candidate' -Version ([string]$Spec.version) -Tag ([string]$Spec.tag) -Commit ([string]$Spec.commit) -Asset $assetName -Sha256 $expectedSha
+        $candidateIdentity = $null
         $backupIdentity = $null
         $manifestPublished = $false
         $publishedManifest = $null
@@ -541,7 +583,11 @@ function Sync-CodeGraphBundle {
                 $candidate = $flat
             }
             $candidateCommand = Join-Path $candidate 'bin\codegraph.cmd'
+            # Execution is allowed only here, while bytes are still inside the freshly downloaded,
+            # exact-SHA-qualified release candidate. Persisted/renamed bundles are validated by bytes only.
             Assert-CodeGraphVersion -CommandPath $candidateCommand -ExpectedVersion ([string]$Spec.version)
+            $candidateTreeSha = Get-CodeGraphBundleTreeSha256 -Path $candidate
+            $candidateIdentity = New-CodeGraphBundleIdentity -TransactionId $transactionId -Role 'candidate' -Version ([string]$Spec.version) -Tag ([string]$Spec.tag) -Commit ([string]$Spec.commit) -Asset $assetName -Sha256 $expectedSha -BundleTreeSha256 $candidateTreeSha
             Write-CodeGraphBundleMarker -Path $candidate -Identity $candidateIdentity
             Assert-CodeGraphTransactionBundle -Path $candidate -Identity $candidateIdentity
 
@@ -550,13 +596,13 @@ function Sync-CodeGraphBundle {
                 if (Test-Path -LiteralPath $current) {
                     if ($null -eq $existingManifest) { throw 'Existing CodeGraph current bundle has no HMS ownership manifest.' }
                     $backup = Join-Path $CodeGraphRoot ("backup-" + [guid]::NewGuid().ToString('N'))
-                    $backupIdentity = New-CodeGraphBundleIdentity -TransactionId $transactionId -Role 'backup' -Version ([string]$existingManifest.version) -Tag ([string]$existingManifest.tag) -Commit ([string]$existingManifest.commit) -Asset ([string]$existingManifest.asset) -Sha256 ([string]$existingManifest.sha256)
+                    $backupIdentity = New-CodeGraphBundleIdentity -TransactionId $transactionId -Role 'backup' -Version ([string]$existingManifest.version) -Tag ([string]$existingManifest.tag) -Commit ([string]$existingManifest.commit) -Asset ([string]$existingManifest.asset) -Sha256 ([string]$existingManifest.sha256) -BundleTreeSha256 ([string]$existingManifest.bundle_tree_sha256)
                     Move-CodeGraphCurrentToRollbackBackup -CurrentPath $current -BackupPath $backup -ExistingManifest $existingManifest -BackupIdentity $backupIdentity
+                    if ($env:HMS_TEST_FAIL_CODEGRAPH_AFTER_BACKUP_RENAME -ceq '1') { throw 'Injected CodeGraph failure after previous current crossed the backup rename boundary.' }
                 }
 
                 Move-Item -LiteralPath $candidate -Destination $current
                 Assert-CodeGraphTransactionBundle -Path $current -Identity $candidateIdentity
-                Assert-CodeGraphVersion -CommandPath $command -ExpectedVersion ([string]$Spec.version)
                 $publishedManifest = [ordered]@{
                     managed_by = $ManagedBy
                     version = [string]$Spec.version
@@ -564,6 +610,8 @@ function Sync-CodeGraphBundle {
                     commit = [string]$Spec.commit
                     asset = $assetName
                     sha256 = $expectedSha
+                    bundle_transaction_id = $transactionId
+                    bundle_tree_sha256 = [string]$candidateIdentity.bundle_tree_sha256
                 }
                 $manifestTemp = Join-Path $CodeGraphRoot ('.hms-codegraph-manifest-' + $transactionId + '.tmp')
                 $publishedManifest | ConvertTo-Json | Set-Content -LiteralPath $manifestTemp -Encoding UTF8
@@ -576,6 +624,7 @@ function Sync-CodeGraphBundle {
             }
             catch {
                 $installError = $_
+                if ($null -eq $candidateIdentity) { throw $installError }
                 $rollback = Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup -CandidateIdentity $candidateIdentity -BackupIdentity $backupIdentity -ManifestPublished $manifestPublished -PublishedManifest $publishedManifest -PreviousManifestBytes $existingManifestBytes -HadPrevious $wasInstalled
                 $rollbackErrors = @($rollback.RollbackErrors)
                 if ($rollbackErrors.Count -gt 0) {
@@ -665,8 +714,9 @@ if ($RemoveCodeGraphConfig) {
         if ($null -ne (Get-CodexMcpEntry -Name 'codegraph')) { throw 'CodeGraph MCP config exists but the HMS-managed bundle is absent; ownership cannot be proven.' }
         return
     }
-    $managedCommand = Join-Path $CodeGraphRoot 'current\bin\codegraph.cmd'
-    Assert-CodeGraphVersion -CommandPath $managedCommand -ExpectedVersion ([string]$lock.codegraph.version)
+    $managedCurrent = Join-Path $CodeGraphRoot 'current'
+    $managedCommand = Join-Path $managedCurrent 'bin\codegraph.cmd'
+    $null = Assert-CodeGraphBundleAgainstManifest -Path $managedCurrent -Manifest $manifest
     Remove-CodeGraphMcpConfig -CommandPath $managedCommand
     return
 }
