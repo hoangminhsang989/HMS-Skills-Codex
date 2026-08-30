@@ -1,0 +1,45 @@
+name: Export permanent gate patch blobs
+
+on:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.2.0-ui-design-authority
+    paths:
+      - .github/workflows/export-permanent-gate-patch-blobs.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact exporter head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Reproduce validated patch and export exact blobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, pathlib, re, subprocess
+          root=pathlib.Path.cwd()
+          author=root/'.github/workflows/author-permanent-gate-compatibility-fix.yml'
+          text=author.read_text(encoding='utf-8')
+          m=re.findall(r"^          payload='([^']+)'$",text,re.M)
+          if len(m)!=1:
+              raise SystemExit(f'expected exactly one embedded patch payload, found {len(m)}')
+          exec(compile(base64.b64decode(m[0]),'<gate-patch>','exec'))
+          paths=[
+            '.github/workflows/validate-p1-trust-boundaries.yml',
+            '.github/workflows/validate-review-486-latest-p1.yml',
+            '.github/workflows/validate-review-5dbd-latest-p1.yml',
+            '.github/workflows/validate-fresh-review-destructive-boundaries.yml',
+          ]
+          for p in paths:
+              data=(root/p).read_bytes()
+              blob=subprocess.check_output(['git','hash-object','--stdin'],input=data).decode().strip()
+              print(f'BLOB_BEGIN::{p}::{blob}::{base64.b64encode(data).decode()}::BLOB_END')
+          PY
