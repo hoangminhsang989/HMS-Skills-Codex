@@ -111,7 +111,7 @@ if ($false) {
     }
 }
 function Copy-SkillModule {
-    param([string]$Source,[string]$Destination)
+    param([string]$Source,[string]$Destination,[Parameter(Mandatory)][string]$ExpectedHead)
     Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
 }
 $ModelResolverSource = 'unused'
@@ -125,8 +125,10 @@ $lines = @(
 )
 $uiSequence = 'Apply only enabled work modules, sequentially, inside owner/project UI authority. Taste owns unresolved direction when enabled; Impeccable owns audit/polish when enabled; Superpowers owns implementation when enabled; HMS owns evidence/release when enabled.'
 $target = Join-Path $OutputRoot 'hms-superpowers'
+$fixtureExpectedHead = ((& git -C $InstallRoot rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
+if ($LASTEXITCODE -ne 0 -or $fixtureExpectedHead -notmatch '^[0-9a-f]{40}$') { throw 'Synthetic support-binding fixture HEAD is unavailable.' }
 New-Item -ItemType Directory -Force -Path $target | Out-Null
-Copy-SkillModule -Source (Join-Path $InstallRoot 'skills\fixture-source') -Destination (Join-Path $target 'references\fixture-source')
+Copy-SkillModule -Source (Join-Path $InstallRoot 'skills\fixture-source') -Destination (Join-Path $target 'references\fixture-source') -ExpectedHead $fixtureExpectedHead
 $superRaw = [IO.File]::ReadAllText($SuperpowersLockPath)
 $uiRaw = [IO.File]::ReadAllText($UiLockPath)
 Set-Content -LiteralPath (Join-Path $target 'SKILL.md') -Value (($lines + $uiSequence + $superRaw + $uiRaw) -join "`r`n") -Encoding UTF8
