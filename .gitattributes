@@ -1,0 +1,6 @@
+# These executable trust roots are authorized by literal Git-blob identity at runtime.
+# Force deterministic LF checkout bytes on every platform; local/info attributes or filters
+# cannot authorize altered bytes because runtime verification uses hash-object --no-filters.
+install.ps1 text eol=lf
+update.ps1 text eol=lf
+scripts/Build-HmsCompositeSkill.ps1 text eol=lf
