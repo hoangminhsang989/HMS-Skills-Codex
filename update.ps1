@@ -85,9 +85,9 @@ function Sync-PinnedRepo {
 
 function Get-ModuleState {
     if (Test-Path -LiteralPath $CompositeManifest) {
-        $manifest = Get-Content -LiteralPath $CompositeManifest -Raw | ConvertFrom-Json
-        if ([string]$manifest.managed_by -cne 'HMS-Skills-Codex' -or [string]$manifest.artifact -cne 'hms-superpowers-composite') { throw 'Composite manifest ownership mismatch.' }
-        return [ordered]@{ hms=[bool]$manifest.modules.hms; superpowers=[bool]$manifest.modules.superpowers; taste=[bool]$manifest.modules.taste; impeccable=[bool]$manifest.modules.impeccable }
+        $reader = Join-Path $InstallRoot 'scripts\Read-HmsCompositeModuleState.ps1'
+        if (-not (Test-Path -LiteralPath $reader)) { throw "Strict composite manifest reader is missing: $reader" }
+        return & $reader -ManifestPath $CompositeManifest
     }
     $legacy = [ordered]@{ hms='hms'; superpowers='superpowers'; taste='gpt-taste'; impeccable='impeccable' }
     $state = [ordered]@{}
@@ -97,8 +97,8 @@ function Get-ModuleState {
         $state[$key] = $exists
         if ($exists) { $found = $true }
     }
-    if ($found) { return $state }
-    return [ordered]@{ hms=$true; superpowers=(-not $SkipSuperpowers); taste=(-not $SkipTaste); impeccable=(-not $SkipImpeccable) }
+    if ($found) { return [pscustomobject]$state }
+    return [pscustomobject][ordered]@{ hms=$true; superpowers=(-not $SkipSuperpowers); taste=(-not $SkipTaste); impeccable=(-not $SkipImpeccable) }
 }
 
 $buildMutex = New-Object System.Threading.Mutex($false, $BuildMutexName)
