@@ -1,0 +1,172 @@
+name: Validate HMS latest CodeGraph rollback P1 boundaries
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  windows-latest-codegraph-rollback-p1:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Qualify reserved backup and pre-rename rollback boundaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Set-StrictMode -Version Latest
+          $workspace=$env:GITHUB_WORKSPACE
+          $expected=$env:CANDIDATE_SHA.ToLowerInvariant()
+          $actual=((& git -C $workspace rev-parse HEAD)-join '').Trim().ToLowerInvariant()
+          if($LASTEXITCODE -ne 0 -or $actual -cne $expected){throw "Workflow checkout identity mismatch. Expected $expected, found $actual"}
+
+          $delivery=Join-Path $workspace 'scripts\Sync-DeliveryTools.ps1'
+          $tokens=$null;$errors=$null
+          [Management.Automation.Language.Parser]::ParseFile($delivery,[ref]$tokens,[ref]$errors)|Out-Null
+          if(@($errors).Count){throw "PowerShell parser rejected delivery script: $((@($errors)|ForEach-Object Message)-join ' | ')"}
+          $deliveryText=[IO.File]::ReadAllText($delivery)
+
+          foreach($literal in @(
+            'function Move-CodeGraphCurrentToRollbackBackup',
+            "Assert-CodeGraphTransactionBundle -Path `$BackupPath -Identity `$BackupIdentity",
+            "`$reserveLeaf = '.hms-codegraph-rollback-reserved-'",
+            'Assert-CodeGraphTransactionBundle -Path $reservedBackupPath -Identity $BackupIdentity',
+            'Move-CodeGraphCurrentToRollbackBackup -CurrentPath $current -BackupPath $backup',
+            'Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup'
+          )){if($deliveryText -notmatch [regex]::Escape($literal)){throw "Latest CodeGraph rollback P1 contract is missing: $literal"}}
+
+          $prep=$deliveryText.IndexOf('Move-CodeGraphCurrentToRollbackBackup -CurrentPath $current -BackupPath $backup',[StringComparison]::Ordinal)
+          $repair=$deliveryText.IndexOf('Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup',[StringComparison]::Ordinal)
+          if($prep -lt 0 -or $repair -lt 0 -or $repair -le $prep){throw 'Current-to-backup preparation is not enclosed by the transaction path that later invokes rollback repair.'}
+
+          function Get-FunctionText{
+            param([string]$Path,[string[]]$Names)
+            $t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$t,[ref]$e)
+            if(@($e).Count){throw "Could not parse function source: $Path"}
+            $texts=@()
+            foreach($name in $Names){
+              $nodes=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name},$true))
+              if($nodes.Count -ne 1){throw "Expected one function '$name', found $($nodes.Count)."}
+              $texts+=$nodes[0].Extent.Text
+            }
+            return ($texts -join "`r`n`r`n")
+          }
+
+          $defs=Get-FunctionText -Path $delivery -Names @(
+            'Assert-CodeGraphVersion',
+            'Assert-RegularCodeGraphBundle',
+            'New-CodeGraphBundleIdentity',
+            'Write-CodeGraphBundleMarker',
+            'Assert-CodeGraphTransactionBundle',
+            'Remove-CodeGraphTransactionBundle',
+            'Restore-CodeGraphManifestAfterFailure',
+            'Repair-CodeGraphRollbackState',
+            'Assert-CodeGraphBundleAgainstManifest',
+            'Move-CodeGraphCurrentToRollbackBackup'
+          )
+
+          $harness=Join-Path $env:RUNNER_TEMP ('hms-latest-codegraph-p1-'+[guid]::NewGuid().ToString('N')+'.ps1')
+          $root=Join-Path $env:RUNNER_TEMP ('hms-latest-codegraph-p1-root-'+[guid]::NewGuid().ToString('N'))
+          $script=@"
+          param([string]`$Root)
+          Set-StrictMode -Version Latest
+          `$ErrorActionPreference='Stop'
+          `$ManagedBy='HMS-Skills-Codex'
+          `$CodeGraphBundleMarkerName='.hms-codegraph-bundle.json'
+          $defs
+
+          function New-TestBundle{
+            param([string]`$Path,`$Identity)
+            New-Item -ItemType Directory -Force -Path (Join-Path `$Path 'bin')|Out-Null
+            [IO.File]::WriteAllText((Join-Path `$Path 'bin\codegraph.cmd'),("@echo off`r`necho " + [string]`$Identity.version + "`r`n"),[Text.Encoding]::ASCII)
+            Write-CodeGraphBundleMarker -Path `$Path -Identity `$Identity
+            Assert-CodeGraphTransactionBundle -Path `$Path -Identity `$Identity
+          }
+
+          function New-TestManifest{
+            param([string]`$Version)
+            return [ordered]@{managed_by='HMS-Skills-Codex';version=`$Version;tag=('v-'+`$Version);commit=('c-'+`$Version);asset=('a-'+`$Version);sha256=('s-'+`$Version)}
+          }
+
+          New-Item -ItemType Directory -Force -Path `$Root|Out-Null
+
+          # Scenario 1: a foreign object appears at the vacated backup pathname after backup cleanup crossed rename.
+          # The foreign replacement must never authorize deleting the active candidate.
+          `$case1=Join-Path `$Root 'foreign-backup-before-rollback';New-Item -ItemType Directory -Force -Path `$case1|Out-Null
+          `$CodeGraphManifest=Join-Path `$case1 'hms-codegraph-install.json'
+          `$candidate1=New-CodeGraphBundleIdentity -TransactionId 'tx1' -Role 'candidate' -Version 'new1' -Tag 'v-new1' -Commit 'c-new1' -Asset 'a-new1' -Sha256 's-new1'
+          `$backup1id=New-CodeGraphBundleIdentity -TransactionId 'tx1' -Role 'backup' -Version 'old1' -Tag 'v-old1' -Commit 'c-old1' -Asset 'a-old1' -Sha256 's-old1'
+          `$current1=Join-Path `$case1 'current';`$backup1=Join-Path `$case1 'backup'
+          New-TestBundle -Path `$current1 -Identity `$candidate1
+          `$newManifest1=New-TestManifest -Version 'new1';`$oldManifest1=New-TestManifest -Version 'old1'
+          `$oldBytes1=(New-Object Text.UTF8Encoding(`$false)).GetBytes((`$oldManifest1|ConvertTo-Json -Compress))
+          [IO.File]::WriteAllText(`$CodeGraphManifest,(`$newManifest1|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
+          New-Item -ItemType Directory -Force -Path `$backup1|Out-Null
+          `$foreign1=Join-Path `$backup1 'FOREIGN.txt';[IO.File]::WriteAllText(`$foreign1,'foreign',[Text.Encoding]::ASCII)
+          `$forbid={param(`$Path,`$Identity);throw 'CANDIDATE_REMOVAL_RAN_AGAINST_UNVERIFIED_BACKUP'}
+          `$r1=Repair-CodeGraphRollbackState -CurrentPath `$current1 -BackupPath `$backup1 -CandidateIdentity `$candidate1 -BackupIdentity `$backup1id -ManifestPublished `$true -PublishedManifest `$newManifest1 -PreviousManifestBytes `$oldBytes1 -HadPrevious `$true -CandidateRemovalAction `$forbid
+          if(`$r1.CurrentBundleState -cne 'candidate' -or -not `$r1.CandidatePreserved){throw 'Foreign backup replacement did not preserve the verified candidate.'}
+          if((@(`$r1.RollbackErrors)-join ' | ') -match 'CANDIDATE_REMOVAL_RAN_AGAINST_UNVERIFIED_BACKUP'){throw 'Candidate removal ran before backup identity was proven.'}
+          if(-not(Test-Path -LiteralPath `$foreign1)){throw 'Foreign backup replacement was moved or deleted during rollback adjudication.'}
+          Assert-CodeGraphTransactionBundle -Path `$current1 -Identity `$candidate1
+
+          # Scenario 2: after reservation succeeds, a foreign object occupies the original backup pathname.
+          # Candidate deletion may proceed because the exact old bundle is held at the reserved pathname; restoration
+          # must use that reservation and leave the foreign replacement untouched.
+          `$case2=Join-Path `$Root 'foreign-backup-after-reservation';New-Item -ItemType Directory -Force -Path `$case2|Out-Null
+          `$CodeGraphManifest=Join-Path `$case2 'hms-codegraph-install.json'
+          `$candidate2=New-CodeGraphBundleIdentity -TransactionId 'tx2' -Role 'candidate' -Version 'new2' -Tag 'v-new2' -Commit 'c-new2' -Asset 'a-new2' -Sha256 's-new2'
+          `$backup2id=New-CodeGraphBundleIdentity -TransactionId 'tx2' -Role 'backup' -Version 'old2' -Tag 'v-old2' -Commit 'c-old2' -Asset 'a-old2' -Sha256 's-old2'
+          `$current2=Join-Path `$case2 'current';`$backup2=Join-Path `$case2 'backup'
+          New-TestBundle -Path `$current2 -Identity `$candidate2
+          New-TestBundle -Path `$backup2 -Identity `$backup2id
+          `$newManifest2=New-TestManifest -Version 'new2';`$oldManifest2=New-TestManifest -Version 'old2'
+          `$oldBytes2=(New-Object Text.UTF8Encoding(`$false)).GetBytes((`$oldManifest2|ConvertTo-Json -Compress))
+          [IO.File]::WriteAllText(`$CodeGraphManifest,(`$newManifest2|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
+          `$script:InjectedBackupPath=`$backup2
+          `$script:InjectedForeignSentinel=Join-Path `$backup2 'FOREIGN.txt'
+          `$removeAfterReserve={
+            param(`$Path,`$Identity)
+            New-Item -ItemType Directory -Force -Path `$script:InjectedBackupPath|Out-Null
+            [IO.File]::WriteAllText(`$script:InjectedForeignSentinel,'foreign',[Text.Encoding]::ASCII)
+            Remove-CodeGraphTransactionBundle -Path `$Path -Identity `$Identity
+          }
+          `$r2=Repair-CodeGraphRollbackState -CurrentPath `$current2 -BackupPath `$backup2 -CandidateIdentity `$candidate2 -BackupIdentity `$backup2id -ManifestPublished `$true -PublishedManifest `$newManifest2 -PreviousManifestBytes `$oldBytes2 -HadPrevious `$true -CandidateRemovalAction `$removeAfterReserve
+          if(`$r2.CurrentBundleState -cne 'previous' -or -not `$r2.BackupActivated -or -not `$r2.CandidateRemovalCompleted){throw 'Reserved backup was not restored after candidate removal.'}
+          if(@(`$r2.RollbackErrors).Count -ne 0){throw "Unexpected reserved-backup rollback errors: `$(@(`$r2.RollbackErrors)-join ' | ')"}
+          Assert-CodeGraphTransactionBundle -Path `$current2 -Identity `$backup2id
+          if(-not(Test-Path -LiteralPath `$script:InjectedForeignSentinel)){throw 'Foreign replacement at original backup pathname was touched after reservation.'}
+          if([Convert]::ToBase64String([IO.File]::ReadAllBytes(`$CodeGraphManifest)) -cne [Convert]::ToBase64String(`$oldBytes2)){throw 'Previous manifest bytes were not restored with the reserved previous bundle.'}
+
+          # Scenario 3: backup marker preparation fails before current is renamed. The active previous pathname must
+          # remain untouched and no backup pathname may appear.
+          `$case3=Join-Path `$Root 'pre-rename-marker-failure';New-Item -ItemType Directory -Force -Path `$case3|Out-Null
+          `$current3=Join-Path `$case3 'current';`$backup3=Join-Path `$case3 'backup'
+          `$oldManifest3=New-TestManifest -Version 'old3'
+          `$oldId3=New-CodeGraphBundleIdentity -TransactionId 'tx3' -Role 'candidate' -Version 'old3' -Tag 'v-old3' -Commit 'c-old3' -Asset 'a-old3' -Sha256 's-old3'
+          `$backup3id=New-CodeGraphBundleIdentity -TransactionId 'tx4' -Role 'backup' -Version 'old3' -Tag 'v-old3' -Commit 'c-old3' -Asset 'a-old3' -Sha256 's-old3'
+          New-TestBundle -Path `$current3 -Identity `$oldId3
+          `$marker3=Join-Path `$current3 `$CodeGraphBundleMarkerName
+          Remove-Item -LiteralPath `$marker3 -Force
+          New-Item -ItemType Directory -Force -Path `$marker3|Out-Null
+          `$failed3=`$false
+          try{Move-CodeGraphCurrentToRollbackBackup -CurrentPath `$current3 -BackupPath `$backup3 -ExistingManifest `$oldManifest3 -BackupIdentity `$backup3id}catch{`$failed3=`$true}
+          if(-not `$failed3){throw 'Injected pre-rename marker failure did not fail.'}
+          if(-not(Test-Path -LiteralPath `$current3)){throw 'Current was renamed despite backup marker preparation failing first.'}
+          if(Test-Path -LiteralPath `$backup3){throw 'Backup pathname appeared despite pre-rename preparation failure.'}
+          if(-not(Test-Path -LiteralPath (Join-Path `$current3 'bin\codegraph.cmd'))){throw 'Previous current bundle was damaged by pre-rename preparation failure.'}
+
+          Write-Host 'PASS: rollback verifies/reserves the exact backup before candidate deletion, survives foreign backup-path replacement, and keeps pre-rename qualification failures non-mutating.'
+          "@
+          [IO.File]::WriteAllText($harness,$script,(New-Object Text.UTF8Encoding($false)))
+          try{& $harness -Root $root}finally{Remove-Item -LiteralPath $harness -Force -ErrorAction SilentlyContinue;Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue}
