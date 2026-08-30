@@ -20,7 +20,7 @@ jobs:
         with:
           ref: ${{ env.CANDIDATE_SHA }}
 
-      - name: Qualify git show exact blob materialization inside Start-Job
+      - name: Qualify exact-HEAD archive transport inside Start-Job
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -30,34 +30,37 @@ jobs:
             throw "Workflow checkout identity mismatch. Expected $expectedSha, found $actualSha"
           }
 
-          $blob = (& git -C $env:GITHUB_WORKSPACE rev-parse "$expectedSha`:scripts/Build-HmsCompositeSkill.impl.ps1").Trim().ToLowerInvariant()
+          $pathSpec = 'scripts/Build-HmsCompositeSkill.impl.ps1'
+          $blob = (& git -C $env:GITHUB_WORKSPACE rev-parse "$expectedSha`:$pathSpec").Trim().ToLowerInvariant()
           if ($LASTEXITCODE -ne 0 -or $blob -notmatch '^[0-9a-f]{40}$') { throw 'Could not resolve implementation blob.' }
           $gitExe = [string](Get-Command git -ErrorAction Stop).Source
-          $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-blob-show-' + [guid]::NewGuid().ToString('N'))
+          $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-archive-transport-' + [guid]::NewGuid().ToString('N'))
           New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+          $archivePath = Join-Path $tempRoot 'support.zip'
           $destination = Join-Path $tempRoot 'implementation.ps1'
-          $stderrPath = Join-Path $tempRoot 'git.stderr.txt'
 
           $job = $null
           try {
             $job = Start-Job -ScriptBlock {
-              param($GitExe,$RepoRoot,$Blob,$Destination,$StderrPath)
+              param($GitExe,$RepoRoot,$Head,$PathSpec,$ArchivePath,$Destination)
               $ErrorActionPreference = 'Stop'
-              Write-Output "HMS_BLOB_SHOW_START pid=$PID blob=$Blob utc=$([DateTime]::UtcNow.ToString('o'))"
-              $process = Start-Process -FilePath $GitExe `
-                -ArgumentList @('show',$Blob) `
-                -WorkingDirectory $RepoRoot `
-                -NoNewWindow `
-                -Wait `
-                -PassThru `
-                -RedirectStandardOutput $Destination `
-                -RedirectStandardError $StderrPath
-              if ($process.ExitCode -ne 0) {
-                $stderr = if (Test-Path -LiteralPath $StderrPath) { Get-Content -LiteralPath $StderrPath -Raw } else { '' }
-                throw "git show failed with exit code $($process.ExitCode): $stderr"
+              Write-Output "HMS_ARCHIVE_START pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+              & $GitExe -C $RepoRoot archive --format=zip "--output=$ArchivePath" $Head -- $PathSpec
+              if ($LASTEXITCODE -ne 0) { throw "git archive failed with exit code $LASTEXITCODE" }
+
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+              $archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+              try {
+                $matches = @($archive.Entries | Where-Object { $_.FullName -ceq $PathSpec })
+                if ($matches.Count -ne 1) { throw "Expected exactly one archive entry '$PathSpec', found $($matches.Count)." }
+                $input = $matches[0].Open()
+                $output = New-Object System.IO.FileStream($Destination,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+                try { $input.CopyTo($output); $output.Flush() }
+                finally { $output.Dispose(); $input.Dispose() }
               }
-              Write-Output "HMS_BLOB_SHOW_RETURN pid=$PID blob=$Blob utc=$([DateTime]::UtcNow.ToString('o'))"
-            } -ArgumentList $gitExe,$env:GITHUB_WORKSPACE,$blob,$destination,$stderrPath
+              finally { $archive.Dispose() }
+              Write-Output "HMS_ARCHIVE_RETURN pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+            } -ArgumentList $gitExe,$env:GITHUB_WORKSPACE,$expectedSha,$pathSpec,$archivePath,$destination
 
             $deadline = [DateTime]::UtcNow.AddSeconds(15)
             while ([DateTime]::UtcNow -lt $deadline -and $job.State -notin @('Completed','Failed','Stopped')) {
@@ -65,13 +68,13 @@ jobs:
               Start-Sleep -Milliseconds 100
             }
             Receive-Job -Job $job -ErrorAction Stop | Write-Host
-            if ($job.State -ne 'Completed') { throw "git show blob materialization did not complete within 15s. State=$($job.State)" }
+            if ($job.State -ne 'Completed') { throw "Exact-HEAD archive transport did not complete within 15s. State=$($job.State)" }
 
             $actualBlob = (& git -C $env:GITHUB_WORKSPACE hash-object --no-filters -- $destination).Trim().ToLowerInvariant()
             if ($LASTEXITCODE -ne 0 -or $actualBlob -ne $blob) {
-              throw "git show materialization mismatch. Expected $blob, found $actualBlob"
+              throw "Archive transport literal-byte mismatch. Expected $blob, found $actualBlob"
             }
-            Write-Host "PASS: git show completed inside Start-Job and preserved exact blob $blob."
+            Write-Host "PASS: exact-HEAD archive transport completed inside Start-Job and preserved literal blob $blob."
           }
           finally {
             if ($null -ne $job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
