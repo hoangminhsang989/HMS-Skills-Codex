@@ -60,13 +60,17 @@ function Assert-CloneIdentity {
 }
 
 function Assert-OwnedCompositeRoot {
-    if (-not (Test-Path -LiteralPath $compositeRoot)) { return }
-    Assert-SafeRemovalPath -Path $compositeRoot
-    $manifestPath = Join-Path $compositeRoot 'manifest.json'
-    if (-not (Test-Path -LiteralPath $manifestPath)) { throw "Refusing to remove composite without ownership manifest: $compositeRoot" }
+    param([string]$Path = $compositeRoot)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+    Assert-SafeRemovalPath -Path $Path
+    if (-not [bool]$item.PSIsContainer) { throw "Refusing to remove non-directory composite path: $Path" }
+    if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Refusing to remove composite reparse point: $Path" }
+    $manifestPath = Join-Path $Path 'manifest.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "Refusing to remove composite without ownership manifest: $Path" }
     try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json }
     catch { throw "Refusing to remove composite with invalid manifest: $($_.Exception.Message)" }
-    if ([string]$manifest.managed_by -cne 'HMS-Skills-Codex' -or [string]$manifest.artifact -cne 'hms-superpowers-composite') { throw "Refusing to remove composite with unexpected ownership: $compositeRoot" }
+    if ([string]$manifest.managed_by -cne 'HMS-Skills-Codex' -or [string]$manifest.artifact -cne 'hms-superpowers-composite') { throw "Refusing to remove composite with unexpected ownership: $Path" }
 }
 
 function Assert-ManagedCodeGraphRoot {
@@ -162,6 +166,38 @@ function Remove-VerifiedClone {
     }
 }
 
+function Remove-VerifiedCompositeRoot {
+    param([string]$Path,[string]$Action)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-OwnedCompositeRoot -Path $Path
+    if (-not $PSCmdlet.ShouldProcess($Path, $Action)) { return }
+
+    $parent = Split-Path -Parent $Path
+    $leaf = '.hms-composite-removing-' + [guid]::NewGuid().ToString('N')
+    $quarantine = Join-Path $parent $leaf
+    $deleteStarted = $false
+    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    try {
+        # The exact random quarantine, not the earlier pathname, is the destructive authority.
+        # This preserves any non-cooperating foreign replacement that appears at the original path.
+        Assert-OwnedCompositeRoot -Path $quarantine
+        $deleteStarted = $true
+        Remove-Item -LiteralPath $quarantine -Recurse -Force
+        if (Test-Path -LiteralPath $quarantine) { throw "Composite removal did not complete: $quarantine" }
+    }
+    catch {
+        $e = $_
+        if (-not $deleteStarted) {
+            try { Restore-Quarantine -Original $Path -Quarantine $quarantine }
+            catch { throw "Composite removal preflight failed and rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)" }
+        }
+        elseif (Test-Path -LiteralPath $quarantine) {
+            throw "Composite deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+        }
+        throw $e
+    }
+}
+
 function Remove-VerifiedDirectory {
     param([string]$Path,[string]$Action)
     if (-not (Test-Path -LiteralPath $Path)) { return }
@@ -224,7 +260,7 @@ try {
     }
 
     if ($RemoveClones) {
-        Remove-VerifiedDirectory -Path $compositeRoot -Action 'Remove verified HMS composite bundle'
+        Remove-VerifiedCompositeRoot -Path $compositeRoot -Action 'Remove verified HMS composite bundle'
         if ($IncludeSuperpowers) { Remove-VerifiedClone -Path $superpowersClone -ExpectedRemote $SuperpowersRemote -MarkerRelativePath 'skills\brainstorming\SKILL.md' -Action 'Remove verified Superpowers clone' }
         if ($IncludeUiSkills) {
             Remove-VerifiedClone -Path $tasteClone -ExpectedRemote $TasteRemote -MarkerRelativePath 'skills\gpt-tasteskill\SKILL.md' -Action 'Remove verified Taste clone'
