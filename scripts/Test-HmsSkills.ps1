@@ -30,7 +30,21 @@ foreach ($file in $skillFiles) {
     if ($frontmatter.Length -gt 1024) { $errors.Add("Frontmatter exceeds 1024 characters: $($file.FullName)") }
 }
 
-$required = @('hms-superpowers','hms-authority-loader','hms-authority-gate','hms-scope-lock','hms-model-router','hms-isolated-execution','hms-evidence-gate','hms-independent-review','hms-fail-closed','hms-release-gate','hms-handoff','hms-ui-design-authority')
+$required = @(
+    'hms-superpowers',
+    'hms-authority-loader',
+    'hms-authority-gate',
+    'hms-scope-lock',
+    'hms-model-router',
+    'hms-model-dispatcher',
+    'hms-isolated-execution',
+    'hms-evidence-gate',
+    'hms-independent-review',
+    'hms-fail-closed',
+    'hms-release-gate',
+    'hms-handoff',
+    'hms-ui-design-authority'
+)
 foreach ($requiredName in $required) { if (-not $names.ContainsKey($requiredName)) { $errors.Add("Required skill missing: $requiredName") } }
 
 foreach ($skillName in @('hms-superpowers','hms-ui-design-authority')) {
@@ -40,6 +54,22 @@ foreach ($skillName in @('hms-superpowers','hms-ui-design-authority')) {
 
 $architecturePath = Join-Path $RepoRoot 'docs\UNIFIED_SKILL_ARCHITECTURE.md'
 if (-not (Test-Path -LiteralPath $architecturePath)) { $errors.Add('Missing docs/UNIFIED_SKILL_ARCHITECTURE.md') }
+
+$modelDispatcherPath = Join-Path $skillsRoot 'hms-model-dispatcher\SKILL.md'
+if (Test-Path -LiteralPath $modelDispatcherPath) {
+    $modelDispatcherText = Get-Content -LiteralPath $modelDispatcherPath -Raw
+    foreach ($literal in @(
+        'NO_ENABLED_MODEL_SATISFIES_REQUIRED_FLOOR',
+        'Luna OFF: Luna-class work may move to Terra, then Sol.',
+        'Terra OFF: Terra-class work may move to Sol.',
+        'Sol OFF: Sol-required work has no lower safe substitute'
+    )) {
+        if ($modelDispatcherText -notmatch [regex]::Escape($literal)) { $errors.Add("Model dispatcher contract missing literal: $literal") }
+    }
+}
+
+$modelLauncherPath = Join-Path $RepoRoot 'HMS-Model-Settings.cmd'
+if (-not (Test-Path -LiteralPath $modelLauncherPath)) { $errors.Add('Missing HMS-Model-Settings.cmd launcher.') }
 
 $lockPath = Join-Path $RepoRoot 'superpowers.lock.json'
 if (-not (Test-Path -LiteralPath $lockPath)) { $errors.Add('Missing superpowers.lock.json') }
@@ -81,7 +111,10 @@ $powerShellScripts = @(
     (Join-Path $RepoRoot 'uninstall.ps1'),
     (Join-Path $RepoRoot 'manager\HmsSuperpowersManager.ps1'),
     (Join-Path $RepoRoot 'manager\HmsSuperpowersManager.utf8.ps1'),
+    (Join-Path $RepoRoot 'manager\HmsModelSettings.ps1'),
+    (Join-Path $RepoRoot 'manager\HmsModelSettings.utf8.ps1'),
     (Join-Path $RepoRoot 'scripts\Build-HmsCompositeSkill.ps1'),
+    (Join-Path $RepoRoot 'scripts\Resolve-HmsModelRoute.ps1'),
     (Join-Path $RepoRoot 'scripts\Sync-UiSkills.ps1'),
     (Join-Path $RepoRoot 'scripts\Test-CodexSkillDiscovery.ps1')
 )
@@ -93,4 +126,4 @@ foreach ($scriptPath in $powerShellScripts) {
 }
 
 if ($errors.Count -gt 0) { throw ("HMS skill validation failed:`n - " + ($errors -join "`n - ")) }
-Write-Host "PASS: validated $($skillFiles.Count) source skills, unified composite architecture, Manager/compiler PowerShell syntax, and pinned external source contracts."
+Write-Host "PASS: validated $($skillFiles.Count) source skills, unified composite architecture, dedicated model dispatcher/settings, PowerShell syntax, and pinned external source contracts."
