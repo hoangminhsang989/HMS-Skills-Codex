@@ -28,30 +28,32 @@ jobs:
           if actual != expected:
               raise SystemExit(f'Production blob drifted. Expected {expected}, found {actual}')
           text=path.read_text(encoding='utf-8')
-          old="""    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\\')
-    $records = New-Object System.Collections.Generic.List[string]
-    foreach ($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)) {
-        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw \"CodeGraph bundle tree contains a reparse point: $($item.FullName)\" }
-        if ([bool]$item.PSIsContainer) { continue }
-        $relative = $item.FullName.Substring($root.Length).TrimStart('\\').Replace('\\','/')
-        if ($relative -ceq $CodeGraphBundleMarkerName) { continue }
-        $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-        $records.Add($relative + \"`t\" + $hash)
-    }
-"""
-          new="""    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\\')
-    $markerFullPath = [IO.Path]::GetFullPath((Join-Path $root $CodeGraphBundleMarkerName))
-    $records = New-Object System.Collections.Generic.List[string]
-    foreach ($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)) {
-        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw \"CodeGraph bundle tree contains a reparse point: $($item.FullName)\" }
-        if ([bool]$item.PSIsContainer) { continue }
-        $itemFullPath = [IO.Path]::GetFullPath($item.FullName)
-        if ([string]::Equals($itemFullPath, $markerFullPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
-        $relative = $itemFullPath.Substring($root.Length).TrimStart('\\').Replace('\\','/')
-        $hash = (Get-FileHash -LiteralPath $itemFullPath -Algorithm SHA256).Hash.ToLowerInvariant()
-        $records.Add($relative + \"`t\" + $hash)
-    }
-"""
+          old=(
+              "    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\\\\')\n"
+              "    $records = New-Object System.Collections.Generic.List[string]\n"
+              "    foreach ($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)) {\n"
+              "        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw \"CodeGraph bundle tree contains a reparse point: $($item.FullName)\" }\n"
+              "        if ([bool]$item.PSIsContainer) { continue }\n"
+              "        $relative = $item.FullName.Substring($root.Length).TrimStart('\\\\').Replace('\\\\','/')\n"
+              "        if ($relative -ceq $CodeGraphBundleMarkerName) { continue }\n"
+              "        $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()\n"
+              "        $records.Add($relative + \"`t\" + $hash)\n"
+              "    }\n"
+          )
+          new=(
+              "    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\\\\')\n"
+              "    $markerFullPath = [IO.Path]::GetFullPath((Join-Path $root $CodeGraphBundleMarkerName))\n"
+              "    $records = New-Object System.Collections.Generic.List[string]\n"
+              "    foreach ($item in @(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop)) {\n"
+              "        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw \"CodeGraph bundle tree contains a reparse point: $($item.FullName)\" }\n"
+              "        if ([bool]$item.PSIsContainer) { continue }\n"
+              "        $itemFullPath = [IO.Path]::GetFullPath($item.FullName)\n"
+              "        if ([string]::Equals($itemFullPath, $markerFullPath, [StringComparison]::OrdinalIgnoreCase)) { continue }\n"
+              "        $relative = $itemFullPath.Substring($root.Length).TrimStart('\\\\').Replace('\\\\','/')\n"
+              "        $hash = (Get-FileHash -LiteralPath $itemFullPath -Algorithm SHA256).Hash.ToLowerInvariant()\n"
+              "        $records.Add($relative + \"`t\" + $hash)\n"
+              "    }\n"
+          )
           if text.count(old) != 1:
               raise SystemExit(f'Marker exclusion anchor mismatch: {text.count(old)}')
           text=text.replace(old,new,1)
@@ -67,5 +69,3 @@ jobs:
           git add scripts/Sync-DeliveryTools.ps1
           git commit -m 'Exclude CodeGraph marker by canonical full path'
           git push origin HEAD:stage/hms-superpowers-v0.2.0-ui-design-authority
-
-# exact-authoring-trigger-v2
