@@ -34,6 +34,29 @@ $escapedRepoRoot = $repoRoot.Replace("'", "''")
 $replacement = '$RepoRoot = ''' + $escapedRepoRoot + ''''
 $source = $source.Replace($needle, $replacement)
 
+# The UTF-8 implementation retains its legacy parser for source readability, but
+# the public runtime replaces that entry point with the shared strict manifest
+# reader. This prevents PowerShell coercion of values such as JSON "false" to true.
+$stateNeedle = 'function Get-CurrentModuleState {'
+$stateOccurrences = [regex]::Matches($source, [regex]::Escape($stateNeedle)).Count
+if ($stateOccurrences -ne 1) {
+    throw "Manager state-reader contract mismatch: expected exactly one Get-CurrentModuleState declaration, found $stateOccurrences."
+}
+$source = $source.Replace($stateNeedle, 'function Get-CurrentModuleState-Legacy {')
+$strictReaderPath = Join-Path $repoRoot 'scripts\Read-HmsCompositeModuleState.ps1'
+if (-not (Test-Path -LiteralPath $strictReaderPath)) {
+    throw "Strict composite manifest reader is missing: $strictReaderPath"
+}
+$escapedStrictReader = $strictReaderPath.Replace("'", "''")
+$strictWrapper = @'
+function Get-CurrentModuleState {
+    if (-not (Test-Path -LiteralPath $ManifestPath)) { return Get-LegacyInferredState }
+    return & '__STRICT_READER__' -ManifestPath $ManifestPath
+}
+'@
+$strictWrapper = $strictWrapper.Replace('__STRICT_READER__', $escapedStrictReader)
+$source = $strictWrapper + "`r`n" + $source
+
 try {
     $implementation = [ScriptBlock]::Create($source)
 }
