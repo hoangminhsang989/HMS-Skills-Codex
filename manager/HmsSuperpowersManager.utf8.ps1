@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $BuilderPath = Join-Path $RepoRoot 'scripts\Build-HmsCompositeSkill.ps1'
+$ModelSettingsScript = Join-Path $RepoRoot 'manager\HmsModelSettings.ps1'
 $OutputRoot = Join-Path $env:USERPROFILE '.codex\hms-composite'
 $CompositeRoot = Join-Path $OutputRoot 'hms-superpowers'
 $ManifestPath = Join-Path $CompositeRoot 'manifest.json'
@@ -43,6 +44,10 @@ $ModuleDefinitions = @(
 
 function Assert-BuilderAvailable {
     if (-not (Test-Path -LiteralPath $BuilderPath)) { throw "Composite compiler is missing: $BuilderPath" }
+}
+
+function Assert-ModelSettingsAvailable {
+    if (-not (Test-Path -LiteralPath $ModelSettingsScript)) { throw "Model Settings popup is missing: $ModelSettingsScript" }
 }
 
 function Assert-VietnameseModuleDescriptions {
@@ -131,6 +136,15 @@ function Assert-OneSkillBundle {
             throw "Composite manifest state mismatch for '$key'."
         }
     }
+    if ([string]$manifest.routing_contract.model_dispatcher -cne 'always-internal') {
+        throw 'Composite manifest is missing the always-internal model dispatcher contract.'
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $final 'references\model-dispatcher\MODULE.md'))) {
+        throw 'Composite is missing references/model-dispatcher/MODULE.md.'
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $final 'references\model-dispatcher\Resolve-HmsModelRoute.ps1'))) {
+        throw 'Composite is missing the bundled model resolver.'
+    }
 
     $publicSkillFiles = @(Get-ChildItem -LiteralPath $final -Filter 'SKILL.md' -File -Recurse -ErrorAction Stop)
     if ($publicSkillFiles.Count -ne 1) {
@@ -161,6 +175,7 @@ function Assert-OneSkillBundle {
 function Invoke-ManagerSelfTest {
     if ($env:OS -ne 'Windows_NT') { throw 'Manager self-test requires Windows.' }
     Assert-BuilderAvailable
+    Assert-ModelSettingsAvailable
     Assert-VietnameseModuleDescriptions
 
     $root = Join-Path ([IO.Path]::GetTempPath()) ('hms-unified-manager-' + [guid]::NewGuid().ToString('N'))
@@ -182,7 +197,7 @@ function Invoke-ManagerSelfTest {
         Invoke-CompositeBuild -State $allOff -BuildOutputRoot $testOutput -BuildSkillsRoot $testSkills
         Assert-OneSkillBundle -Root $testOutput -DiscoveryRoot $testSkills -ExpectedState $allOff
 
-        Write-Host 'PASS: HMS Skills Manager compiled module selections into exactly one public hms-superpowers skill, preserved exclusive role routing, and validated Vietnamese module descriptions.'
+        Write-Host 'PASS: HMS Skills Manager compiled module selections into exactly one public hms-superpowers skill, preserved the always-internal model dispatcher, exclusive role routing, and Vietnamese module descriptions.'
     }
     finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
@@ -196,6 +211,7 @@ if ($SelfTest) {
 
 if ($env:OS -ne 'Windows_NT') { throw 'HMS Skills Manager UI is supported on Windows only.' }
 Assert-BuilderAvailable
+Assert-ModelSettingsAvailable
 Assert-VietnameseModuleDescriptions
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -216,6 +232,12 @@ $title.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 20)
 $title.Location = New-Object System.Drawing.Point(26, 20)
 $title.AutoSize = $true
 $form.Controls.Add($title)
+
+$modelSettingsButton = New-Object System.Windows.Forms.Button
+$modelSettingsButton.Text = 'Model Settings...'
+$modelSettingsButton.Size = New-Object System.Drawing.Size(145, 36)
+$modelSettingsButton.Location = New-Object System.Drawing.Point(587, 18)
+$form.Controls.Add($modelSettingsButton)
 
 $subtitle = New-Object System.Windows.Forms.Label
 $subtitle.Text = 'Codex sees one public skill: $hms-superpowers. Switches below select internal modules.'
@@ -336,6 +358,15 @@ function Apply-UiState {
     Refresh-UiState
 }
 
+$modelSettingsButton.Add_Click({
+    try {
+        Assert-ModelSettingsAvailable
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ModelSettingsScript
+        if ($LASTEXITCODE -ne 0) { throw "Model Settings popup exited with code $LASTEXITCODE." }
+    }
+    catch { Show-ManagerError -Message $_.Exception.Message }
+})
+
 $applyButton.Add_Click({
     try { Apply-UiState }
     catch { Show-ManagerError -Message $_.Exception.Message }
@@ -363,7 +394,7 @@ $validateButton.Add_Click({
         $state = Get-CurrentModuleState
         Invoke-CompositeBuild -State $state
         Assert-OneSkillBundle -Root $OutputRoot -DiscoveryRoot $SkillsRoot -ExpectedState $state
-        [System.Windows.Forms.MessageBox]::Show('PASS: one public skill and module routing contract validated.', 'HMS Unified Skill Manager', 'OK', 'Information') | Out-Null
+        [System.Windows.Forms.MessageBox]::Show('PASS: one public skill, model-dispatcher, and module routing contract validated.', 'HMS Unified Skill Manager', 'OK', 'Information') | Out-Null
     }
     catch { Show-ManagerError -Message $_.Exception.Message }
 })
