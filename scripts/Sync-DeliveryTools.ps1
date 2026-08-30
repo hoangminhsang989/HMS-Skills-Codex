@@ -357,6 +357,7 @@ function Repair-CodeGraphRollbackState {
         [string]$BackupPath,
         [Parameter(Mandatory)]$CandidateIdentity,
         $BackupIdentity,
+        $PreviousIdentity,
         [Parameter(Mandatory)][bool]$ManifestPublished,
         $PublishedManifest,
         [byte[]]$PreviousManifestBytes,
@@ -430,9 +431,14 @@ function Repair-CodeGraphRollbackState {
         try {
             if ($null -eq $reservedBackupPath -or -not (Test-Path -LiteralPath $reservedBackupPath)) { throw 'CodeGraph reserved backup disappeared before rollback activation.' }
             Assert-CodeGraphTransactionBundle -Path $reservedBackupPath -Identity $BackupIdentity
+            if ($null -eq $PreviousIdentity) { throw 'CodeGraph previous candidate identity is unavailable before rollback activation.' }
             if (Test-Path -LiteralPath $CurrentPath) { throw "Cannot restore CodeGraph backup because current became occupied: $CurrentPath" }
             Move-Item -LiteralPath $reservedBackupPath -Destination $CurrentPath
             Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
+            # Restore the original candidate-role marker before restoring the previous root manifest.
+            # This keeps the active bundle and manifest on the same transaction identity after rollback.
+            Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $PreviousIdentity
+            Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $PreviousIdentity
             $backupActivated = $true
             $reservedBackupPath = $null
         }
@@ -446,9 +452,9 @@ function Repair-CodeGraphRollbackState {
             $candidatePreserved = $true
         }
         catch {
-            if ($HadPrevious -and $null -ne $BackupIdentity) {
+            if ($HadPrevious -and $null -ne $PreviousIdentity) {
                 try {
-                    Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
+                    Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $PreviousIdentity
                     $currentBundleState = 'previous'
                     $backupActivated = $true
                 }
@@ -514,12 +520,13 @@ function Move-CodeGraphCurrentToRollbackBackup {
 
     # Authenticate the existing bundle from the root-manifest-pinned transaction marker and
     # deterministic tree hash before touching or executing any bytes beneath current.
-    $null = Assert-CodeGraphBundleAgainstManifest -Path $CurrentPath -Manifest $ExistingManifest
+    $existingIdentity = Assert-CodeGraphBundleAgainstManifest -Path $CurrentPath -Manifest $ExistingManifest
     Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $BackupIdentity
     Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
     Move-Item -LiteralPath $CurrentPath -Destination $BackupPath
     # Path-independent validation only. Never execute a launcher from a randomized backup path.
     Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity
+    return $existingIdentity
 }
 
 function Sync-CodeGraphBundle {
@@ -562,6 +569,7 @@ function Sync-CodeGraphBundle {
         $backup = $null
         $candidateIdentity = $null
         $backupIdentity = $null
+        $previousIdentity = $null
         $manifestPublished = $false
         $publishedManifest = $null
         try {
@@ -597,7 +605,7 @@ function Sync-CodeGraphBundle {
                     if ($null -eq $existingManifest) { throw 'Existing CodeGraph current bundle has no HMS ownership manifest.' }
                     $backup = Join-Path $CodeGraphRoot ("backup-" + [guid]::NewGuid().ToString('N'))
                     $backupIdentity = New-CodeGraphBundleIdentity -TransactionId $transactionId -Role 'backup' -Version ([string]$existingManifest.version) -Tag ([string]$existingManifest.tag) -Commit ([string]$existingManifest.commit) -Asset ([string]$existingManifest.asset) -Sha256 ([string]$existingManifest.sha256) -BundleTreeSha256 ([string]$existingManifest.bundle_tree_sha256)
-                    Move-CodeGraphCurrentToRollbackBackup -CurrentPath $current -BackupPath $backup -ExistingManifest $existingManifest -BackupIdentity $backupIdentity
+                    $previousIdentity = Move-CodeGraphCurrentToRollbackBackup -CurrentPath $current -BackupPath $backup -ExistingManifest $existingManifest -BackupIdentity $backupIdentity
                     if ($env:HMS_TEST_FAIL_CODEGRAPH_AFTER_BACKUP_RENAME -ceq '1') { throw 'Injected CodeGraph failure after previous current crossed the backup rename boundary.' }
                 }
 
@@ -625,7 +633,7 @@ function Sync-CodeGraphBundle {
             catch {
                 $installError = $_
                 if ($null -eq $candidateIdentity) { throw $installError }
-                $rollback = Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup -CandidateIdentity $candidateIdentity -BackupIdentity $backupIdentity -ManifestPublished $manifestPublished -PublishedManifest $publishedManifest -PreviousManifestBytes $existingManifestBytes -HadPrevious $wasInstalled
+                $rollback = Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup -CandidateIdentity $candidateIdentity -BackupIdentity $backupIdentity -PreviousIdentity $previousIdentity -ManifestPublished $manifestPublished -PublishedManifest $publishedManifest -PreviousManifestBytes $existingManifestBytes -HadPrevious $wasInstalled
                 $rollbackErrors = @($rollback.RollbackErrors)
                 if ($rollbackErrors.Count -gt 0) {
                     throw "CodeGraph installation failed and rollback was incomplete. Original: $($installError.Exception.Message). Rollback: $($rollbackErrors -join ' | ')"
