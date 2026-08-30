@@ -20,7 +20,7 @@ jobs:
         with:
           ref: ${{ env.CANDIDATE_SHA }}
 
-      - name: Qualify exact-HEAD archive transport inside Start-Job
+      - name: Qualify no-EOL exact-HEAD archive transport inside Start-Job
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -45,7 +45,7 @@ jobs:
               param($GitExe,$RepoRoot,$Head,$PathSpec,$ArchivePath,$Destination)
               $ErrorActionPreference = 'Stop'
               Write-Output "HMS_ARCHIVE_START pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
-              & $GitExe -C $RepoRoot archive --format=zip "--output=$ArchivePath" $Head -- $PathSpec
+              & $GitExe -C $RepoRoot -c core.autocrlf=false -c core.eol=lf archive --format=zip "--output=$ArchivePath" $Head -- $PathSpec
               if ($LASTEXITCODE -ne 0) { throw "git archive failed with exit code $LASTEXITCODE" }
 
               Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -68,13 +68,13 @@ jobs:
               Start-Sleep -Milliseconds 100
             }
             Receive-Job -Job $job -ErrorAction Stop | Write-Host
-            if ($job.State -ne 'Completed') { throw "Exact-HEAD archive transport did not complete within 15s. State=$($job.State)" }
+            if ($job.State -ne 'Completed') { throw "No-EOL exact-HEAD archive transport did not complete within 15s. State=$($job.State)" }
 
             $actualBlob = (& git -C $env:GITHUB_WORKSPACE hash-object --no-filters -- $destination).Trim().ToLowerInvariant()
             if ($LASTEXITCODE -ne 0 -or $actualBlob -ne $blob) {
               throw "Archive transport literal-byte mismatch. Expected $blob, found $actualBlob"
             }
-            Write-Host "PASS: exact-HEAD archive transport completed inside Start-Job and preserved literal blob $blob."
+            Write-Host "PASS: no-EOL exact-HEAD archive transport completed inside Start-Job and preserved literal blob $blob."
           }
           finally {
             if ($null -ne $job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
