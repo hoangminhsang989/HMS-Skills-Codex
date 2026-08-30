@@ -1,0 +1,46 @@
+name: Author CodeGraph logical prefix fix
+
+on:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.2.0-ui-design-authority
+    paths:
+      - .github/workflows/author-codegraph-logical-prefix-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  author:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Patch exact production blob
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          path=Path('scripts/Sync-DeliveryTools.ps1')
+          expected='90badf0461d36c96df5b30f1b081cdfedea7ee8f'
+          actual=subprocess.check_output(['git','hash-object',str(path)],text=True).strip().lower()
+          if actual != expected:
+              raise SystemExit(f'Production blob drifted. Expected {expected}, found {actual}')
+          text=path.read_text(encoding='utf-8')
+          old='        [Parameter(Mandatory)][string]$LogicalPrefix,\n'
+          new='        [Parameter(Mandatory)][AllowEmptyString()][string]$LogicalPrefix,\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'LogicalPrefix anchor mismatch: {text.count(old)}')
+          path.write_text(text.replace(old,new,1),encoding='utf-8',newline='\n')
+      - name: Validate and push production commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff -- scripts/Sync-DeliveryTools.ps1
+          git config user.name 'HMS exact-blob remediation'
+          git config user.email '121548965+hoangminhsang989@users.noreply.github.com'
+          git add scripts/Sync-DeliveryTools.ps1
+          git commit -m 'Allow root logical prefix in CodeGraph tree identity'
+          git push origin HEAD:stage/hms-superpowers-v0.2.0-ui-design-authority
