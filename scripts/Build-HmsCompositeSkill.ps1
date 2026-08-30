@@ -73,7 +73,8 @@ public static class HmsOwnedTempNative
         int rootOffset = IntPtr.Size == 8 ? 8 : 4;
         int lengthOffset = IntPtr.Size == 8 ? 16 : 8;
         int nameOffset = IntPtr.Size == 8 ? 20 : 12;
-        int size = nameOffset + nameBytes.Length;
+        int minimumStructSize = IntPtr.Size == 8 ? 24 : 16;
+        int size = Math.Max(minimumStructSize, nameOffset + nameBytes.Length + 2); // trailing UTF-16 NUL/padding; FileNameLength still excludes it.
         IntPtr buffer = Marshal.AllocHGlobal(size);
         try
         {
