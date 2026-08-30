@@ -63,7 +63,7 @@ Never downgrade a mandatory capability floor merely to keep the workflow moving.
 | `CRITICAL_BLOCKER_RELEASE_GATE` | Sol/max | Sol/max only |
 | `FINAL_STAGE_REVIEW` | Sol/max | Sol/max only |
 
-The deterministic resolver is `scripts/Resolve-HmsModelRoute.ps1` in the HMS installation source. Use its result instead of inventing a fallback.
+Inside the generated composite, use the bundled deterministic resolver at `references/model-dispatcher/Resolve-HmsModelRoute.ps1`. In the source repository, the reviewed canonical script is `scripts/Resolve-HmsModelRoute.ps1`. Use its result instead of inventing a fallback.
 
 ## Dispatch output
 
