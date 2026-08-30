@@ -19,7 +19,7 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           $message = ((& git log -1 --format=%s) -join '').Trim()
-          if($message -cne 'chore: invoke registered review 486 P1 remediation v4') {
+          if($message -cne 'chore: invoke registered review 486 P1 remediation v5') {
             Write-Host "No remediation action for head message: $message"
             exit 0
           }
@@ -35,7 +35,7 @@ jobs:
             else { $body.Add($line) }
           }
           $oldPatch = "sync=replace_once(sync,old_remove,new_remove,'CodeGraph destructive helper block')"
-          $newPatch = "start=sync.index('function Remove-CodeGraphTransactionBundle {'); end=sync.index('`nfunction Assert-CodeGraphBundleAgainstManifest',start); sync=sync[:start]+new_remove+sync[end+1:]"
+          $newPatch = "start=sync.index('function Remove-CodeGraphTransactionBundle {'); end=sync.index(chr(10)+'function Assert-CodeGraphBundleAgainstManifest',start); sync=sync[:start]+new_remove+sync[end+1:]"
           $patchIndex = $body.IndexOf($oldPatch)
           if($patchIndex -lt 0) { throw 'Could not locate staged CodeGraph whole-function replacement.' }
           $body[$patchIndex] = $newPatch
