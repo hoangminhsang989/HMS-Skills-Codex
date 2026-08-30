@@ -27,14 +27,20 @@ jobs:
             $path = Join-Path $workspace $relative
             $text = [IO.File]::ReadAllText($path)
             foreach ($literal in @(
+              'function Get-HmsOwnedDirectoryIdentityFromHandle',
               'function Open-HmsOwnedDirectoryIdentityHandle',
-              'function Get-HmsOwnedDirectoryIdentity',
               'function New-HmsOwnedTempDirectory',
               'function Remove-HmsOwnedTempDirectory',
+              'SetFileInformationByHandle',
+              'RenameHmsOwnedDirectoryByHandle',
+              '[uint32]0x00010000',
               "'.hms-owned-temp-quarantine-'",
-              '-ShareMode ([uint32]3)'
+              "'.hms-owned-temp-identity'"
             )) {
-              if ($text -notmatch [regex]::Escape($literal)) { throw "$relative is missing owned-temp identity contract: $literal" }
+              if ($text -notmatch [regex]::Escape($literal)) { throw "$relative is missing exact-handle owned-temp contract: $literal" }
+            }
+            if ($text -match [regex]::Escape('During active use ShareMode excludes FILE_SHARE_DELETE')) {
+              throw "$relative still claims share-mode exclusion is the cleanup authority."
             }
             if ($text -match [regex]::Escape('Remove-Item -LiteralPath $transportRoot -Recurse -Force -ErrorAction SilentlyContinue')) {
               throw "$relative still recursively deletes a transport pathname without identity binding."
@@ -53,15 +59,19 @@ jobs:
           [IO.File]::WriteAllText($helperPath,$helperText,(New-Object Text.UTF8Encoding($false)))
           . $helperPath
 
-          # Case A: the threat model is another process, not a second API call in the owner process.
-          # Keep the production guard alive and ask a separate PowerShell process to rename the root.
-          $ownedA = New-HmsOwnedTempDirectory -Prefix 'hms-owned-temp-active-' -Label 'active-guard regression'
-          $movedA = ([string]$ownedA.Path) + '-moved'
+          # Case A: prove the original pathname is not the deletion authority. A separate process first
+          # renames the exact HMS-owned object away, then a foreign directory occupies the original name.
+          # Cleanup must use the still-live object handle to rename/delete only the original object.
+          $ownedA = New-HmsOwnedTempDirectory -Prefix 'hms-owned-temp-active-' -Label 'exact-handle regression'
+          $originalA = [string]$ownedA.Path
+          $movedA = $originalA + '-moved-by-foreign-process'
+          $foreignSentinelA = Join-Path $originalA 'FOREIGN-PRESERVE.txt'
           $jobA = $null
           try {
             Write-Host "GUARD_IS_CLOSED=$($ownedA.Guard.IsClosed)"
             Write-Host "GUARD_IS_INVALID=$($ownedA.Guard.IsInvalid)"
-            if ($ownedA.Guard.IsClosed -or $ownedA.Guard.IsInvalid) { throw 'Production owned-temp guard is not live before cross-process race.' }
+            if ($ownedA.Guard.IsClosed -or $ownedA.Guard.IsInvalid) { throw 'Production exact-object handle is not live before race.' }
+
             $jobA = Start-Job -ScriptBlock {
               param($Original,$Moved)
               $ErrorActionPreference='Stop'
@@ -72,24 +82,34 @@ jobs:
               catch {
                 [pscustomobject]@{ Renamed=$false; Error=$_.Exception.Message }
               }
-            } -ArgumentList ([string]$ownedA.Path),$movedA
+            } -ArgumentList $originalA,$movedA
             $null = Wait-Job -Job $jobA -Timeout 20
             if ($jobA.State -ne 'Completed') { throw "Cross-process rename probe did not complete. State=$($jobA.State)" }
             $probeA = Receive-Job -Job $jobA -ErrorAction Stop
             Write-Host "CROSS_PROCESS_RENAMED=$($probeA.Renamed)"
             Write-Host "CROSS_PROCESS_RENAME_ERROR=$($probeA.Error)"
-            if ([bool]$probeA.Renamed) { throw 'Active owned-temp guard allowed a separate process to rename the root.' }
-            Remove-HmsOwnedTempDirectory -Owned $ownedA -Label 'active-guard regression'
-            if (Test-Path -LiteralPath ([string]$ownedA.Path)) { throw 'Exact owned temp root remained after normal identity-bound cleanup.' }
+            if (-not [bool]$probeA.Renamed) { throw 'Threat-model setup could not rename the owned root from a separate process.' }
+            if (Test-Path -LiteralPath $originalA) { throw 'Original pathname unexpectedly remained occupied after foreign rename setup.' }
+            if (-not (Test-Path -LiteralPath $movedA -PathType Container)) { throw 'Foreign rename setup lost the exact owned directory.' }
+
+            New-Item -ItemType Directory -Path $originalA -ErrorAction Stop | Out-Null
+            [IO.File]::WriteAllText($foreignSentinelA,'foreign replacement must survive',(New-Object Text.UTF8Encoding($false)))
+
+            Remove-HmsOwnedTempDirectory -Owned $ownedA -Label 'exact-handle regression'
+            if (-not (Test-Path -LiteralPath $foreignSentinelA -PathType Leaf)) { throw 'Exact-handle cleanup deleted the foreign replacement at the original pathname.' }
+            if (Test-Path -LiteralPath $movedA) { throw 'Exact owned object remained at its adversarially moved pathname after cleanup.' }
+            $leftA = @(Get-ChildItem -LiteralPath (Split-Path -Parent $originalA) -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.hms-owned-temp-quarantine-*' })
+            if ($leftA.Count -ne 0) { throw 'Exact-handle cleanup left quarantine residue.' }
           }
           finally {
             if ($null -ne $jobA) { Remove-Job -Job $jobA -Force -ErrorAction SilentlyContinue }
             if ($null -ne $ownedA.Guard) { $ownedA.Guard.Dispose(); $ownedA.Guard=$null }
-            foreach ($p in @([string]$ownedA.Path,$movedA)) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } }
+            foreach ($p in @($originalA,$movedA)) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } }
           }
 
-          # Case B: after guard release, replace the pathname and prove cleanup rejects the foreign object.
-          $ownedB = New-HmsOwnedTempDirectory -Prefix 'hms-owned-temp-replace-' -Label 'foreign-replacement regression'
+          # Case B: once exact-object authority is explicitly lost, cleanup must fail closed rather than
+          # falling back to a pathname. A foreign replacement at the old name must survive.
+          $ownedB = New-HmsOwnedTempDirectory -Prefix 'hms-owned-temp-lost-handle-' -Label 'lost-handle regression'
           $originalB = [string]$ownedB.Path
           $movedB = $originalB + '-owned-original'
           $sentinelB = Join-Path $originalB 'FOREIGN-PRESERVE.txt'
@@ -99,17 +119,17 @@ jobs:
             New-Item -ItemType Directory -Path $originalB -ErrorAction Stop | Out-Null
             [IO.File]::WriteAllText($sentinelB,'foreign replacement must survive',(New-Object Text.UTF8Encoding($false)))
             $rejected = $false
-            try { Remove-HmsOwnedTempDirectory -Owned $ownedB -Label 'foreign-replacement regression' }
+            try { Remove-HmsOwnedTempDirectory -Owned $ownedB -Label 'lost-handle regression' }
             catch {
-              if ($_.Exception.Message -match 'cleanup rejected a foreign pathname replacement') { $rejected = $true }
+              if ($_.Exception.Message -match 'exact-object cleanup handle is unavailable') { $rejected = $true }
               else { throw }
             }
-            if (-not $rejected) { throw 'Identity-bound cleanup accepted a foreign pathname replacement.' }
-            if (-not (Test-Path -LiteralPath $sentinelB -PathType Leaf)) { throw 'Identity-bound cleanup deleted the foreign replacement.' }
-            if (-not (Test-Path -LiteralPath $movedB -PathType Container)) { throw 'Original exact owned directory disappeared during foreign-replacement regression.' }
+            if (-not $rejected) { throw 'Cleanup fell back to pathname authority after exact handle loss.' }
+            if (-not (Test-Path -LiteralPath $sentinelB -PathType Leaf)) { throw 'Lost-handle cleanup deleted the foreign replacement.' }
+            if (-not (Test-Path -LiteralPath $movedB -PathType Container)) { throw 'Original exact owned directory disappeared after cleanup correctly failed closed.' }
           }
           finally {
             foreach ($p in @($originalB,$movedB,$helperPath)) { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue } }
           }
 
-          Write-Host 'PASS: cross-process filesystem guard blocks support-root rename and identity-bound cleanup rejects/deletes no foreign pathname replacement.'
+          Write-Host 'PASS: exact-handle cleanup deletes the original moved filesystem object, preserves foreign pathname replacements, and fails closed after handle loss.'
