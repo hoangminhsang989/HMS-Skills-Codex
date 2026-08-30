@@ -16,6 +16,7 @@ $CanonicalSuperpowersRemote = 'https://github.com/obra/superpowers.git'
 $SuperpowersRoot = Join-Path $env:USERPROFILE '.codex\superpowers'
 $CompositeManifest = Join-Path $env:USERPROFILE '.codex\hms-composite\hms-superpowers\manifest.json'
 $SkillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
+$BuildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
 
 function ConvertTo-NormalizedRemote {
     param([Parameter(Mandatory)][string]$Remote)
@@ -100,30 +101,51 @@ function Get-ModuleState {
     return [ordered]@{ hms=$true; superpowers=(-not $SkipSuperpowers); taste=(-not $SkipTaste); impeccable=(-not $SkipImpeccable) }
 }
 
-if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }
-$state = Get-ModuleState
-Update-CleanRepo -Path $InstallRoot -ExpectedRemote $HmsRemote
-& (Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1')
-& (Join-Path $InstallRoot 'scripts\Test-DeliveryTools.ps1')
+$buildMutex = New-Object System.Threading.Mutex($false, $BuildMutexName)
+$mutexOwned = $false
+try {
+    try {
+        $mutexOwned = $buildMutex.WaitOne([TimeSpan]::FromSeconds(120))
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        $mutexOwned = $true
+    }
+    if (-not $mutexOwned) { throw "Timed out waiting for composite build lock: $BuildMutexName" }
 
-if (-not $SkipSuperpowers) {
-    $lock = Read-SuperLock
-    Sync-PinnedRepo -Path $SuperpowersRoot -Remote ([string]$lock.repository) -Commit ([string]$lock.commit)
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }
+    $state = Get-ModuleState
+
+    # Source reconciliation and composite compilation are one cross-process transaction.
+    Update-CleanRepo -Path $InstallRoot -ExpectedRemote $HmsRemote
+    & (Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1')
+    & (Join-Path $InstallRoot 'scripts\Test-DeliveryTools.ps1')
+
+    if (-not $SkipSuperpowers) {
+        $lock = Read-SuperLock
+        Sync-PinnedRepo -Path $SuperpowersRoot -Remote ([string]$lock.repository) -Commit ([string]$lock.commit)
+    }
+    $uiArgs = @{}
+    if ($SkipTaste) { $uiArgs.SkipTaste = $true }
+    if ($SkipImpeccable) { $uiArgs.SkipImpeccable = $true }
+    & (Join-Path $InstallRoot 'scripts\Sync-UiSkills.ps1') @uiArgs
+
+    $deliveryArgs = @{}
+    if (-not $SkipCodeGraph) { $deliveryArgs.EnableCodeGraphIfNew = $true }
+    if ($SkipCodeGraph) { $deliveryArgs.SkipCodeGraph = $true }
+    if ($SkipThreeLevelDelivery) { $deliveryArgs.SkipThreeLevelDelivery = $true }
+    & (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') @deliveryArgs
+
+    # Build-HmsCompositeSkill acquires the same mutex reentrantly on this thread.
+    & (Join-Path $InstallRoot 'scripts\Build-HmsCompositeSkill.ps1') -InstallRoot $InstallRoot -Hms ([bool]$state.hms) -Superpowers ([bool]$state.superpowers) -Taste ([bool]$state.taste) -Impeccable ([bool]$state.impeccable)
+
+    Write-Host 'HMS Skills Codex update PASS.'
+    Write-Host 'Existing module ON/OFF choices were preserved.'
+    Write-Host 'Codex public skill remains: $hms-superpowers'
+    Write-Host 'Restart Codex if discovery does not refresh automatically.'
 }
-$uiArgs = @{}
-if ($SkipTaste) { $uiArgs.SkipTaste = $true }
-if ($SkipImpeccable) { $uiArgs.SkipImpeccable = $true }
-& (Join-Path $InstallRoot 'scripts\Sync-UiSkills.ps1') @uiArgs
-
-$deliveryArgs = @{}
-if (-not $SkipCodeGraph) { $deliveryArgs.EnableCodeGraphIfNew = $true }
-if ($SkipCodeGraph) { $deliveryArgs.SkipCodeGraph = $true }
-if ($SkipThreeLevelDelivery) { $deliveryArgs.SkipThreeLevelDelivery = $true }
-& (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') @deliveryArgs
-
-& (Join-Path $InstallRoot 'scripts\Build-HmsCompositeSkill.ps1') -InstallRoot $InstallRoot -Hms ([bool]$state.hms) -Superpowers ([bool]$state.superpowers) -Taste ([bool]$state.taste) -Impeccable ([bool]$state.impeccable)
-
-Write-Host 'HMS Skills Codex update PASS.'
-Write-Host 'Existing module ON/OFF choices were preserved.'
-Write-Host 'Codex public skill remains: $hms-superpowers'
-Write-Host 'Restart Codex if discovery does not refresh automatically.'
+finally {
+    if ($mutexOwned) {
+        try { $buildMutex.ReleaseMutex() } catch { }
+    }
+    $buildMutex.Dispose()
+}
