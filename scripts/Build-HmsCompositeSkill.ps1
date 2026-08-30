@@ -12,7 +12,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$BuildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $selfRelative = 'scripts/Build-HmsCompositeSkill.ps1'
 $implementationRelative = 'scripts/Build-HmsCompositeSkill.impl.ps1'
@@ -123,21 +122,8 @@ if ($actualSelf -cne $expectedSelf) {
 }
 
 $lifecycleOwnsBuildMutex = Test-ExactHeadLifecycleCaller
-$buildMutex = $null
-$mutexOwned = $false
 $supportRoot = $null
 try {
-    if (-not $lifecycleOwnsBuildMutex) {
-        $buildMutex = New-Object System.Threading.Mutex($false, $BuildMutexName)
-        try {
-            $mutexOwned = $buildMutex.WaitOne([TimeSpan]::FromSeconds(120))
-        }
-        catch [System.Threading.AbandonedMutexException] {
-            $mutexOwned = $true
-        }
-        if (-not $mutexOwned) { throw "Timed out waiting for composite build lock before public bootstrap: $BuildMutexName" }
-    }
-
     $expectedImplementation = Get-ExpectedSupportBlob -RelativePath $implementationRelative -Label 'Composite implementation'
     $expectedHelper = Get-ExpectedSupportBlob -RelativePath $helperRelative -Label 'Committed-copy helper'
     $expectedSuperLock = Get-ExpectedSupportBlob -RelativePath $superLockRelative -Label 'Superpowers lock'
@@ -147,6 +133,7 @@ try {
 
     New-Item -ItemType Directory -Force -Path $supportRoot | Out-Null
     $implementationPath = Join-Path $supportRoot 'Build-HmsCompositeSkill.impl.ps1'
+    $runtimeImplementationPath = Join-Path $supportRoot 'Build-HmsCompositeSkill.runtime.ps1'
     $committedCopyHelper = Join-Path $supportRoot 'Copy-HmsCommittedGitPath.ps1'
     $committedSuperLock = Join-Path $supportRoot 'superpowers.lock.json'
     $committedUiLock = Join-Path $supportRoot 'ui-skills.lock.json'
@@ -224,25 +211,36 @@ try {
     $uiSequence = 'Apply only enabled work modules sequentially after the applicable higher HMS checkpoint, fail-closed/safety, and required-model-floor gates are satisfied. Taste owns unresolved direction when enabled; Impeccable owns audit/polish when enabled; Superpowers owns implementation when enabled; HMS owns evidence/release when enabled.'
     $source = Replace-ExactlyOnce -Text $source -Needle $legacyUiSequence -Replacement $uiSequence -Label 'UI authority sequence'
 
-    # One owner per execution path: lifecycle -> wrapper inherits; direct wrapper -> wrapper owns;
-    # direct implementation -> implementation owns. Dynamic wrapper execution strips exactly one
-    # committed implementation lock block whenever that production lock marker is present.
-    $dynamicLockMarker = '$buildMutex = New-Object System.Threading.Mutex($false, $BuildMutexName)'
-    $dynamicLockRequired = $source.Contains($dynamicLockMarker)
-    $implementationLockPattern = '(?m)^\$buildMutex = New-Object System\.Threading\.Mutex\(\$false, \$BuildMutexName\)\r?\n\$mutexOwned = \$false\r?\n\$stage = \$null\r?\ntry \{\r?\n    try \{\r?\n        \$mutexOwned = \$buildMutex\.WaitOne\(\[TimeSpan\]::FromSeconds\(120\)\)\r?\n    \}\r?\n    catch \[System\.Threading\.AbandonedMutexException\] \{\r?\n        \$mutexOwned = \$true\r?\n    \}\r?\n    if \(-not \$mutexOwned\) \{ throw "Timed out waiting for composite build lock: \$BuildMutexName" \}\r?\n'
-    # PowerShell single-quoted regex strings do not consume backslashes; normalize the pattern to
-    # the one-backslash .NET regex escapes required to match literal '$', '.', '(', '[', and braces.
-    $implementationLockPattern = $implementationLockPattern.Replace('\\','\')
-    $implementationLockReplacement = '$buildMutex = $null' + "`n" + '$mutexOwned = $false' + "`n" + '$stage = $null' + "`n" + 'try {' + "`n"
-    $source = Replace-RegexRequiredWhen -Text $source -Pattern $implementationLockPattern -Replacement $implementationLockReplacement -Required $dynamicLockRequired -Label 'Dynamic implementation composite mutex acquisition'
+    # Exactly one cross-process lock owner exists on every path:
+    # - direct implementation: committed implementation owns the mutex;
+    # - direct public wrapper: transformed runtime file retains that same implementation mutex;
+    # - exact install/update lifecycle: lifecycle already owns the mutex, so only that path strips
+    #   the implementation acquire/release before executing the transformed runtime file.
+    if ($lifecycleOwnsBuildMutex) {
+        $dynamicLockMarker = '$buildMutex = New-Object System.Threading.Mutex($false, $BuildMutexName)'
+        if (-not $source.Contains($dynamicLockMarker)) {
+            throw 'Lifecycle-owned runtime expected the committed implementation mutex marker but it was absent.'
+        }
+        $implementationLockPattern = '(?m)^\$buildMutex = New-Object System\.Threading\.Mutex\(\$false, \$BuildMutexName\)\r?\n\$mutexOwned = \$false\r?\n\$stage = \$null\r?\ntry \{\r?\n    try \{\r?\n        \$mutexOwned = \$buildMutex\.WaitOne\(\[TimeSpan\]::FromSeconds\(120\)\)\r?\n    \}\r?\n    catch \[System\.Threading\.AbandonedMutexException\] \{\r?\n        \$mutexOwned = \$true\r?\n    \}\r?\n    if \(-not \$mutexOwned\) \{ throw "Timed out waiting for composite build lock: \$BuildMutexName" \}\r?\n'
+        $implementationLockPattern = $implementationLockPattern.Replace('\\','\')
+        $implementationLockReplacement = '$buildMutex = $null' + "`n" + '$mutexOwned = $false' + "`n" + '$stage = $null' + "`n" + 'try {' + "`n"
+        $source = Replace-RegexRequiredWhen -Text $source -Pattern $implementationLockPattern -Replacement $implementationLockReplacement -Required $true -Label 'Lifecycle-owned implementation composite mutex acquisition'
 
-    $implementationDisposePattern = '(?m)^    \$buildMutex\.Dispose\(\)\r?$'.Replace('\\','\')
-    $source = Replace-RegexRequiredWhen -Text $source -Pattern $implementationDisposePattern -Replacement '    if ($null -ne $buildMutex) { $buildMutex.Dispose() }' -Required $dynamicLockRequired -Label 'Dynamic implementation composite mutex disposal'
+        $implementationDisposePattern = '(?m)^    \$buildMutex\.Dispose\(\)\r?$'.Replace('\\','\')
+        $source = Replace-RegexRequiredWhen -Text $source -Pattern $implementationDisposePattern -Replacement '    if ($null -ne $buildMutex) { $buildMutex.Dispose() }' -Required $true -Label 'Lifecycle-owned implementation composite mutex disposal'
+    }
 
-    try { $implementation = [ScriptBlock]::Create($source) }
-    catch { throw "Composite build implementation failed to parse after deterministic trust-boundary binding: $($_.Exception.Message)" }
+    # Execute transformed support as a real script file. Direct committed implementation file execution
+    # is the independently proven Windows liveness path; do not introduce a dynamic ScriptBlock boundary.
+    [IO.File]::WriteAllText($runtimeImplementationPath, $source, $utf8Strict)
+    $runtimeTokens = $null
+    $runtimeParseErrors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($runtimeImplementationPath,[ref]$runtimeTokens,[ref]$runtimeParseErrors) | Out-Null
+    if (@($runtimeParseErrors).Count -ne 0) {
+        throw "Composite runtime implementation failed to parse after deterministic trust-boundary binding: $((@($runtimeParseErrors) | ForEach-Object { $_.Message }) -join ' | ')"
+    }
 
-    & $implementation -InstallRoot $InstallRoot -OutputRoot $OutputRoot -SkillsRoot $SkillsRoot -Hms $Hms -Superpowers $Superpowers -Taste $Taste -Impeccable $Impeccable
+    & $runtimeImplementationPath -InstallRoot $InstallRoot -OutputRoot $OutputRoot -SkillsRoot $SkillsRoot -Hms $Hms -Superpowers $Superpowers -Taste $Taste -Impeccable $Impeccable
 
     $generatedSkill = Join-Path (Join-Path $OutputRoot 'hms-superpowers') 'SKILL.md'
     if (-not (Test-Path -LiteralPath $generatedSkill)) { throw "Generated composite SKILL.md is missing after build: $generatedSkill" }
@@ -253,24 +251,10 @@ try {
         throw 'Generated composite did not preserve the project-authority safety boundary.'
     }
 
-    Write-Host "PASS: public bootstrap, implementation, committed-copy helper, and lock inputs are bound to HMS HEAD $head; published source bytes are Git-object-derived and authority precedence is pinned below HMS checkpoint/safety/model-floor gates."
+    Write-Host "PASS: public bootstrap, file-executed runtime implementation, committed-copy helper, and lock inputs are bound to HMS HEAD $head; published source bytes are Git-object-derived, single-owner serialized, and authority precedence is pinned below HMS checkpoint/safety/model-floor gates."
 }
 finally {
     if ($null -ne $supportRoot -and (Test-Path -LiteralPath $supportRoot)) {
         Remove-Item -LiteralPath $supportRoot -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    $mutexReleaseError = $null
-    if ($mutexOwned) {
-        try {
-            $buildMutex.ReleaseMutex()
-            $mutexOwned = $false
-        }
-        catch {
-            $mutexReleaseError = $_
-        }
-    }
-    if ($null -ne $buildMutex) { $buildMutex.Dispose() }
-    if ($null -ne $mutexReleaseError) {
-        throw "Failed to release composite build lock after public wrapper lifecycle: $($mutexReleaseError.Exception.Message)"
     }
 }
