@@ -163,10 +163,15 @@ jobs:
             try {
               $jobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$parallelOutput,$parallelSkills,$true
               $jobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$parallelOutput,$parallelSkills,$false
-              $null = Wait-Job -Job $jobs -Timeout 120
+              $deadline = [DateTime]::UtcNow.AddSeconds(120)
+              while ([DateTime]::UtcNow -lt $deadline) {
+                foreach ($job in $jobs) { Receive-Job -Job $job -ErrorAction Stop | Write-Host }
+                if (@($jobs | Where-Object { $_.State -notin @('Completed','Failed','Stopped') }).Count -eq 0) { break }
+                Start-Sleep -Milliseconds 250
+              }
               foreach ($job in $jobs) {
-                if ($job.State -ne 'Completed') { throw "Concurrent lightweight composite build job did not complete: $($job.State)" }
                 Receive-Job -Job $job -ErrorAction Stop | Write-Host
+                if ($job.State -ne 'Completed') { throw "Concurrent lightweight composite build job did not complete: $($job.State)" }
               }
               $parallelManifestPath = Join-Path $parallelOutput 'hms-superpowers\manifest.json'
               if (-not (Test-Path -LiteralPath $parallelManifestPath)) { throw 'Concurrent build did not leave a valid composite manifest.' }
@@ -209,7 +214,7 @@ jobs:
             & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -Hms $true -Superpowers $true -Taste $false -Impeccable $true
             $beforeUpdate = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
             if ([bool]$beforeUpdate.modules.taste) { throw 'Failed to create Taste OFF composite state.' }
-            if (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\taste')) { throw 'Taste reference remained after Taste was disabled.' }
+            if (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\taste')) { throw 'Taste reference remained after Taste OFF rebuild.' }
             if (-not (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\model-router\MODULE.md'))) { throw 'Model router disappeared during module rebuild.' }
             if (-not (Test-Path -LiteralPath (Join-Path $modelDispatcherRoot 'MODULE.md'))) { throw 'Model dispatcher disappeared during module rebuild.' }
 
