@@ -61,6 +61,30 @@ function Assert-VietnameseModuleDescriptions {
     }
 }
 
+function Assert-VietnameseLayoutCapacity {
+    if ($env:OS -ne 'Windows_NT') { return }
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $font = New-Object System.Drawing.Font('Segoe UI', 10)
+    try {
+        foreach ($module in $ModuleDefinitions) {
+            $label = New-Object System.Windows.Forms.Label
+            try {
+                $label.Font = $font
+                $label.Text = $module.DescriptionVi
+                $label.MaximumSize = New-Object System.Drawing.Size(650, 0)
+                $label.AutoSize = $true
+                $preferred = $label.PreferredSize
+                if ($preferred.Width -gt 650 -or $preferred.Height -gt 44) {
+                    throw "Vietnamese description does not fit the reviewed wrapped layout for '$($module.Key)': $($preferred.Width)x$($preferred.Height)."
+                }
+            }
+            finally { $label.Dispose() }
+        }
+    }
+    finally { $font.Dispose() }
+}
+
 function New-DefaultState {
     return [ordered]@{
         hms = $true
@@ -136,8 +160,14 @@ function Assert-OneSkillBundle {
             throw "Composite manifest state mismatch for '$key'."
         }
     }
+    if ([string]$manifest.routing_contract.model_router -cne 'always-internal') {
+        throw 'Composite manifest is missing the always-internal model router contract.'
+    }
     if ([string]$manifest.routing_contract.model_dispatcher -cne 'always-internal') {
         throw 'Composite manifest is missing the always-internal model dispatcher contract.'
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $final 'references\model-router\MODULE.md'))) {
+        throw 'Composite is missing references/model-router/MODULE.md.'
     }
     if (-not (Test-Path -LiteralPath (Join-Path $final 'references\model-dispatcher\MODULE.md'))) {
         throw 'Composite is missing references/model-dispatcher/MODULE.md.'
@@ -177,6 +207,7 @@ function Invoke-ManagerSelfTest {
     Assert-BuilderAvailable
     Assert-ModelSettingsAvailable
     Assert-VietnameseModuleDescriptions
+    Assert-VietnameseLayoutCapacity
 
     $root = Join-Path ([IO.Path]::GetTempPath()) ('hms-unified-manager-' + [guid]::NewGuid().ToString('N'))
     $testOutput = Join-Path $root 'composite'
@@ -197,7 +228,7 @@ function Invoke-ManagerSelfTest {
         Invoke-CompositeBuild -State $allOff -BuildOutputRoot $testOutput -BuildSkillsRoot $testSkills
         Assert-OneSkillBundle -Root $testOutput -DiscoveryRoot $testSkills -ExpectedState $allOff
 
-        Write-Host 'PASS: HMS Skills Manager compiled module selections into exactly one public hms-superpowers skill, preserved the always-internal model dispatcher, exclusive role routing, and Vietnamese module descriptions.'
+        Write-Host 'PASS: HMS Skills Manager compiled module selections into exactly one public hms-superpowers skill, preserved always-internal model routing, exclusive enabled-owner routing, and measured wrapped Vietnamese descriptions.'
     }
     finally {
         if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
@@ -221,8 +252,8 @@ Add-Type -AssemblyName System.Drawing
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'HMS Unified Skill Manager'
 $form.StartPosition = 'CenterScreen'
-$form.ClientSize = New-Object System.Drawing.Size(760, 630)
-$form.MinimumSize = New-Object System.Drawing.Size(776, 669)
+$form.ClientSize = New-Object System.Drawing.Size(760, 690)
+$form.MinimumSize = New-Object System.Drawing.Size(776, 729)
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 10)
 $form.BackColor = [System.Drawing.Color]::FromArgb(245, 247, 250)
 
@@ -258,7 +289,7 @@ $top = 125
 foreach ($module in $ModuleDefinitions) {
     $panel = New-Object System.Windows.Forms.Panel
     $panel.Location = New-Object System.Drawing.Point(28, $top)
-    $panel.Size = New-Object System.Drawing.Size(704, 88)
+    $panel.Size = New-Object System.Drawing.Size(704, 108)
     $panel.BackColor = [System.Drawing.Color]::White
     $panel.BorderStyle = 'FixedSingle'
 
@@ -280,16 +311,17 @@ foreach ($module in $ModuleDefinitions) {
     $descriptionVi.Text = $module.DescriptionVi
     $descriptionVi.ForeColor = [System.Drawing.Color]::FromArgb(45, 70, 90)
     $descriptionVi.Location = New-Object System.Drawing.Point(38, 57)
-    $descriptionVi.Size = New-Object System.Drawing.Size(650, 22)
+    $descriptionVi.MaximumSize = New-Object System.Drawing.Size(650, 0)
+    $descriptionVi.AutoSize = $true
     $panel.Controls.Add($descriptionVi)
 
     $form.Controls.Add($panel)
     $checks[$module.Key] = $check
-    $top += 96
+    $top += 116
 }
 
 $status = New-Object System.Windows.Forms.Label
-$status.Location = New-Object System.Drawing.Point(30, 516)
+$status.Location = New-Object System.Drawing.Point(30, 590)
 $status.Size = New-Object System.Drawing.Size(700, 28)
 $status.ForeColor = [System.Drawing.Color]::FromArgb(30, 100, 60)
 $form.Controls.Add($status)
@@ -297,31 +329,31 @@ $form.Controls.Add($status)
 $applyButton = New-Object System.Windows.Forms.Button
 $applyButton.Text = 'Apply + Rebuild'
 $applyButton.Size = New-Object System.Drawing.Size(145, 42)
-$applyButton.Location = New-Object System.Drawing.Point(28, 557)
+$applyButton.Location = New-Object System.Drawing.Point(28, 632)
 $form.Controls.Add($applyButton)
 
 $allOnButton = New-Object System.Windows.Forms.Button
 $allOnButton.Text = 'Enable All'
 $allOnButton.Size = New-Object System.Drawing.Size(120, 42)
-$allOnButton.Location = New-Object System.Drawing.Point(183, 557)
+$allOnButton.Location = New-Object System.Drawing.Point(183, 632)
 $form.Controls.Add($allOnButton)
 
 $allOffButton = New-Object System.Windows.Forms.Button
 $allOffButton.Text = 'Disable All'
 $allOffButton.Size = New-Object System.Drawing.Size(120, 42)
-$allOffButton.Location = New-Object System.Drawing.Point(313, 557)
+$allOffButton.Location = New-Object System.Drawing.Point(313, 632)
 $form.Controls.Add($allOffButton)
 
 $validateButton = New-Object System.Windows.Forms.Button
 $validateButton.Text = 'Validate'
 $validateButton.Size = New-Object System.Drawing.Size(120, 42)
-$validateButton.Location = New-Object System.Drawing.Point(443, 557)
+$validateButton.Location = New-Object System.Drawing.Point(443, 632)
 $form.Controls.Add($validateButton)
 
 $closeButton = New-Object System.Windows.Forms.Button
 $closeButton.Text = 'Close'
 $closeButton.Size = New-Object System.Drawing.Size(159, 42)
-$closeButton.Location = New-Object System.Drawing.Point(573, 557)
+$closeButton.Location = New-Object System.Drawing.Point(573, 632)
 $form.Controls.Add($closeButton)
 
 function Show-ManagerError {
@@ -394,7 +426,8 @@ $validateButton.Add_Click({
         $state = Get-CurrentModuleState
         Invoke-CompositeBuild -State $state
         Assert-OneSkillBundle -Root $OutputRoot -DiscoveryRoot $SkillsRoot -ExpectedState $state
-        [System.Windows.Forms.MessageBox]::Show('PASS: one public skill, model-dispatcher, and module routing contract validated.', 'HMS Unified Skill Manager', 'OK', 'Information') | Out-Null
+        Assert-VietnameseLayoutCapacity
+        [System.Windows.Forms.MessageBox]::Show('PASS: one public skill, model-routing kernel, enabled-owner routing, and wrapped Vietnamese UI validated.', 'HMS Unified Skill Manager', 'OK', 'Information') | Out-Null
     }
     catch { Show-ManagerError -Message $_.Exception.Message }
 })
