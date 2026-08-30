@@ -34,7 +34,8 @@ $source = $source.Replace($needle, $replacement)
 
 # Serialize the complete write/verify/rollback transaction across processes.
 # The reviewed UTF-8 implementation remains the authoritative write body; this
-# shim renames it and injects one fail-closed cross-process wrapper.
+# shim renames it and injects one fail-closed cross-process wrapper after the
+# top-level declarations so [CmdletBinding()]/param remain the first statements.
 $writeNeedle = 'function Write-ModelState {'
 $writeOccurrences = [regex]::Matches($source, [regex]::Escape($writeNeedle)).Count
 if ($writeOccurrences -ne 1) {
@@ -69,7 +70,12 @@ function Write-ModelState {
     }
 }
 '@
-$source = $writerWrapper + "`r`n" + $source
+$insertMarker = 'function Assert-ResolverAvailable {'
+$insertOccurrences = [regex]::Matches($source, [regex]::Escape($insertMarker)).Count
+if ($insertOccurrences -ne 1) {
+    throw "Model settings wrapper insertion contract mismatch: expected one Assert-ResolverAvailable declaration, found $insertOccurrences."
+}
+$source = $source.Replace($insertMarker, $writerWrapper + "`r`n" + $insertMarker)
 
 try {
     $implementation = [ScriptBlock]::Create($source)
