@@ -557,8 +557,9 @@ try {
         try {
             if ($newActivated) {
                 if (Test-Path -LiteralPath $FinalRoot) {
-                    Assert-OwnedCompositeRoot -Path $FinalRoot
-                    Remove-Item -LiteralPath $FinalRoot -Recurse -Force
+                    # Rollback is destructive too: quarantine and revalidate the activated root
+                    # instead of recursively deleting a previously checked pathname.
+                    Remove-OwnedCompositeQuarantine -Path $FinalRoot
                 }
             }
             elseif (Test-Path -LiteralPath $FinalRoot) {
