@@ -167,7 +167,8 @@ try {
     if ($SkipThreeLevelDelivery) { $deliveryArgs.SkipThreeLevelDelivery = $true }
     & (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') @deliveryArgs
 
-    # Build-HmsCompositeSkill acquires the same mutex reentrantly on this thread.
+    # The builder acquires this named Mutex recursively on the same lifecycle thread.
+    # Both successful WaitOne calls are required to release exactly once; release failures are fatal below.
     & (Join-Path $InstallRoot 'scripts\Build-HmsCompositeSkill.ps1') -InstallRoot $InstallRoot -Hms ([bool]$state.hms) -Superpowers ([bool]$state.superpowers) -Taste ([bool]$state.taste) -Impeccable ([bool]$state.impeccable)
 
     Write-Host 'HMS Skills Codex update PASS.'
@@ -176,8 +177,18 @@ try {
     Write-Host 'Restart Codex if discovery does not refresh automatically.'
 }
 finally {
+    $mutexReleaseError = $null
     if ($mutexOwned) {
-        try { $buildMutex.ReleaseMutex() } catch { }
+        try {
+            $buildMutex.ReleaseMutex()
+            $mutexOwned = $false
+        }
+        catch {
+            $mutexReleaseError = $_
+        }
     }
     $buildMutex.Dispose()
+    if ($null -ne $mutexReleaseError) {
+        throw "Failed to release composite build lock after update lifecycle: $($mutexReleaseError.Exception.Message)"
+    }
 }

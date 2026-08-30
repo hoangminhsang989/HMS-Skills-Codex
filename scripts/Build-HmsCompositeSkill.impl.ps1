@@ -549,9 +549,30 @@ try {
     if ($enabled.Count -gt 0) { Write-Host "Codex discovery: $CompositeLink" } else { Write-Host 'Codex discovery disabled because no work modules are enabled.' }
 }
 finally {
-    if ($null -ne $stage -and (Test-Path -LiteralPath $stage)) { Remove-Item -LiteralPath $stage -Recurse -Force }
+    $stageCleanupError = $null
+    $mutexReleaseError = $null
+    if ($null -ne $stage -and (Test-Path -LiteralPath $stage)) {
+        try {
+            Remove-Item -LiteralPath $stage -Recurse -Force
+        }
+        catch {
+            $stageCleanupError = $_
+        }
+    }
     if ($mutexOwned) {
-        try { $buildMutex.ReleaseMutex() } catch { }
+        try {
+            $buildMutex.ReleaseMutex()
+            $mutexOwned = $false
+        }
+        catch {
+            $mutexReleaseError = $_
+        }
     }
     $buildMutex.Dispose()
+    if ($null -ne $mutexReleaseError) {
+        throw "Failed to release composite build lock after builder lifecycle: $($mutexReleaseError.Exception.Message)"
+    }
+    if ($null -ne $stageCleanupError) {
+        throw "Failed to clean staged composite after builder lifecycle: $($stageCleanupError.Exception.Message)"
+    }
 }

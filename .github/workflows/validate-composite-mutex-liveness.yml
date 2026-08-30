@@ -1,0 +1,155 @@
+name: Validate HMS composite mutex liveness
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  windows-mutex-liveness:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Prove post-lifecycle external lock acquisition and two-process build liveness
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedSha = $env:CANDIDATE_SHA.ToLowerInvariant()
+          $actualSha = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $actualSha -ne $expectedSha) {
+            throw "Workflow checkout identity mismatch. Expected $expectedSha, found $actualSha"
+          }
+
+          $buildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
+          $builderPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.ps1'
+
+          function Assert-ExternalMutexAcquire {
+            param([Parameter(Mandatory)][string]$Label)
+            $probe = Start-Job -ScriptBlock {
+              param($MutexName)
+              $ErrorActionPreference = 'Stop'
+              $mutex = New-Object System.Threading.Mutex($false, $MutexName)
+              $owned = $false
+              try {
+                try {
+                  $owned = $mutex.WaitOne([TimeSpan]::FromSeconds(10))
+                }
+                catch [System.Threading.AbandonedMutexException] {
+                  $owned = $true
+                }
+                if (-not $owned) { throw "Timed out acquiring composite build mutex from external process: $MutexName" }
+              }
+              finally {
+                if ($owned) {
+                  $mutex.ReleaseMutex()
+                  $owned = $false
+                }
+                $mutex.Dispose()
+              }
+            } -ArgumentList $buildMutexName
+            try {
+              $null = Wait-Job -Job $probe -Timeout 20
+              if ($probe.State -eq 'Completed') {
+                Receive-Job -Job $probe -ErrorAction Stop | Write-Host
+              }
+              elseif ($probe.State -eq 'Failed') {
+                Receive-Job -Job $probe -ErrorAction Stop | Write-Host
+                throw "External composite mutex probe failed after $Label."
+              }
+              else {
+                throw "External composite mutex probe did not complete after $Label. State=$($probe.State)"
+              }
+            }
+            finally {
+              Remove-Job -Job $probe -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "PASS: external process acquired and released composite mutex after $Label."
+          }
+
+          $runnerHome = $env:USERPROFILE
+          $originalHome = $env:HOME
+          $originalCodexHome = $env:CODEX_HOME
+          $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-mutex-liveness-' + [guid]::NewGuid().ToString('N'))
+          try {
+            $env:HOME = $runnerHome
+            $env:CODEX_HOME = Join-Path $runnerHome '.codex'
+
+            & "$env:GITHUB_WORKSPACE\install.ps1" `
+              -InstallRoot $env:GITHUB_WORKSPACE `
+              -SkipSuperpowers `
+              -SkipTaste `
+              -SkipImpeccable `
+              -SkipCodeGraph `
+              -SkipThreeLevelDelivery
+            Assert-ExternalMutexAcquire -Label 'install lifecycle'
+
+            $directOutput = Join-Path $tempRoot 'direct-composite'
+            $directSkills = Join-Path $tempRoot 'direct-skills'
+            & $builderPath `
+              -InstallRoot $env:GITHUB_WORKSPACE `
+              -OutputRoot $directOutput `
+              -SkillsRoot $directSkills `
+              -Hms $false `
+              -Superpowers $false `
+              -Taste $false `
+              -Impeccable $false
+            Assert-ExternalMutexAcquire -Label 'direct builder lifecycle'
+
+            $parallelOutput = Join-Path $tempRoot 'parallel-composite'
+            $parallelSkills = Join-Path $tempRoot 'parallel-skills'
+            $jobScript = {
+              param($Builder,$Install,$Output,$Skills,$HmsEnabled)
+              $ErrorActionPreference = 'Stop'
+              & $Builder `
+                -InstallRoot $Install `
+                -OutputRoot $Output `
+                -SkillsRoot $Skills `
+                -Hms ([bool]$HmsEnabled) `
+                -Superpowers $false `
+                -Taste $false `
+                -Impeccable $false
+            }
+            $jobs = @()
+            try {
+              $jobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$parallelOutput,$parallelSkills,$true
+              $jobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$parallelOutput,$parallelSkills,$false
+              $deadline = [DateTime]::UtcNow.AddSeconds(120)
+              while ([DateTime]::UtcNow -lt $deadline) {
+                foreach ($job in $jobs) { Receive-Job -Job $job -ErrorAction Stop | Write-Host }
+                if (@($jobs | Where-Object { $_.State -notin @('Completed','Failed','Stopped') }).Count -eq 0) { break }
+                Start-Sleep -Milliseconds 250
+              }
+              foreach ($job in $jobs) {
+                Receive-Job -Job $job -ErrorAction Stop | Write-Host
+                if ($job.State -ne 'Completed') {
+                  throw "Concurrent lightweight composite build job did not complete: Id=$($job.Id) State=$($job.State)"
+                }
+              }
+            }
+            finally {
+              foreach ($job in $jobs) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+            }
+
+            Assert-ExternalMutexAcquire -Label 'two-process composite build lifecycle'
+            $parallelManifestPath = Join-Path $parallelOutput 'hms-superpowers\manifest.json'
+            if (-not (Test-Path -LiteralPath $parallelManifestPath)) { throw 'Two-process build did not leave a composite manifest.' }
+            $leftovers = @(Get-ChildItem -LiteralPath $parallelOutput -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.stage-*' -or $_.Name -like '.backup-*' })
+            if ($leftovers.Count -ne 0) { throw 'Two-process build left stage/backup artifacts.' }
+
+            Write-Host 'PASS: composite mutex ownership is externally reacquirable after install/direct-build/two-process lifecycles; 120-second two-process liveness bound holds.'
+          }
+          finally {
+            if (Test-Path -LiteralPath $tempRoot) { Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue }
+            $env:HOME = $originalHome
+            $env:CODEX_HOME = $originalCodexHome
+          }
