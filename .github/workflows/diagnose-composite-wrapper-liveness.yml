@@ -20,7 +20,7 @@ jobs:
         with:
           ref: ${{ env.CANDIDATE_SHA }}
 
-      - name: Diagnose one public wrapper child without weakening liveness bounds
+      - name: Qualify Start-Process binary Git blob materialization inside Start-Job
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -30,98 +30,48 @@ jobs:
             throw "Workflow checkout identity mismatch. Expected $expectedSha, found $actualSha"
           }
 
-          $buildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
-          $builderPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.ps1'
-          $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-wrapper-diagnostic-' + [guid]::NewGuid().ToString('N'))
-          $pidMarker = Join-Path $tempRoot 'wrapper.pid'
+          $blob = (& git -C $env:GITHUB_WORKSPACE rev-parse "$expectedSha`:scripts/Build-HmsCompositeSkill.impl.ps1").Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $blob -notmatch '^[0-9a-f]{40}$') { throw 'Could not resolve implementation blob.' }
+          $gitExe = [string](Get-Command git -ErrorAction Stop).Source
+          $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-blob-redirection-' + [guid]::NewGuid().ToString('N'))
           New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
-
-          function Test-ExternalMutexAcquireNow {
-            param([Parameter(Mandatory)][string]$Label)
-            $mutex = New-Object System.Threading.Mutex($false, $buildMutexName)
-            $owned = $false
-            try {
-              try { $owned = $mutex.WaitOne([TimeSpan]::FromSeconds(10)) }
-              catch [System.Threading.AbandonedMutexException] { $owned = $true }
-              if ($owned) {
-                Write-Host "HMS_DIAG_MUTEX_FREE label=$Label utc=$([DateTime]::UtcNow.ToString('o'))"
-                return $true
-              }
-              Write-Host "HMS_DIAG_MUTEX_BUSY label=$Label utc=$([DateTime]::UtcNow.ToString('o'))"
-              return $false
-            }
-            finally {
-              if ($owned) { $mutex.ReleaseMutex() }
-              $mutex.Dispose()
-            }
-          }
-
-          function Show-ProcessTreeSnapshot {
-            param([Parameter(Mandatory)][int]$RootPid,[Parameter(Mandatory)][string]$Label)
-            Write-Host "HMS_DIAG_PROCESS_SNAPSHOT_BEGIN label=$Label root_pid=$RootPid"
-            $all = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine)
-            $queue = [System.Collections.Generic.Queue[int]]::new()
-            $queue.Enqueue($RootPid)
-            $seen = New-Object 'System.Collections.Generic.HashSet[int]'
-            while ($queue.Count -gt 0) {
-              $parent = $queue.Dequeue()
-              if (-not $seen.Add($parent)) { continue }
-              foreach ($proc in @($all | Where-Object { [int]$_.ParentProcessId -eq $parent })) {
-                Write-Host ("HMS_DIAG_PROCESS pid={0} ppid={1} name={2} cmd={3}" -f $proc.ProcessId,$proc.ParentProcessId,$proc.Name,$proc.CommandLine)
-                $queue.Enqueue([int]$proc.ProcessId)
-              }
-            }
-            Write-Host "HMS_DIAG_PROCESS_SNAPSHOT_END label=$Label"
-          }
+          $destination = Join-Path $tempRoot 'implementation.ps1'
+          $stderrPath = Join-Path $tempRoot 'git.stderr.txt'
 
           $job = $null
           try {
             $job = Start-Job -ScriptBlock {
-              param($Builder,$Install,$Output,$Skills,$PidMarker)
+              param($GitExe,$RepoRoot,$Blob,$Destination,$StderrPath)
               $ErrorActionPreference = 'Stop'
-              Set-Content -LiteralPath $PidMarker -Value ([string]$PID) -Encoding ascii
-              Write-Output "HMS_DIAG_WRAPPER_JOB_START pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
-              & $Builder `
-                -InstallRoot $Install `
-                -OutputRoot $Output `
-                -SkillsRoot $Skills `
-                -Hms $false `
-                -Superpowers $false `
-                -Taste $false `
-                -Impeccable $false
-              Write-Output "HMS_DIAG_WRAPPER_JOB_RETURN pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
-            } -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,(Join-Path $tempRoot 'output'),(Join-Path $tempRoot 'skills'),$pidMarker
+              Write-Output "HMS_BLOB_START pid=$PID blob=$Blob utc=$([DateTime]::UtcNow.ToString('o'))"
+              $process = Start-Process -FilePath $GitExe `
+                -ArgumentList @('cat-file','blob',$Blob) `
+                -WorkingDirectory $RepoRoot `
+                -NoNewWindow `
+                -Wait `
+                -PassThru `
+                -RedirectStandardOutput $Destination `
+                -RedirectStandardError $StderrPath
+              if ($process.ExitCode -ne 0) {
+                $stderr = if (Test-Path -LiteralPath $StderrPath) { Get-Content -LiteralPath $StderrPath -Raw } else { '' }
+                throw "git cat-file via Start-Process failed with exit code $($process.ExitCode): $stderr"
+              }
+              Write-Output "HMS_BLOB_RETURN pid=$PID blob=$Blob utc=$([DateTime]::UtcNow.ToString('o'))"
+            } -ArgumentList $gitExe,$env:GITHUB_WORKSPACE,$blob,$destination,$stderrPath
 
-            $markerDeadline = [DateTime]::UtcNow.AddSeconds(10)
-            while (-not (Test-Path -LiteralPath $pidMarker) -and [DateTime]::UtcNow -lt $markerDeadline) {
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            while ([DateTime]::UtcNow -lt $deadline -and $job.State -notin @('Completed','Failed','Stopped')) {
               Receive-Job -Job $job -ErrorAction Stop | Write-Host
               Start-Sleep -Milliseconds 100
             }
-            if (-not (Test-Path -LiteralPath $pidMarker)) { throw 'Wrapper child did not publish its PID marker within 10s.' }
-            $wrapperPid = [int]((Get-Content -LiteralPath $pidMarker -Raw).Trim())
             Receive-Job -Job $job -ErrorAction Stop | Write-Host
+            if ($job.State -ne 'Completed') { throw "Start-Process blob materialization did not complete within 15s. State=$($job.State)" }
 
-            Start-Sleep -Seconds 3
-            $mutexFreeAt3s = Test-ExternalMutexAcquireNow -Label 'single-wrapper-at-3s'
-            Write-Host "HMS_DIAG_WRAPPER_STATE t=3s state=$($job.State) mutex_free=$mutexFreeAt3s"
-            Show-ProcessTreeSnapshot -RootPid $wrapperPid -Label 'single-wrapper-at-3s'
-
-            $deadline = [DateTime]::UtcNow.AddSeconds(40)
-            while ([DateTime]::UtcNow -lt $deadline -and $job.State -notin @('Completed','Failed','Stopped')) {
-              Receive-Job -Job $job -ErrorAction Stop | Write-Host
-              Start-Sleep -Milliseconds 200
+            $actualBlob = (& git -C $env:GITHUB_WORKSPACE hash-object --no-filters -- $destination).Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $actualBlob -ne $blob) {
+              throw "Start-Process binary materialization mismatch. Expected $blob, found $actualBlob"
             }
-            Receive-Job -Job $job -ErrorAction Stop | Write-Host
-
-            if ($job.State -ne 'Completed') {
-              $mutexFreeAtFailure = Test-ExternalMutexAcquireNow -Label 'single-wrapper-before-fail'
-              Show-ProcessTreeSnapshot -RootPid $wrapperPid -Label 'single-wrapper-before-fail'
-              throw "Single public wrapper child failed bounded liveness. State=$($job.State); mutex_free_at_3s=$mutexFreeAt3s; mutex_free_before_fail=$mutexFreeAtFailure"
-            }
-            if (-not $mutexFreeAt3s) {
-              Write-Host 'HMS_DIAG_NOTE: wrapper held the composite mutex at the 3s probe but still completed within the existing bound.'
-            }
-            Write-Host 'PASS: single public wrapper child completed within existing bounded liveness diagnostic.'
+            Write-Host "PASS: Start-Process redirected git cat-file completed inside Start-Job and preserved exact blob $blob."
           }
           finally {
             if ($null -ne $job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
