@@ -1,0 +1,232 @@
+name: Validate HMS P1 trust boundaries
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  windows-p1-trust-boundaries:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Qualify literal bootstrap and destructive quarantine boundaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $expectedSha = $env:CANDIDATE_SHA.ToLowerInvariant()
+          $actualSha = ((& git -C $env:GITHUB_WORKSPACE rev-parse HEAD) -join '').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $actualSha -ne $expectedSha) {
+            throw "Workflow checkout identity mismatch. Expected $expectedSha, found $actualSha"
+          }
+
+          $builderPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.ps1'
+          $implPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.impl.ps1'
+          $uninstallPath = Join-Path $env:GITHUB_WORKSPACE 'uninstall.ps1'
+          foreach ($path in @($builderPath,$implPath,$uninstallPath)) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors) | Out-Null
+            if (@($errors).Count -ne 0) { throw "PowerShell parser rejected $path : $((@($errors) | ForEach-Object Message) -join ' | ')" }
+          }
+
+          $builderText = [IO.File]::ReadAllText($builderPath)
+          $implText = [IO.File]::ReadAllText($implPath)
+          $uninstallText = [IO.File]::ReadAllText($uninstallPath)
+          foreach ($literal in @(
+            'hash-object --no-filters -- $resolvedCandidate',
+            'hash-object --no-filters -- $PSCommandPath'
+          )) {
+            if ($builderText -notmatch [regex]::Escape($literal)) { throw "Public bootstrap is missing literal-byte trust primitive: $literal" }
+          }
+          if ($builderText -match 'hash-object\s+"--path=\$relative"' -or $builderText -match 'hash-object\s+"--path=\$selfRelative"') {
+            throw 'Public bootstrap still authorizes executable bytes through Git clean/path filters.'
+          }
+          foreach ($literal in @(
+            'Remove-OwnedCompositeQuarantine',
+            'Assert-OwnedCompositeRoot -Path $backup',
+            '.hms-composite-deleting-'
+          )) {
+            if ($implText -notmatch [regex]::Escape($literal)) { throw "Composite builder is missing quarantine trust boundary: $literal" }
+          }
+          foreach ($literal in @(
+            'Remove-VerifiedCompositeRoot',
+            '.hms-composite-removing-',
+            'Assert-OwnedCompositeRoot -Path $quarantine'
+          )) {
+            if ($uninstallText -notmatch [regex]::Escape($literal)) { throw "Uninstaller is missing composite quarantine trust boundary: $literal" }
+          }
+          if ($uninstallText -match [regex]::Escape("Remove-VerifiedDirectory -Path `$compositeRoot")) {
+            throw 'Uninstaller still recursively deletes the composite through the preflight pathname.'
+          }
+          Write-Host 'PASS: committed source contains literal bootstrap hashing and explicit composite quarantine/revalidation boundaries.'
+
+          # P1 regression 1: prove the historical Git-clean-filter forgery premise, then prove the
+          # public bootstrap rejects the altered literal bytes even though --path would authorize them.
+          $selfRelative = 'scripts/Build-HmsCompositeSkill.ps1'
+          $expectedSelf = ((& git -C $env:GITHUB_WORKSPACE rev-parse "$expectedSha`:$selfRelative") -join '').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $expectedSelf -notmatch '^[0-9a-f]{40}$') { throw 'Could not resolve committed public-bootstrap blob.' }
+          $infoAttributes = Join-Path $env:GITHUB_WORKSPACE '.git\info\attributes'
+          $hadAttributes = Test-Path -LiteralPath $infoAttributes
+          $originalAttributes = if ($hadAttributes) { [IO.File]::ReadAllText($infoAttributes) } else { $null }
+          $originalBuilder = [IO.File]::ReadAllBytes($builderPath)
+          try {
+            & git -C $env:GITHUB_WORKSPACE config filter.hms-bootstrap-mask.clean "git cat-file blob $expectedSelf"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not configure adversarial bootstrap clean filter.' }
+            [IO.File]::WriteAllText($infoAttributes, "$selfRelative filter=hms-bootstrap-mask`n", (New-Object System.Text.UTF8Encoding($false)))
+            [IO.File]::AppendAllText($builderPath, "`n# HMS_P1_FILTER_FORGERY_SENTINEL`n", (New-Object System.Text.UTF8Encoding($false)))
+
+            $filtered = ((& git -C $env:GITHUB_WORKSPACE hash-object "--path=$selfRelative" -- $builderPath) -join '').Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $filtered -cne $expectedSelf) {
+              throw "Adversarial clean-filter premise was not reproduced. Expected --path hash $expectedSelf, found $filtered"
+            }
+            $literal = ((& git -C $env:GITHUB_WORKSPACE hash-object --no-filters -- $builderPath) -join '').Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $literal -eq $expectedSelf) { throw 'Literal hash unexpectedly accepted altered public-bootstrap bytes.' }
+
+            $rejected = $false
+            $tempOutput = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-filter-output-' + [guid]::NewGuid().ToString('N'))
+            $tempSkills = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-filter-skills-' + [guid]::NewGuid().ToString('N'))
+            try {
+              & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -OutputRoot $tempOutput -SkillsRoot $tempSkills -Hms $false -Superpowers $false -Taste $false -Impeccable $false
+            }
+            catch {
+              if ($_.Exception.Message -match 'Public composite bootstrap bytes do not match HMS HEAD') { $rejected = $true }
+              else { throw }
+            }
+            finally {
+              Remove-Item -LiteralPath $tempOutput -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-Item -LiteralPath $tempSkills -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            if (-not $rejected) { throw 'Public bootstrap accepted altered bytes hidden behind a Git clean filter.' }
+          }
+          finally {
+            [IO.File]::WriteAllBytes($builderPath,$originalBuilder)
+            & git -C $env:GITHUB_WORKSPACE config --unset-all filter.hms-bootstrap-mask.clean 2>$null
+            if ($hadAttributes) { [IO.File]::WriteAllText($infoAttributes,$originalAttributes,(New-Object System.Text.UTF8Encoding($false))) }
+            else { Remove-Item -LiteralPath $infoAttributes -Force -ErrorAction SilentlyContinue }
+          }
+          Write-Host 'PASS: Git clean-filter forgery can fool --path hashing but cannot authorize altered public-bootstrap literal bytes.'
+
+          # P1 regression 2: replace FinalRoot after builder preflight but after staging starts.
+          # New code must quarantine the raced pathname, reject its missing ownership, and restore it;
+          # old code would activate the new stage and recursively delete the foreign backup.
+          $raceRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-builder-race-' + [guid]::NewGuid().ToString('N'))
+          $raceOutput = Join-Path $raceRoot 'output'
+          $raceSkills = Join-Path $raceRoot 'skills'
+          $finalRoot = Join-Path $raceOutput 'hms-superpowers'
+          $displacedOwned = Join-Path $raceOutput 'owned-displaced-by-test'
+          $foreignSentinel = Join-Path $finalRoot 'FOREIGN-PRESERVE.txt'
+          $watcher = $null
+          try {
+            & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -OutputRoot $raceOutput -SkillsRoot $raceSkills -Hms $false -Superpowers $false -Taste $false -Impeccable $false
+            if (-not (Test-Path -LiteralPath (Join-Path $finalRoot 'manifest.json'))) { throw 'Builder race baseline composite is missing.' }
+
+            $watcher = Start-Job -ScriptBlock {
+              param($OutputRoot,$FinalRoot,$Displaced,$ForeignSentinel)
+              $ErrorActionPreference='Stop'
+              $deadline=[DateTime]::UtcNow.AddSeconds(30)
+              while ([DateTime]::UtcNow -lt $deadline) {
+                $stage = @(Get-ChildItem -LiteralPath $OutputRoot -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.stage-*' })
+                if ($stage.Count -gt 0) { break }
+                Start-Sleep -Milliseconds 5
+              }
+              if (@(Get-ChildItem -LiteralPath $OutputRoot -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.stage-*' }).Count -eq 0) { throw 'Builder race watcher never observed staged materialization.' }
+              Rename-Item -LiteralPath $FinalRoot -NewName (Split-Path -Leaf $Displaced) -ErrorAction Stop
+              New-Item -ItemType Directory -Force -Path $FinalRoot | Out-Null
+              Set-Content -LiteralPath $ForeignSentinel -Value 'foreign replacement must survive' -Encoding UTF8
+            } -ArgumentList $raceOutput,$finalRoot,$displacedOwned,$foreignSentinel
+
+            $raceRejected = $false
+            try {
+              & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -OutputRoot $raceOutput -SkillsRoot $raceSkills -Hms $false -Superpowers $false -Taste $false -Impeccable $false
+            }
+            catch {
+              if ($_.Exception.Message -match 'unowned composite|unexpected ownership|non-directory|reparse point') { $raceRejected = $true }
+              else { throw }
+            }
+            $null = Wait-Job -Job $watcher -Timeout 30
+            if ($watcher.State -ne 'Completed') { throw "Builder race watcher failed. State=$($watcher.State)" }
+            Receive-Job -Job $watcher -ErrorAction Stop | Out-Null
+            if (-not $raceRejected) { throw 'Builder did not fail closed after FinalRoot was replaced between preflight and quarantine rename.' }
+            if (-not (Test-Path -LiteralPath $foreignSentinel)) { throw 'Builder deleted or failed to restore the foreign FinalRoot replacement.' }
+            if (-not (Test-Path -LiteralPath (Join-Path $displacedOwned 'manifest.json'))) { throw 'Builder race setup lost the displaced previously-owned composite.' }
+            $leftovers = @(Get-ChildItem -LiteralPath $raceOutput -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.backup-*' -or $_.Name -like '.hms-composite-deleting-*' })
+            if ($leftovers.Count -ne 0) { throw 'Builder race remediation left backup/deletion quarantine artifacts.' }
+          }
+          finally {
+            if ($null -ne $watcher) { Remove-Job -Job $watcher -Force -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $raceRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host 'PASS: builder revalidates the renamed previous composite and preserves a foreign FinalRoot replacement.'
+
+          # P1 regression 3: execute the actual uninstall composite-removal function in an isolated
+          # advanced-script harness. A replacement created after quarantine rename must survive at
+          # the original pathname while only the verified random quarantine is deleted.
+          $tokens=$null; $parseErrors=$null
+          $ast=[System.Management.Automation.Language.Parser]::ParseFile($uninstallPath,[ref]$tokens,[ref]$parseErrors)
+          if (@($parseErrors).Count -ne 0) { throw 'Could not parse uninstall script for function-level destructive-boundary regression.' }
+          $needed = @('Assert-SafeRemovalPath','Assert-OwnedCompositeRoot','Restore-Quarantine','Remove-VerifiedCompositeRoot')
+          $defs = foreach ($name in $needed) {
+            $node = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name },$true))
+            if ($node.Count -ne 1) { throw "Expected exactly one uninstall function '$name', found $($node.Count)." }
+            $node[0].Extent.Text
+          }
+          $harnessPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-uninstall-harness-' + [guid]::NewGuid().ToString('N') + '.ps1')
+          $harnessRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-uninstall-root-' + [guid]::NewGuid().ToString('N'))
+          $definitionText = $defs -join "`r`n`r`n"
+          $harness = @"
+          [CmdletBinding(SupportsShouldProcess)]
+          param([Parameter(Mandatory)][string]`$TestHome)
+          Set-StrictMode -Version Latest
+          `$ErrorActionPreference='Stop'
+          `$env:USERPROFILE=`$TestHome
+          `$compositeRoot = Join-Path `$TestHome '.codex\hms-composite\hms-superpowers'
+          $definitionText
+          New-Item -ItemType Directory -Force -Path `$compositeRoot | Out-Null
+          `$manifest=[ordered]@{schema_version=1;managed_by='HMS-Skills-Codex';artifact='hms-superpowers-composite';modules=[ordered]@{hms=`$false;superpowers=`$false;taste=`$false;impeccable=`$false}}
+          `$manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path `$compositeRoot 'manifest.json') -Encoding UTF8
+          Set-Content -LiteralPath (Join-Path `$compositeRoot 'OWNED.txt') -Value 'owned quarantine' -Encoding UTF8
+          `$foreignSentinel=Join-Path `$compositeRoot 'FOREIGN-PRESERVE.txt'
+          `$watcher=Start-Job -ScriptBlock {
+            param(`$Original,`$Sentinel)
+            `$ErrorActionPreference='Stop'
+            `$deadline=[DateTime]::UtcNow.AddSeconds(20)
+            while ((Test-Path -LiteralPath `$Original) -and [DateTime]::UtcNow -lt `$deadline) { Start-Sleep -Milliseconds 2 }
+            if (Test-Path -LiteralPath `$Original) { throw 'Composite quarantine rename was never observed.' }
+            New-Item -ItemType Directory -Force -Path `$Original | Out-Null
+            Set-Content -LiteralPath `$Sentinel -Value 'foreign replacement must survive' -Encoding UTF8
+          } -ArgumentList `$compositeRoot,`$foreignSentinel
+          try {
+            Remove-VerifiedCompositeRoot -Path `$compositeRoot -Action 'P1 regression composite removal'
+            `$null=Wait-Job -Job `$watcher -Timeout 20
+            if (`$watcher.State -ne 'Completed') { throw "Composite replacement watcher failed. State=`$(`$watcher.State)" }
+            Receive-Job -Job `$watcher -ErrorAction Stop | Out-Null
+            if (-not (Test-Path -LiteralPath `$foreignSentinel)) { throw 'Foreign replacement at original composite pathname was deleted.' }
+            `$parent=Split-Path -Parent `$compositeRoot
+            `$leftovers=@(Get-ChildItem -LiteralPath `$parent -Force -ErrorAction SilentlyContinue | Where-Object { `$_.Name -like '.hms-composite-removing-*' })
+            if (`$leftovers.Count -ne 0) { throw 'Composite uninstall quarantine left residue.' }
+          }
+          finally { Remove-Job -Job `$watcher -Force -ErrorAction SilentlyContinue }
+          "@ 
+          [IO.File]::WriteAllText($harnessPath,$harness,(New-Object System.Text.UTF8Encoding($false)))
+          try {
+            & $harnessPath -TestHome $harnessRoot
+            if ($LASTEXITCODE -ne 0) { throw "Composite uninstall harness failed with exit code $LASTEXITCODE." }
+          }
+          finally {
+            Remove-Item -LiteralPath $harnessPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $harnessRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host 'PASS: uninstall composite deletion quarantines/revalidates the exact owned root and preserves a foreign replacement pathname.'
+
+          Write-Host 'PASS: all three remediated P1 trust boundaries are qualified on exact candidate HEAD.'
