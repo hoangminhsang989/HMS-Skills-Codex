@@ -330,7 +330,33 @@ function Repair-CodeGraphRollbackState {
     $backupActivated = $false
     $candidatePreserved = $false
     $currentBundleState = 'absent'
-    $canRestorePrevious = $HadPrevious -and $null -ne $BackupIdentity -and -not [string]::IsNullOrWhiteSpace($BackupPath) -and (Test-Path -LiteralPath $BackupPath)
+    $canRestorePrevious = $false
+    $reservedBackupPath = $null
+
+    if ($HadPrevious -and $null -ne $BackupIdentity -and -not [string]::IsNullOrWhiteSpace($BackupPath) -and (Test-Path -LiteralPath $BackupPath)) {
+        try {
+            Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity
+            $reserveLeaf = '.hms-codegraph-rollback-reserved-' + [guid]::NewGuid().ToString('N')
+            $reservedBackupPath = Join-Path (Split-Path -Parent $BackupPath) $reserveLeaf
+            Rename-Item -LiteralPath $BackupPath -NewName $reserveLeaf -ErrorAction Stop
+            Assert-CodeGraphTransactionBundle -Path $reservedBackupPath -Identity $BackupIdentity
+            $canRestorePrevious = $true
+        }
+        catch {
+            $rollbackErrors += "CodeGraph backup reservation failed before candidate removal: $($_.Exception.Message)"
+            if ($null -ne $reservedBackupPath -and (Test-Path -LiteralPath $reservedBackupPath) -and -not (Test-Path -LiteralPath $BackupPath)) {
+                try {
+                    Assert-CodeGraphTransactionBundle -Path $reservedBackupPath -Identity $BackupIdentity
+                    Rename-Item -LiteralPath $reservedBackupPath -NewName (Split-Path -Leaf $BackupPath) -ErrorAction Stop
+                    Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity
+                    $reservedBackupPath = $null
+                }
+                catch {
+                    $rollbackErrors += "CodeGraph backup reservation rollback failed: $($_.Exception.Message)"
+                }
+            }
+        }
+    }
 
     if ($canRestorePrevious -or -not $HadPrevious) {
         try {
@@ -350,13 +376,26 @@ function Repair-CodeGraphRollbackState {
         }
     }
 
+    if ($canRestorePrevious -and -not $candidateRemovalCompleted -and $null -ne $reservedBackupPath -and (Test-Path -LiteralPath $reservedBackupPath)) {
+        try {
+            Assert-CodeGraphTransactionBundle -Path $reservedBackupPath -Identity $BackupIdentity
+            if (Test-Path -LiteralPath $BackupPath) { throw "Cannot return reserved CodeGraph backup because the original backup pathname became occupied: $BackupPath" }
+            Rename-Item -LiteralPath $reservedBackupPath -NewName (Split-Path -Leaf $BackupPath) -ErrorAction Stop
+            Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity
+            $reservedBackupPath = $null
+        }
+        catch { $rollbackErrors += "CodeGraph reserved backup could not be returned after candidate preservation: $($_.Exception.Message)" }
+    }
+
     if ($canRestorePrevious -and $candidateRemovalCompleted) {
         try {
-            if (-not (Test-Path -LiteralPath $BackupPath)) { throw "CodeGraph backup disappeared before rollback activation: $BackupPath" }
+            if ($null -eq $reservedBackupPath -or -not (Test-Path -LiteralPath $reservedBackupPath)) { throw 'CodeGraph reserved backup disappeared before rollback activation.' }
+            Assert-CodeGraphTransactionBundle -Path $reservedBackupPath -Identity $BackupIdentity
             if (Test-Path -LiteralPath $CurrentPath) { throw "Cannot restore CodeGraph backup because current became occupied: $CurrentPath" }
-            Move-Item -LiteralPath $BackupPath -Destination $CurrentPath
+            Move-Item -LiteralPath $reservedBackupPath -Destination $CurrentPath
             Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
             $backupActivated = $true
+            $reservedBackupPath = $null
         }
         catch { $rollbackErrors += $_.Exception.Message }
     }
@@ -409,6 +448,7 @@ function Repair-CodeGraphRollbackState {
         BackupActivated = $backupActivated
         CandidatePreserved = $candidatePreserved
         CurrentBundleState = $currentBundleState
+        ReservedBackupPath = $reservedBackupPath
     }
 }
 
@@ -419,6 +459,25 @@ function Assert-CodeGraphBundleAgainstManifest {
         if ([string]::IsNullOrWhiteSpace([string]$Manifest.$field)) { throw "Managed CodeGraph manifest is missing '$field'." }
     }
     Assert-CodeGraphVersion -CommandPath (Join-Path $Path 'bin\codegraph.cmd') -ExpectedVersion ([string]$Manifest.version)
+}
+
+function Move-CodeGraphCurrentToRollbackBackup {
+    param(
+        [Parameter(Mandatory)][string]$CurrentPath,
+        [Parameter(Mandatory)][string]$BackupPath,
+        [Parameter(Mandatory)]$ExistingManifest,
+        [Parameter(Mandatory)]$BackupIdentity
+    )
+    if (-not (Test-Path -LiteralPath $CurrentPath)) { throw "CodeGraph current bundle disappeared before backup preparation: $CurrentPath" }
+    if (Test-Path -LiteralPath $BackupPath) { throw "CodeGraph rollback backup path is already occupied: $BackupPath" }
+
+    # Qualify and transaction-mark the active previous bundle before crossing the rename boundary.
+    # Version/marker failures therefore leave the existing current pathname untouched.
+    Assert-CodeGraphBundleAgainstManifest -Path $CurrentPath -Manifest $ExistingManifest
+    Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $BackupIdentity
+    Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
+    Move-Item -LiteralPath $CurrentPath -Destination $BackupPath
+    Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity
 }
 
 function Sync-CodeGraphBundle {
@@ -487,18 +546,14 @@ function Sync-CodeGraphBundle {
             Assert-CodeGraphTransactionBundle -Path $candidate -Identity $candidateIdentity
 
             New-Item -ItemType Directory -Force -Path $CodeGraphRoot | Out-Null
-            if (Test-Path -LiteralPath $current) {
-                if ($null -eq $existingManifest) { throw 'Existing CodeGraph current bundle has no HMS ownership manifest.' }
-                $backup = Join-Path $CodeGraphRoot ("backup-" + [guid]::NewGuid().ToString('N'))
-                Move-Item -LiteralPath $current -Destination $backup
-                # The old pathname is no longer destructive authority. Revalidate the exact renamed
-                # old bundle against the HMS root manifest, then bind a transaction marker to it.
-                Assert-CodeGraphBundleAgainstManifest -Path $backup -Manifest $existingManifest
-                $backupIdentity = New-CodeGraphBundleIdentity -TransactionId $transactionId -Role 'backup' -Version ([string]$existingManifest.version) -Tag ([string]$existingManifest.tag) -Commit ([string]$existingManifest.commit) -Asset ([string]$existingManifest.asset) -Sha256 ([string]$existingManifest.sha256)
-                Write-CodeGraphBundleMarker -Path $backup -Identity $backupIdentity
-                Assert-CodeGraphTransactionBundle -Path $backup -Identity $backupIdentity
-            }
             try {
+                if (Test-Path -LiteralPath $current) {
+                    if ($null -eq $existingManifest) { throw 'Existing CodeGraph current bundle has no HMS ownership manifest.' }
+                    $backup = Join-Path $CodeGraphRoot ("backup-" + [guid]::NewGuid().ToString('N'))
+                    $backupIdentity = New-CodeGraphBundleIdentity -TransactionId $transactionId -Role 'backup' -Version ([string]$existingManifest.version) -Tag ([string]$existingManifest.tag) -Commit ([string]$existingManifest.commit) -Asset ([string]$existingManifest.asset) -Sha256 ([string]$existingManifest.sha256)
+                    Move-CodeGraphCurrentToRollbackBackup -CurrentPath $current -BackupPath $backup -ExistingManifest $existingManifest -BackupIdentity $backupIdentity
+                }
+
                 Move-Item -LiteralPath $candidate -Destination $current
                 Assert-CodeGraphTransactionBundle -Path $current -Identity $candidateIdentity
                 Assert-CodeGraphVersion -CommandPath $command -ExpectedVersion ([string]$Spec.version)
