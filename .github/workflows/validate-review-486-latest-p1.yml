@@ -85,22 +85,28 @@ jobs:
             'manifestPublished',
             '$candidateRemovalCompleted',
             '$backupActivated',
-            '$currentBundleState'
+            '$currentBundleState',
+            '-PreviousIdentity $previousIdentity',
+            'bundle_transaction_id',
+            'bundle_tree_sha256'
           )){if($deliveryText -notmatch [regex]::Escape($literal)){throw "CodeGraph rollback boundary is missing: $literal"}}
           if($deliveryText -match [regex]::Escape('if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }')){throw 'CodeGraph temp root still uses pathname recursive deletion.'}
           if($deliveryText -match [regex]::Escape('if ($rollbackErrors.Count -eq 0 -and $manifestPublished)')){throw 'Superseded aggregate-error manifest gate is still present.'}
-          if($deliveryText -notmatch [regex]::Escape('Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup')){throw 'Sync-CodeGraphBundle does not delegate rollback state adjudication to the durable-state helper.'}
 
           function Get-FunctionText{
             param([string]$Path,[string[]]$Names)
             $t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$t,[ref]$e)
             if(@($e).Count){throw "Could not parse function source: $Path"}
             $texts=@()
-            foreach($name in $Names){$nodes=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name},$true));if($nodes.Count -ne 1){throw "Expected one function '$name', found $($nodes.Count)."};$texts+=$nodes[0].Extent.Text}
+            foreach($name in $Names){
+              $nodes=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name},$true))
+              if($nodes.Count -ne 1){throw "Expected one function '$name', found $($nodes.Count)."}
+              $texts+=$nodes[0].Extent.Text
+            }
             return ($texts -join "`r`n`r`n")
           }
+
           $defs=Get-FunctionText -Path $delivery -Names @(
-            'Assert-CodeGraphVersion',
             'Assert-RegularCodeGraphBundle',
             'Add-CodeGraphBundleTreeRecords',
             'Get-CodeGraphBundleTreeSha256',
@@ -114,6 +120,7 @@ jobs:
             'Restore-CodeGraphManifestAfterFailure',
             'Repair-CodeGraphRollbackState'
           )
+
           $harness=Join-Path $env:RUNNER_TEMP ('hms-review486-codegraph-'+[guid]::NewGuid().ToString('N')+'.ps1')
           $testRoot=Join-Path $env:RUNNER_TEMP ('hms-review486-root-'+[guid]::NewGuid().ToString('N'))
           $script=@"
@@ -133,27 +140,40 @@ jobs:
             Assert-CodeGraphTransactionBundle -Path `$Path -Identity `$Identity
           }
 
-          function New-TestManifests {
-            param([string]`$OldVersion,[string]`$NewVersion)
-            `$old=[ordered]@{managed_by='HMS-Skills-Codex';version=`$OldVersion;tag=('v-'+`$OldVersion);commit=('c-'+`$OldVersion);asset=('a-'+`$OldVersion);sha256=('s-'+`$OldVersion)}
-            `$new=[ordered]@{managed_by='HMS-Skills-Codex';version=`$NewVersion;tag=('v-'+`$NewVersion);commit=('c-'+`$NewVersion);asset=('a-'+`$NewVersion);sha256=('s-'+`$NewVersion)}
-            return [pscustomobject]@{Old=`$old;New=`$new;OldBytes=(New-Object Text.UTF8Encoding(`$false)).GetBytes((`$old|ConvertTo-Json -Compress))}
+          function New-ManifestFromIdentity {
+            param(`$Identity)
+            return [ordered]@{
+              managed_by='HMS-Skills-Codex'
+              version=[string]`$Identity.version
+              tag=[string]`$Identity.tag
+              commit=[string]`$Identity.commit
+              asset=[string]`$Identity.asset
+              sha256=[string]`$Identity.sha256
+              bundle_transaction_id=[string]`$Identity.transaction_id
+              bundle_tree_sha256=[string]`$Identity.bundle_tree_sha256
+            }
           }
 
           New-Item -ItemType Directory -Force -Path `$Root|Out-Null
 
-          # Scenario 1: candidate deletion has already crossed its destructive rename and partially failed.
-          # The old backup is still restorable. Rollback must reactivate the old bundle and restore the old manifest
-          # even though the candidate cleanup error remains reportable.
+          # Scenario 1: candidate deletion crosses its destructive rename, then reports an error.
+          # The exact previous bundle is already represented as the new transaction's backup role.
+          # Rollback must reserve that exact tree, restore it, rewrite its original candidate-role marker,
+          # restore the previous manifest bytes, and retain the partial candidate cleanup error as evidence.
           `$case1=Join-Path `$Root 'partial-candidate-delete';New-Item -ItemType Directory -Force -Path `$case1|Out-Null
           `$CodeGraphManifest=Join-Path `$case1 'hms-codegraph-install.json'
-          `$m1=New-TestManifests -OldVersion 'old1' -NewVersion 'new1'
-          `$candidate1=New-CodeGraphBundleIdentity -TransactionId 'tx1' -Role 'candidate' -Version 'new1' -Tag 'v-new1' -Commit 'c-new1' -Asset 'a-new1' -Sha256 's-new1'
-          `$backup1id=New-CodeGraphBundleIdentity -TransactionId 'tx1' -Role 'backup' -Version 'old1' -Tag 'v-old1' -Commit 'c-old1' -Asset 'a-old1' -Sha256 's-old1'
           `$current1=Join-Path `$case1 'current';`$backup1=Join-Path `$case1 'backup'
+          `$previous1=New-CodeGraphBundleIdentity -TransactionId '11111111111111111111111111111111' -Role 'candidate' -Version 'old1' -Tag 'v-old1' -Commit 'c-old1' -Asset 'a-old1' -Sha256 's-old1'
+          New-TestBundle -Path `$backup1 -Identity `$previous1
+          `$backup1id=New-CodeGraphBundleIdentity -TransactionId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' -Role 'backup' -Version 'old1' -Tag 'v-old1' -Commit 'c-old1' -Asset 'a-old1' -Sha256 's-old1' -BundleTreeSha256 ([string]`$previous1.bundle_tree_sha256)
+          Write-CodeGraphBundleMarker -Path `$backup1 -Identity `$backup1id
+          Assert-CodeGraphTransactionBundle -Path `$backup1 -Identity `$backup1id
+          `$candidate1=New-CodeGraphBundleIdentity -TransactionId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' -Role 'candidate' -Version 'new1' -Tag 'v-new1' -Commit 'c-new1' -Asset 'a-new1' -Sha256 's-new1'
           New-TestBundle -Path `$current1 -Identity `$candidate1
-          New-TestBundle -Path `$backup1 -Identity `$backup1id
-          [IO.File]::WriteAllText(`$CodeGraphManifest,(`$m1.New|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
+          `$oldManifest1=New-ManifestFromIdentity -Identity `$previous1
+          `$newManifest1=New-ManifestFromIdentity -Identity `$candidate1
+          `$oldBytes1=(New-Object Text.UTF8Encoding(`$false)).GetBytes((`$oldManifest1|ConvertTo-Json -Compress))
+          [IO.File]::WriteAllText(`$CodeGraphManifest,(`$newManifest1|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
           `$partialCandidate=Join-Path `$case1 '.hms-codegraph-deleting-injected-candidate'
           `$injectCandidateFailure={
             param(`$Path,`$Identity)
@@ -161,48 +181,67 @@ jobs:
             Remove-Item -LiteralPath (Join-Path `$partialCandidate 'bin\codegraph.cmd') -Force
             throw 'INJECTED_CANDIDATE_PARTIAL_DELETE'
           }
-          `$r1=Repair-CodeGraphRollbackState -CurrentPath `$current1 -BackupPath `$backup1 -CandidateIdentity `$candidate1 -BackupIdentity `$backup1id -ManifestPublished `$true -PublishedManifest `$m1.New -PreviousManifestBytes `$m1.OldBytes -HadPrevious `$true -CandidateRemovalAction `$injectCandidateFailure
+          `$r1=Repair-CodeGraphRollbackState -CurrentPath `$current1 -BackupPath `$backup1 -CandidateIdentity `$candidate1 -BackupIdentity `$backup1id -PreviousIdentity `$previous1 -ManifestPublished `$true -PublishedManifest `$newManifest1 -PreviousManifestBytes `$oldBytes1 -HadPrevious `$true -CandidateRemovalAction `$injectCandidateFailure
           if(`$r1.CurrentBundleState -cne 'previous' -or -not `$r1.BackupActivated -or -not `$r1.CandidateRemovalCompleted){throw 'Partial candidate deletion did not adjudicate to the restored previous bundle.'}
           if((@(`$r1.RollbackErrors)-join ' | ') -notmatch 'INJECTED_CANDIDATE_PARTIAL_DELETE'){throw 'Injected partial candidate cleanup failure was not retained as rollback evidence.'}
-          Assert-CodeGraphTransactionBundle -Path `$current1 -Identity `$backup1id
-          if([Convert]::ToBase64String([IO.File]::ReadAllBytes(`$CodeGraphManifest)) -cne [Convert]::ToBase64String(`$m1.OldBytes)){throw 'Old manifest bytes were not restored after the old bundle became active.'}
+          Assert-CodeGraphTransactionBundle -Path `$current1 -Identity `$previous1
+          if([Convert]::ToBase64String([IO.File]::ReadAllBytes(`$CodeGraphManifest)) -cne [Convert]::ToBase64String(`$oldBytes1)){throw 'Old manifest bytes were not restored after the old bundle became active.'}
           if(-not(Test-Path -LiteralPath `$partialCandidate)){throw 'Partial candidate quarantine unexpectedly disappeared from the failure harness.'}
 
-          # Scenario 2: old backup cleanup has already crossed its destructive rename, so the backup pathname is gone.
-          # Rollback must not delete the verified candidate and must not restore old metadata over that candidate.
+          # Scenario 2: the old backup cleanup has already crossed its destructive rename, so the exact
+          # previous bundle is unavailable at BackupPath. Rollback must preserve the verified candidate,
+          # must not invoke candidate removal, and must leave the candidate manifest authoritative.
           `$case2=Join-Path `$Root 'partial-backup-delete';New-Item -ItemType Directory -Force -Path `$case2|Out-Null
           `$CodeGraphManifest=Join-Path `$case2 'hms-codegraph-install.json'
-          `$m2=New-TestManifests -OldVersion 'old2' -NewVersion 'new2'
-          `$candidate2=New-CodeGraphBundleIdentity -TransactionId 'tx2' -Role 'candidate' -Version 'new2' -Tag 'v-new2' -Commit 'c-new2' -Asset 'a-new2' -Sha256 's-new2'
-          `$backup2id=New-CodeGraphBundleIdentity -TransactionId 'tx2' -Role 'backup' -Version 'old2' -Tag 'v-old2' -Commit 'c-old2' -Asset 'a-old2' -Sha256 's-old2'
           `$current2=Join-Path `$case2 'current';`$backup2=Join-Path `$case2 'backup'
+          `$previous2=New-CodeGraphBundleIdentity -TransactionId '22222222222222222222222222222222' -Role 'candidate' -Version 'old2' -Tag 'v-old2' -Commit 'c-old2' -Asset 'a-old2' -Sha256 's-old2'
+          New-TestBundle -Path `$backup2 -Identity `$previous2
+          `$backup2id=New-CodeGraphBundleIdentity -TransactionId 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -Role 'backup' -Version 'old2' -Tag 'v-old2' -Commit 'c-old2' -Asset 'a-old2' -Sha256 's-old2' -BundleTreeSha256 ([string]`$previous2.bundle_tree_sha256)
+          Write-CodeGraphBundleMarker -Path `$backup2 -Identity `$backup2id
+          Assert-CodeGraphTransactionBundle -Path `$backup2 -Identity `$backup2id
+          `$candidate2=New-CodeGraphBundleIdentity -TransactionId 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -Role 'candidate' -Version 'new2' -Tag 'v-new2' -Commit 'c-new2' -Asset 'a-new2' -Sha256 's-new2'
           New-TestBundle -Path `$current2 -Identity `$candidate2
-          New-TestBundle -Path `$backup2 -Identity `$backup2id
-          [IO.File]::WriteAllText(`$CodeGraphManifest,(`$m2.New|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
+          `$oldManifest2=New-ManifestFromIdentity -Identity `$previous2
+          `$newManifest2=New-ManifestFromIdentity -Identity `$candidate2
+          `$oldBytes2=(New-Object Text.UTF8Encoding(`$false)).GetBytes((`$oldManifest2|ConvertTo-Json -Compress))
+          [IO.File]::WriteAllText(`$CodeGraphManifest,(`$newManifest2|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
           `$partialBackup=Join-Path `$case2 '.hms-codegraph-deleting-injected-backup'
           Rename-Item -LiteralPath `$backup2 -NewName (Split-Path -Leaf `$partialBackup) -ErrorAction Stop
           Remove-Item -LiteralPath (Join-Path `$partialBackup 'bin\codegraph.cmd') -Force
           `$forbiddenCandidateRemoval={param(`$Path,`$Identity);throw 'CANDIDATE_REMOVAL_MUST_NOT_RUN_WHEN_PREVIOUS_BACKUP_IS_UNAVAILABLE'}
-          `$r2=Repair-CodeGraphRollbackState -CurrentPath `$current2 -BackupPath `$backup2 -CandidateIdentity `$candidate2 -BackupIdentity `$backup2id -ManifestPublished `$true -PublishedManifest `$m2.New -PreviousManifestBytes `$m2.OldBytes -HadPrevious `$true -CandidateRemovalAction `$forbiddenCandidateRemoval
+          `$r2=Repair-CodeGraphRollbackState -CurrentPath `$current2 -BackupPath `$backup2 -CandidateIdentity `$candidate2 -BackupIdentity `$backup2id -PreviousIdentity `$previous2 -ManifestPublished `$true -PublishedManifest `$newManifest2 -PreviousManifestBytes `$oldBytes2 -HadPrevious `$true -CandidateRemovalAction `$forbiddenCandidateRemoval
           if(`$r2.CurrentBundleState -cne 'candidate' -or -not `$r2.CandidatePreserved -or `$r2.BackupActivated){throw 'Unavailable previous backup did not preserve the verified candidate as the active bundle.'}
           if(@(`$r2.RollbackErrors).Count -ne 0){throw "Unexpected rollback adjudication errors while preserving candidate: `$(@(`$r2.RollbackErrors)-join ' | ')"}
           Assert-CodeGraphTransactionBundle -Path `$current2 -Identity `$candidate2
           `$after2=Get-Content -LiteralPath `$CodeGraphManifest -Raw|ConvertFrom-Json
-          if([string]`$after2.version -cne 'new2'){throw 'Candidate manifest was replaced with old metadata while the candidate remained active.'}
+          if([string]`$after2.version -cne 'new2' -or [string]`$after2.bundle_transaction_id -cne [string]`$candidate2.transaction_id -or [string]`$after2.bundle_tree_sha256 -cne [string]`$candidate2.bundle_tree_sha256){throw 'Candidate manifest was replaced or identity-drifted while the candidate remained active.'}
           if(-not(Test-Path -LiteralPath `$partialBackup)){throw 'Partial backup quarantine unexpectedly disappeared from the failure harness.'}
 
-          # Existing temp-root destructive-boundary regression remains qualified.
+          # Scenario 3: the actual temp-root removal helper must preserve a foreign replacement pathname.
           `$case3=Join-Path `$Root 'temp-quarantine';New-Item -ItemType Directory -Force -Path `$case3|Out-Null
           `$CodeGraphManifest=Join-Path `$case3 'hms-codegraph-install.json'
           `$temp=Join-Path `$case3 'temp';New-Item -ItemType Directory -Force -Path `$temp|Out-Null
           Write-CodeGraphTempMarker -Path `$temp -TransactionId 'tx-review486'
           `$sentinel=Join-Path `$temp 'FOREIGN.txt'
-          `$watcher=Start-Job -ScriptBlock {param(`$P,`$S);`$d=[DateTime]::UtcNow.AddSeconds(20);while((Test-Path -LiteralPath `$P)-and [DateTime]::UtcNow -lt `$d){Start-Sleep -Milliseconds 2};if(Test-Path -LiteralPath `$P){throw 'temp quarantine rename not observed'};New-Item -ItemType Directory -Force -Path `$P|Out-Null;Set-Content -LiteralPath `$S -Value 'foreign'} -ArgumentList `$temp,`$sentinel
-          try{Remove-CodeGraphTempRoot -Path `$temp -TransactionId 'tx-review486';`$null=Wait-Job `$watcher -Timeout 20;Receive-Job `$watcher -ErrorAction Stop|Out-Null;if(-not(Test-Path -LiteralPath `$sentinel)){throw 'Foreign CodeGraph temp replacement was deleted.'}}finally{Remove-Job `$watcher -Force -ErrorAction SilentlyContinue}
+          `$watcher=Start-Job -ScriptBlock {
+            param(`$P,`$S)
+            `$d=[DateTime]::UtcNow.AddSeconds(20)
+            while((Test-Path -LiteralPath `$P)-and [DateTime]::UtcNow -lt `$d){Start-Sleep -Milliseconds 2}
+            if(Test-Path -LiteralPath `$P){throw 'temp quarantine rename not observed'}
+            New-Item -ItemType Directory -Force -Path `$P|Out-Null
+            Set-Content -LiteralPath `$S -Value 'foreign'
+          } -ArgumentList `$temp,`$sentinel
+          try{
+            Remove-CodeGraphTempRoot -Path `$temp -TransactionId 'tx-review486'
+            `$null=Wait-Job `$watcher -Timeout 20
+            if(`$watcher.State -ne 'Completed'){throw "Temp replacement watcher failed. State=`$(`$watcher.State)"}
+            Receive-Job `$watcher -ErrorAction Stop|Out-Null
+            if(-not(Test-Path -LiteralPath `$sentinel)){throw 'Foreign CodeGraph temp replacement was deleted.'}
+          }finally{Remove-Job `$watcher -Force -ErrorAction SilentlyContinue}
           "@
           [IO.File]::WriteAllText($harness,$script,(New-Object Text.UTF8Encoding($false)))
           try{& $harness -Root $testRoot}finally{Remove-Item $harness -Force -ErrorAction SilentlyContinue;Remove-Item $testRoot -Recurse -Force -ErrorAction SilentlyContinue}
-          Write-Host 'PASS: partial candidate deletion restores old bundle+manifest while retaining cleanup error evidence.'
-          Write-Host 'PASS: unavailable old backup preserves verified candidate+candidate manifest instead of publishing stale metadata.'
+          Write-Host 'PASS: partial candidate deletion restores the exact previous candidate identity and previous manifest while retaining cleanup error evidence.'
+          Write-Host 'PASS: unavailable previous backup preserves verified candidate and candidate transaction/tree manifest identity.'
           Write-Host 'PASS: CodeGraph temp cleanup preserves a foreign replacement pathname.'
           Write-Host 'PASS: all review-486 latest P1 boundaries are qualified on exact candidate HEAD.'
