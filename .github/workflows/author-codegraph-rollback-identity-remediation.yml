@@ -1,0 +1,106 @@
+name: Author CodeGraph rollback identity remediation
+
+on:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.2.0-ui-design-authority
+    paths:
+      - .github/workflows/author-codegraph-rollback-identity-remediation.yml
+
+permissions:
+  contents: write
+
+jobs:
+  author-exact-codegraph-remediation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout triggering head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Apply deterministic exact-blob remediation
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+
+          path = Path('scripts/Sync-DeliveryTools.ps1')
+          expected_blob = '4b40e9394b4e6cc11952fd01184155a9a06ea8b5'
+          actual_blob = subprocess.check_output(['git','hash-object',str(path)], text=True).strip().lower()
+          if actual_blob != expected_blob:
+              raise SystemExit(f'Delivery implementation baseline drifted. Expected {expected_blob}, found {actual_blob}')
+
+          text = path.read_text(encoding='utf-8')
+
+          replacements = []
+          replacements.append((
+              "        $BackupIdentity,\n        [Parameter(Mandatory)][bool]$ManifestPublished,\n",
+              "        $BackupIdentity,\n        $PreviousIdentity,\n        [Parameter(Mandatory)][bool]$ManifestPublished,\n",
+              'Repair parameter identity'))
+
+          replacements.append((
+              "            if ($null -eq $reservedBackupPath -or -not (Test-Path -LiteralPath $reservedBackupPath)) { throw 'CodeGraph reserved backup disappeared before rollback activation.' }\n            Assert-CodeGraphTransactionBundle -Path $reservedBackupPath -Identity $BackupIdentity\n            if (Test-Path -LiteralPath $CurrentPath) { throw \"Cannot restore CodeGraph backup because current became occupied: $CurrentPath\" }\n            Move-Item -LiteralPath $reservedBackupPath -Destination $CurrentPath\n            Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity\n            $backupActivated = $true\n            $reservedBackupPath = $null\n",
+              "            if ($null -eq $reservedBackupPath -or -not (Test-Path -LiteralPath $reservedBackupPath)) { throw 'CodeGraph reserved backup disappeared before rollback activation.' }\n            Assert-CodeGraphTransactionBundle -Path $reservedBackupPath -Identity $BackupIdentity\n            if ($null -eq $PreviousIdentity) { throw 'CodeGraph previous candidate identity is unavailable before rollback activation.' }\n            if (Test-Path -LiteralPath $CurrentPath) { throw \"Cannot restore CodeGraph backup because current became occupied: $CurrentPath\" }\n            Move-Item -LiteralPath $reservedBackupPath -Destination $CurrentPath\n            Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity\n            # Restore the original candidate-role marker before restoring the previous root manifest.\n            # This keeps the active bundle and manifest on the same transaction identity after rollback.\n            Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $PreviousIdentity\n            Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $PreviousIdentity\n            $backupActivated = $true\n            $reservedBackupPath = $null\n",
+              'Rollback marker restoration'))
+
+          replacements.append((
+              "            if ($HadPrevious -and $null -ne $BackupIdentity) {\n                try {\n                    Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity\n                    $currentBundleState = 'previous'\n                    $backupActivated = $true\n",
+              "            if ($HadPrevious -and $null -ne $PreviousIdentity) {\n                try {\n                    Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $PreviousIdentity\n                    $currentBundleState = 'previous'\n                    $backupActivated = $true\n",
+              'Rollback previous classification'))
+
+          replacements.append((
+              "    $null = Assert-CodeGraphBundleAgainstManifest -Path $CurrentPath -Manifest $ExistingManifest\n    Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $BackupIdentity\n    Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity\n    Move-Item -LiteralPath $CurrentPath -Destination $BackupPath\n    # Path-independent validation only. Never execute a launcher from a randomized backup path.\n    Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity\n}\n",
+              "    $existingIdentity = Assert-CodeGraphBundleAgainstManifest -Path $CurrentPath -Manifest $ExistingManifest\n    Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $BackupIdentity\n    Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity\n    Move-Item -LiteralPath $CurrentPath -Destination $BackupPath\n    # Path-independent validation only. Never execute a launcher from a randomized backup path.\n    Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity\n    return $existingIdentity\n}\n",
+              'Move helper returns prior identity'))
+
+          replacements.append((
+              "        $candidateIdentity = $null\n        $backupIdentity = $null\n        $manifestPublished = $false\n",
+              "        $candidateIdentity = $null\n        $backupIdentity = $null\n        $previousIdentity = $null\n        $manifestPublished = $false\n",
+              'Sync previous identity state'))
+
+          replacements.append((
+              "                    Move-CodeGraphCurrentToRollbackBackup -CurrentPath $current -BackupPath $backup -ExistingManifest $existingManifest -BackupIdentity $backupIdentity\n                    if ($env:HMS_TEST_FAIL_CODEGRAPH_AFTER_BACKUP_RENAME -ceq '1') { throw 'Injected CodeGraph failure after previous current crossed the backup rename boundary.' }\n",
+              "                    $previousIdentity = Move-CodeGraphCurrentToRollbackBackup -CurrentPath $current -BackupPath $backup -ExistingManifest $existingManifest -BackupIdentity $backupIdentity\n                    if ($env:HMS_TEST_FAIL_CODEGRAPH_AFTER_BACKUP_RENAME -ceq '1') { throw 'Injected CodeGraph failure after previous current crossed the backup rename boundary.' }\n",
+              'Capture previous identity from move'))
+
+          replacements.append((
+              "                $rollback = Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup -CandidateIdentity $candidateIdentity -BackupIdentity $backupIdentity -ManifestPublished $manifestPublished -PublishedManifest $publishedManifest -PreviousManifestBytes $existingManifestBytes -HadPrevious $wasInstalled\n",
+              "                $rollback = Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup -CandidateIdentity $candidateIdentity -BackupIdentity $backupIdentity -PreviousIdentity $previousIdentity -ManifestPublished $manifestPublished -PublishedManifest $publishedManifest -PreviousManifestBytes $existingManifestBytes -HadPrevious $wasInstalled\n",
+              'Pass previous identity into rollback'))
+
+          for old, new, label in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label} anchor mismatch: expected 1, found {count}')
+              text = text.replace(old, new, 1)
+
+          required = [
+              '$PreviousIdentity,',
+              'Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $PreviousIdentity',
+              'Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $PreviousIdentity',
+              'return $existingIdentity',
+              '$previousIdentity = Move-CodeGraphCurrentToRollbackBackup',
+              '-PreviousIdentity $previousIdentity'
+          ]
+          for literal in required:
+              if literal not in text:
+                  raise SystemExit(f'Missing remediated CodeGraph rollback identity contract: {literal}')
+
+          path.write_text(text, encoding='utf-8', newline='\n')
+
+      - name: Validate authored diff and push production commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff -- scripts/Sync-DeliveryTools.ps1
+          if git diff --quiet -- scripts/Sync-DeliveryTools.ps1; then
+            echo 'Expected CodeGraph rollback identity remediation diff is empty.' >&2
+            exit 1
+          fi
+          git config user.name 'HMS exact-blob remediation'
+          git config user.email '121548965+hoangminhsang989@users.noreply.github.com'
+          git add scripts/Sync-DeliveryTools.ps1
+          git commit -m 'Restore previous CodeGraph transaction identity on rollback'
+          git push origin HEAD:stage/hms-superpowers-v0.2.0-ui-design-authority
