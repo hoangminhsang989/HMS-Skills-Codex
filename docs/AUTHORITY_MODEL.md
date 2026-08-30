@@ -2,9 +2,9 @@
 
 ## Purpose
 
-HMS Skills Codex separates **what is authorized** from **how an agent prefers to work**. Process convenience, graph-derived context, design-advisor preferences, and upstream workflow defaults must never become authority.
+HMS Skills Codex separates **what is authorized** from **how an agent prefers to work**. Process convenience, graph-derived context, design-advisor preferences, model availability, and upstream workflow defaults must never become authority.
 
-The runtime exposes one public HMS skill, `$hms-superpowers`. All HMS gates, Superpowers methods, UI advisors, and delivery/context adapters used by that workflow are internal modules selected and arbitrated by the composite dispatcher.
+The runtime exposes one public HMS skill, `$hms-superpowers`. All HMS gates, Superpowers methods, UI advisors, delivery/context adapters, and the dedicated model dispatcher used by that workflow are internal modules selected and arbitrated by the composite dispatcher.
 
 ## Precedence
 
@@ -15,7 +15,7 @@ LATEST VALID HMS CHECKPOINT / FROZEN AUTHORITY
       ↓
 HMS FAIL-CLOSED + SAFETY RULES
       ↓
-HMS ADAPTIVE MODEL ROUTING
+HMS MODEL RISK FLOOR + DEDICATED MODEL DISPATCHER
       ↓
 HMS PROJECT-SPECIFIC PRODUCT / UI AUTHORITY
       ↓
@@ -35,14 +35,34 @@ Three-Level Delivery is never active implicitly. The owner requests that mode th
 
 ## One-primary-owner rule
 
-A task slice has exactly one primary module owner:
+A task slice has exactly one primary **work-module** owner:
 
-- HMS Core — governance, scope, model route, evidence/review/release, handoff;
+- HMS Core — governance, scope, risk-floor/escalation requirements, evidence/review/release, handoff;
 - Superpowers — engineering method and implementation workflow;
 - GPT Taste — unresolved visual direction and aesthetic critique;
 - Impeccable — UI audit and polish inside an accepted direction.
 
-Supporting modules can advise but cannot compete for ownership. Two modules must not independently redesign or mutate the same artifact in parallel.
+The dedicated HMS Model Dispatcher is not a work owner. It receives the required model floor and selects an enabled GPT-5.6 model that safely satisfies that floor.
+
+Supporting modules can advise but cannot compete for ownership. Two work modules must not independently redesign or mutate the same artifact in parallel.
+
+## Model-dispatch boundary
+
+Model routing is deliberately split into two responsibilities:
+
+1. `hms-model-router` classifies risk and emits the required model capability floor.
+2. `hms-model-dispatcher` maps that floor onto the locally enabled model pool.
+
+Local model availability is configured by `HMS-Model-Settings.cmd` and stored in `%USERPROFILE%\.codex\hms-composite\model-settings.json`.
+
+Fallback is capability-preserving only:
+
+- Luna-class work may move Luna -> Terra -> Sol;
+- Terra-class work may move Terra -> Sol;
+- Sol-required work cannot move down to Terra/Luna and becomes `NO_ENABLED_MODEL_SATISFIES_REQUIRED_FLOOR` when Sol is disabled;
+- all-models-OFF blocks every material model-routed task slice.
+
+Model selection policy never proves that Codex actually switched model or effort. A material slice cannot claim the assigned route unless the runtime supports and observably satisfies it. Final independent review still requires reviewer independence; Sol/max capability alone is not self-approval authority.
 
 ## Authority is evidence-bearing
 
@@ -138,6 +158,7 @@ Before a material mutation, HMS Core must establish:
 3. current Git/runtime identity;
 4. required verification;
 5. required review/release gate;
-6. primary module owner for the task slice.
+6. primary work-module owner for the task slice;
+7. required model capability floor.
 
-If any mandatory prerequisite is unknown, stop at the appropriate internal HMS gate instead of improvising.
+Then the dedicated model dispatcher must assign an enabled model satisfying that floor. If any mandatory prerequisite, model assignment, or runtime model identity is unknown, stop at the appropriate internal HMS gate instead of improvising.
