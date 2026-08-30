@@ -19,7 +19,7 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           $message = ((& git log -1 --format=%s) -join '').Trim()
-          if($message -cne 'chore: invoke registered review 486 P1 remediation v6') {
+          if($message -cne 'chore: invoke registered review 486 P1 remediation v7') {
             Write-Host "No remediation action for head message: $message"
             exit 0
           }
@@ -45,6 +45,12 @@ jobs:
           $manifestIndex = $body.IndexOf($manifestPatch)
           if($manifestIndex -lt 0) { throw 'Could not locate staged manifest publication replacement.' }
           $body[$manifestIndex] = $manifestReplacement
+
+          $addOld = "git add scripts/Build-HmsCompositeSkill.impl.ps1 scripts/Build-HmsCompositeSkill.ps1 scripts/Sync-DeliveryTools.ps1 .github/workflows/validate-review-486-latest-p1.yml"
+          $addNew = "git add scripts/Build-HmsCompositeSkill.impl.ps1 scripts/Build-HmsCompositeSkill.ps1 scripts/Sync-DeliveryTools.ps1"
+          $addIndex = $body.IndexOf($addOld)
+          if($addIndex -lt 0) { throw 'Could not locate staged git add command.' }
+          $body[$addIndex] = $addNew
 
           $pythonEnd = $body.IndexOf("'@ | python -")
           if($pythonEnd -lt 0) { throw 'Could not locate staged Python patch invocation.' }
