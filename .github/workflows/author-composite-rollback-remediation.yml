@@ -190,7 +190,7 @@ jobs:
                           # A foreign replacement raced into FinalRoot must be restored, never treated as HMS-owned backup.
                           Assert-OwnedCompositeRoot -Path $backup
                       }
-          """.replace('                      ', '')
+          """.replace('              ', '')
           new = """        if (Test-Path -LiteralPath $FinalRoot) {
                           if ([string]::IsNullOrWhiteSpace([string]$previousCompositeTreeSha)) { throw 'Previous composite identity was not captured before activation.' }
                           Rename-Item -LiteralPath $FinalRoot -NewName (Split-Path -Leaf $backup) -ErrorAction Stop
@@ -200,7 +200,7 @@ jobs:
                           # Rollback and successful disposal use only this random identity-verified reservation.
                           $reservedBackup = Reserve-OwnedCompositeRollbackBackup -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha
                       }
-          """.replace('                      ', '')
+          """.replace('              ', '')
           if text.count(old) != 1:
               raise SystemExit('Composite backup transition anchor mismatch.')
           text = text.replace(old, new, 1)
@@ -220,7 +220,7 @@ jobs:
                               if (-not (Test-Path -LiteralPath $backup)) { throw "Previous composite backup disappeared during rollback: $backup" }
                               Rename-Item -LiteralPath $backup -NewName (Split-Path -Leaf $FinalRoot) -ErrorAction Stop
                           }
-          """.replace('                          ', '')
+          """.replace('              ', '')
           new = """            if ($newActivated) {
                               if (Test-Path -LiteralPath $FinalRoot) {
                                   # Delete only the exact activated candidate tree. A foreign replacement at FinalRoot
@@ -237,7 +237,7 @@ jobs:
                               Restore-OwnedCompositeRollbackBackup -BackupPath $backup -ReservedPath $reservedBackup -FinalPath $FinalRoot -ExpectedTreeSha256 $previousCompositeTreeSha
                               $reservedBackup = $null
                           }
-          """.replace('                          ', '')
+          """.replace('              ', '')
           if text.count(old) != 1:
               raise SystemExit('Composite rollback restore anchor mismatch.')
           text = text.replace(old, new, 1)
