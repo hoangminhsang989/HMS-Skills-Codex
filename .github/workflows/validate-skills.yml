@@ -150,30 +150,41 @@ jobs:
             if (-not [string]::IsNullOrWhiteSpace(((& git -C $tasteRoot status --porcelain=v1 --untracked-files=all) -join "`n"))) { throw 'Taste source did not return to clean state.' }
 
             # Prove two independent PowerShell processes can rebuild the same managed target without racing activation/rollback.
-            # Raw per-blob materialization intentionally performs stronger byte verification and may exceed the old 120s budget on hosted Windows.
+            # Keep this race proof intentionally lightweight: full all-module materialization is already qualified above and in the trust workflow.
             $parallelRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-composite-lock-' + [guid]::NewGuid().ToString('N'))
             $parallelOutput = Join-Path $parallelRoot 'composite'
             $parallelSkills = Join-Path $parallelRoot 'agents\skills'
             $jobScript = {
-              param($Builder,$Install,$Output,$Skills,$TasteEnabled)
+              param($Builder,$Install,$Output,$Skills,$HmsEnabled)
               $ErrorActionPreference = 'Stop'
-              & $Builder -InstallRoot $Install -OutputRoot $Output -SkillsRoot $Skills -Hms $true -Superpowers $true -Taste ([bool]$TasteEnabled) -Impeccable $true
+              & $Builder -InstallRoot $Install -OutputRoot $Output -SkillsRoot $Skills -Hms ([bool]$HmsEnabled) -Superpowers $false -Taste $false -Impeccable $false
             }
             $jobs = @()
             try {
               $jobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$parallelOutput,$parallelSkills,$true
               $jobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$parallelOutput,$parallelSkills,$false
-              $null = Wait-Job -Job $jobs -Timeout 300
+              $null = Wait-Job -Job $jobs -Timeout 120
               foreach ($job in $jobs) {
-                if ($job.State -ne 'Completed') { throw "Concurrent composite build job did not complete: $($job.State)" }
+                if ($job.State -ne 'Completed') { throw "Concurrent lightweight composite build job did not complete: $($job.State)" }
                 Receive-Job -Job $job -ErrorAction Stop | Write-Host
               }
               $parallelManifestPath = Join-Path $parallelOutput 'hms-superpowers\manifest.json'
               if (-not (Test-Path -LiteralPath $parallelManifestPath)) { throw 'Concurrent build did not leave a valid composite manifest.' }
               $parallelManifest = Get-Content -LiteralPath $parallelManifestPath -Raw | ConvertFrom-Json
-              if (-not [bool]$parallelManifest.modules.hms -or -not [bool]$parallelManifest.modules.superpowers -or -not [bool]$parallelManifest.modules.impeccable) { throw 'Concurrent build left an invalid work-module state.' }
+              if ([bool]$parallelManifest.modules.superpowers -or [bool]$parallelManifest.modules.taste -or [bool]$parallelManifest.modules.impeccable) {
+                throw 'Concurrent lightweight build unexpectedly enabled an external work module.'
+              }
+              if ($parallelManifest.modules.hms -isnot [bool]) { throw 'Concurrent lightweight build left a non-boolean HMS module state.' }
               $parallelSkillFiles = @(Get-ChildItem -LiteralPath (Join-Path $parallelOutput 'hms-superpowers') -Filter 'SKILL.md' -File -Recurse)
               if ($parallelSkillFiles.Count -ne 1) { throw 'Concurrent build violated exactly-one-public-SKILL invariant.' }
+              $parallelLink = Join-Path $parallelSkills 'hms-superpowers'
+              $parallelLinkItem = Get-Item -LiteralPath $parallelLink -Force -ErrorAction SilentlyContinue
+              if ([bool]$parallelManifest.modules.hms) {
+                if ($null -eq $parallelLinkItem -or [string]$parallelLinkItem.LinkType -ine 'Junction') { throw 'Concurrent HMS-ON result did not leave exact discovery Junction.' }
+              }
+              elseif ($null -ne $parallelLinkItem) {
+                throw 'Concurrent HMS-OFF result left discovery enabled.'
+              }
               $leftovers = @(Get-ChildItem -LiteralPath $parallelOutput -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.stage-*' -or $_.Name -like '.backup-*' })
               if ($leftovers.Count -ne 0) { throw 'Concurrent build left stage/backup artifacts.' }
               & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -OutputRoot $parallelOutput -SkillsRoot $parallelSkills -Hms $false -Superpowers $false -Taste $false -Impeccable $false
@@ -182,7 +193,7 @@ jobs:
               foreach ($job in $jobs) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
               if (Test-Path -LiteralPath $parallelRoot) { Remove-Item -LiteralPath $parallelRoot -Recurse -Force }
             }
-            Write-Host 'PASS: composite compilation is cross-process serialized and rejects dirty external source bytes.'
+            Write-Host 'PASS: lightweight cross-process composite compilation is serialized; dirty external source rejection remains separately qualified.'
 
             & "$env:GITHUB_WORKSPACE\scripts\Test-CodexSkillDiscovery.ps1" -Cwd $env:GITHUB_WORKSPACE
 
@@ -198,7 +209,7 @@ jobs:
             & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -Hms $true -Superpowers $true -Taste $false -Impeccable $true
             $beforeUpdate = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
             if ([bool]$beforeUpdate.modules.taste) { throw 'Failed to create Taste OFF composite state.' }
-            if (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\taste')) { throw 'Taste reference remained after Taste OFF rebuild.' }
+            if (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\taste')) { throw 'Taste reference remained after Taste was disabled.' }
             if (-not (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\model-router\MODULE.md'))) { throw 'Model router disappeared during module rebuild.' }
             if (-not (Test-Path -LiteralPath (Join-Path $modelDispatcherRoot 'MODULE.md'))) { throw 'Model dispatcher disappeared during module rebuild.' }
 
