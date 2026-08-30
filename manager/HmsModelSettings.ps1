@@ -32,6 +32,45 @@ $escapedRepoRoot = $repoRoot.Replace("'", "''")
 $replacement = '$RepoRoot = ''' + $escapedRepoRoot + ''''
 $source = $source.Replace($needle, $replacement)
 
+# Serialize the complete write/verify/rollback transaction across processes.
+# The reviewed UTF-8 implementation remains the authoritative write body; this
+# shim renames it and injects one fail-closed cross-process wrapper.
+$writeNeedle = 'function Write-ModelState {'
+$writeOccurrences = [regex]::Matches($source, [regex]::Escape($writeNeedle)).Count
+if ($writeOccurrences -ne 1) {
+    throw "Model settings writer contract mismatch: expected exactly one Write-ModelState declaration, found $writeOccurrences."
+}
+$source = $source.Replace($writeNeedle, 'function Write-ModelState-Unserialized {')
+$writerWrapper = @'
+function Write-ModelState {
+    param(
+        [Parameter(Mandatory)]$State,
+        [string]$Path = $SettingsPath
+    )
+
+    $settingsMutexName = 'Local\HMS-Skills-Codex-ModelSettings-v1'
+    $settingsMutex = New-Object System.Threading.Mutex($false, $settingsMutexName)
+    $settingsMutexOwned = $false
+    try {
+        try {
+            $settingsMutexOwned = $settingsMutex.WaitOne([TimeSpan]::FromSeconds(120))
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            $settingsMutexOwned = $true
+        }
+        if (-not $settingsMutexOwned) { throw "Timed out waiting for model settings writer lock: $settingsMutexName" }
+        Write-ModelState-Unserialized -State $State -Path $Path
+    }
+    finally {
+        if ($settingsMutexOwned) {
+            try { $settingsMutex.ReleaseMutex() } catch { }
+        }
+        $settingsMutex.Dispose()
+    }
+}
+'@
+$source = $writerWrapper + "`r`n" + $source
+
 try {
     $implementation = [ScriptBlock]::Create($source)
 }
