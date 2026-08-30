@@ -165,7 +165,7 @@ function Get-CodeGraphBundleTreeSha256 {
         if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "CodeGraph bundle tree contains a reparse point: $($item.FullName)" }
         if ([bool]$item.PSIsContainer) { continue }
         $relative = $item.FullName.Substring($root.Length).TrimStart('\').Replace('\','/')
-        if ($relative -ceq $CodeGraphBundleMarkerName) { continue }
+        if ([string]::Equals([IO.Path]::GetFullPath($item.FullName), [IO.Path]::GetFullPath((Join-Path $root $CodeGraphBundleMarkerName)), [StringComparison]::OrdinalIgnoreCase)) { continue }
         $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         $records.Add($relative + "`t" + $hash)
     }
