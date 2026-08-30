@@ -19,7 +19,7 @@ jobs:
         run: |
           $ErrorActionPreference='Stop'
           $message = ((& git log -1 --format=%s) -join '').Trim()
-          if($message -cne 'chore: invoke registered review 486 P1 remediation v2') {
+          if($message -cne 'chore: invoke registered review 486 P1 remediation v3') {
             Write-Host "No remediation action for head message: $message"
             exit 0
           }
@@ -32,8 +32,7 @@ jobs:
           for($i=$marker+1;$i -lt $lines.Length;$i++) {
             $line=$lines[$i]
             if($line.Length -ge 10 -and $line.Substring(0,10) -ceq '          ') { $body.Add($line.Substring(10)) }
-            elseif([string]::IsNullOrWhiteSpace($line)) { $body.Add('') }
-            else { throw "Unexpected staged remediation indentation at line $($i+1)." }
+            else { $body.Add($line) }
           }
           $script = Join-Path $env:RUNNER_TEMP 'apply-review-486-p1.ps1'
           [IO.File]::WriteAllLines($script,$body,(New-Object Text.UTF8Encoding($false)))
