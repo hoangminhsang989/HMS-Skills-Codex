@@ -16,6 +16,7 @@ $CodeGraphRoot = Join-Path $env:USERPROFILE '.codex\codegraph'
 $ThreeLevelRoot = Join-Path $env:USERPROFILE '.codex\three-level-delivery'
 $CodeGraphManifest = Join-Path $CodeGraphRoot 'hms-codegraph-install.json'
 $ManagedBy = 'HMS-Skills-Codex'
+$CodeGraphBundleMarkerName = '.hms-codegraph-bundle.json'
 
 function ConvertTo-NormalizedRemote {
     param([Parameter(Mandatory)][string]$Remote)
@@ -145,6 +146,94 @@ function Assert-CodeGraphVersion {
     if ($output -notmatch [regex]::Escape($ExpectedVersion)) { throw "Unexpected CodeGraph version output. Expected $ExpectedVersion, found: $output" }
 }
 
+function Assert-RegularCodeGraphBundle {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item -or -not [bool]$item.PSIsContainer) { throw "$Label is not a directory: $Path" }
+    if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "$Label must not be a reparse point: $Path" }
+}
+
+function New-CodeGraphBundleIdentity {
+    param(
+        [Parameter(Mandatory)][string]$TransactionId,
+        [Parameter(Mandatory)][string]$Role,
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][string]$Tag,
+        [Parameter(Mandatory)][string]$Commit,
+        [Parameter(Mandatory)][string]$Asset,
+        [Parameter(Mandatory)][string]$Sha256
+    )
+    return [ordered]@{
+        schema_version = 1
+        managed_by = $ManagedBy
+        artifact = 'hms-codegraph-transaction-bundle'
+        transaction_id = $TransactionId
+        role = $Role
+        version = $Version
+        tag = $Tag
+        commit = $Commit
+        asset = $Asset
+        sha256 = $Sha256
+    }
+}
+
+function Write-CodeGraphBundleMarker {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Identity)
+    Assert-RegularCodeGraphBundle -Path $Path -Label 'CodeGraph transaction bundle'
+    $markerPath = Join-Path $Path $CodeGraphBundleMarkerName
+    $Identity | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $markerPath -Encoding UTF8
+}
+
+function Assert-CodeGraphTransactionBundle {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Identity)
+    Assert-RegularCodeGraphBundle -Path $Path -Label 'CodeGraph transaction bundle'
+    $markerPath = Join-Path $Path $CodeGraphBundleMarkerName
+    $markerItem = Get-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+    if ($null -eq $markerItem -or [bool]$markerItem.PSIsContainer -or [bool]($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "CodeGraph transaction marker is missing or not a regular file: $Path"
+    }
+    try { $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json }
+    catch { throw "CodeGraph transaction marker is invalid JSON: $Path" }
+    foreach ($field in @('managed_by','artifact','transaction_id','role','version','tag','commit','asset','sha256')) {
+        if ([string]$marker.$field -cne [string]$Identity[$field]) { throw "CodeGraph transaction marker mismatch for '$field': $Path" }
+    }
+    Assert-CodeGraphVersion -CommandPath (Join-Path $Path 'bin\codegraph.cmd') -ExpectedVersion ([string]$Identity.version)
+}
+
+function Remove-CodeGraphTransactionBundle {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Identity)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-CodeGraphTransactionBundle -Path $Path -Identity $Identity
+    $parent = Split-Path -Parent $Path
+    $leaf = '.hms-codegraph-deleting-' + [guid]::NewGuid().ToString('N')
+    $quarantine = Join-Path $parent $leaf
+    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    try {
+        Assert-CodeGraphTransactionBundle -Path $quarantine -Identity $Identity
+        Remove-Item -LiteralPath $quarantine -Recurse -Force
+        if (Test-Path -LiteralPath $quarantine) { throw "CodeGraph transaction quarantine removal did not complete: $quarantine" }
+    }
+    catch {
+        # Never restore a partially deleted bundle as trusted. Before destructive deletion,
+        # a failed boundary check can be restored only when the original pathname is still free.
+        if (Test-Path -LiteralPath $quarantine) {
+            if (-not (Test-Path -LiteralPath $Path)) {
+                try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
+            }
+        }
+        throw
+    }
+}
+
+function Assert-CodeGraphBundleAgainstManifest {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Manifest)
+    Assert-RegularCodeGraphBundle -Path $Path -Label 'Existing HMS CodeGraph bundle'
+    foreach ($field in @('version','tag','commit','asset','sha256')) {
+        if ([string]::IsNullOrWhiteSpace([string]$Manifest.$field)) { throw "Managed CodeGraph manifest is missing '$field'." }
+    }
+    Assert-CodeGraphVersion -CommandPath (Join-Path $Path 'bin\codegraph.cmd') -ExpectedVersion ([string]$Manifest.version)
+}
+
 function Sync-CodeGraphBundle {
     param([Parameter(Mandatory)]$Spec)
 
@@ -171,11 +260,14 @@ function Sync-CodeGraphBundle {
     }
 
     if (-not $alreadyExact) {
+        $transactionId = [guid]::NewGuid().ToString('N')
         $temp = Join-Path $env:TEMP ("hms-codegraph-" + [guid]::NewGuid().ToString('N'))
         $zip = Join-Path $temp $assetName
         $extract = Join-Path $temp 'extract'
         $candidate = $extract
         $backup = $null
+        $candidateIdentity = New-CodeGraphBundleIdentity -TransactionId $transactionId -Role 'candidate' -Version ([string]$Spec.version) -Tag ([string]$Spec.tag) -Commit ([string]$Spec.commit) -Asset $assetName -Sha256 $expectedSha
+        $backupIdentity = $null
         try {
             New-Item -ItemType Directory -Force -Path $extract | Out-Null
             $url = "https://github.com/colbymchenry/codegraph/releases/download/$([string]$Spec.tag)/$assetName"
@@ -193,14 +285,24 @@ function Sync-CodeGraphBundle {
             }
             $candidateCommand = Join-Path $candidate 'bin\codegraph.cmd'
             Assert-CodeGraphVersion -CommandPath $candidateCommand -ExpectedVersion ([string]$Spec.version)
+            Write-CodeGraphBundleMarker -Path $candidate -Identity $candidateIdentity
+            Assert-CodeGraphTransactionBundle -Path $candidate -Identity $candidateIdentity
 
             New-Item -ItemType Directory -Force -Path $CodeGraphRoot | Out-Null
             if (Test-Path -LiteralPath $current) {
+                if ($null -eq $existingManifest) { throw 'Existing CodeGraph current bundle has no HMS ownership manifest.' }
                 $backup = Join-Path $CodeGraphRoot ("backup-" + [guid]::NewGuid().ToString('N'))
                 Move-Item -LiteralPath $current -Destination $backup
+                # The old pathname is no longer destructive authority. Revalidate the exact renamed
+                # old bundle against the HMS root manifest, then bind a transaction marker to it.
+                Assert-CodeGraphBundleAgainstManifest -Path $backup -Manifest $existingManifest
+                $backupIdentity = New-CodeGraphBundleIdentity -TransactionId $transactionId -Role 'backup' -Version ([string]$existingManifest.version) -Tag ([string]$existingManifest.tag) -Commit ([string]$existingManifest.commit) -Asset ([string]$existingManifest.asset) -Sha256 ([string]$existingManifest.sha256)
+                Write-CodeGraphBundleMarker -Path $backup -Identity $backupIdentity
+                Assert-CodeGraphTransactionBundle -Path $backup -Identity $backupIdentity
             }
             try {
                 Move-Item -LiteralPath $candidate -Destination $current
+                Assert-CodeGraphTransactionBundle -Path $current -Identity $candidateIdentity
                 Assert-CodeGraphVersion -CommandPath $command -ExpectedVersion ([string]$Spec.version)
                 $manifest = [ordered]@{
                     managed_by = $ManagedBy
@@ -213,12 +315,30 @@ function Sync-CodeGraphBundle {
                 $manifestTemp = "$CodeGraphManifest.tmp"
                 $manifest | ConvertTo-Json | Set-Content -LiteralPath $manifestTemp -Encoding UTF8
                 Move-Item -LiteralPath $manifestTemp -Destination $CodeGraphManifest -Force
-                if ($null -ne $backup -and (Test-Path -LiteralPath $backup)) { Remove-Item -LiteralPath $backup -Recurse -Force }
+                if ($null -ne $backup -and (Test-Path -LiteralPath $backup)) {
+                    Remove-CodeGraphTransactionBundle -Path $backup -Identity $backupIdentity
+                }
             }
             catch {
                 $installError = $_
-                if (Test-Path -LiteralPath $current) { Remove-Item -LiteralPath $current -Recurse -Force }
-                if ($null -ne $backup -and (Test-Path -LiteralPath $backup)) { Move-Item -LiteralPath $backup -Destination $current }
+                $rollbackErrors = @()
+                try {
+                    if (Test-Path -LiteralPath $current) {
+                        Remove-CodeGraphTransactionBundle -Path $current -Identity $candidateIdentity
+                    }
+                }
+                catch { $rollbackErrors += $_.Exception.Message }
+                try {
+                    if ($null -ne $backup -and (Test-Path -LiteralPath $backup)) {
+                        Assert-CodeGraphTransactionBundle -Path $backup -Identity $backupIdentity
+                        if (Test-Path -LiteralPath $current) { throw "Cannot restore CodeGraph backup because current became occupied: $current" }
+                        Move-Item -LiteralPath $backup -Destination $current
+                    }
+                }
+                catch { $rollbackErrors += $_.Exception.Message }
+                if ($rollbackErrors.Count -gt 0) {
+                    throw "CodeGraph installation failed and rollback was incomplete. Original: $($installError.Exception.Message). Rollback: $($rollbackErrors -join ' | ')"
+                }
                 throw $installError
             }
         }
