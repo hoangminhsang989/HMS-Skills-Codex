@@ -1,6 +1,9 @@
 [CmdletBinding()]
 param(
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [string]$TrustedRepoRoot,
+    [string]$TrustedHead,
+    [string]$TrustedBootstrapBlob
 )
 
 Set-StrictMode -Version Latest
@@ -9,10 +12,32 @@ $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 decodes UTF-8-without-BOM .ps1 files through the
 # active ANSI code page. Keep this public entry point ASCII-only and decode
 # reviewed executable dependencies explicitly from verified byte snapshots.
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$head = ((& git -C $repoRoot rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
-if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') {
-    throw 'Manager runtime trust boundary could not resolve a canonical HMS repository HEAD.'
+$trustedValues = @($TrustedRepoRoot,$TrustedHead,$TrustedBootstrapBlob)
+$trustedCount = @($trustedValues | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
+if ($trustedCount -notin @(0,3)) {
+    throw 'Manager trusted bootstrap context is incomplete; repo root, HEAD, and bootstrap blob must be supplied together.'
+}
+$trustedBootstrap = $trustedCount -eq 3
+if ($trustedBootstrap) {
+    try { $repoRoot = (Resolve-Path -LiteralPath $TrustedRepoRoot -ErrorAction Stop).Path.TrimEnd('\') }
+    catch { throw "Manager trusted repository root is invalid: $TrustedRepoRoot" }
+    $head = $TrustedHead.Trim().ToLowerInvariant()
+    if ($head -notmatch '^[0-9a-f]{40}$') { throw "Manager trusted HEAD is invalid: $TrustedHead" }
+    $trustedBlob = $TrustedBootstrapBlob.Trim().ToLowerInvariant()
+    if ($trustedBlob -notmatch '^[0-9a-f]{40}$') { throw "Manager trusted bootstrap blob is invalid: $TrustedBootstrapBlob" }
+    $expectedBootstrap = ((& git -C $repoRoot rev-parse "$head`:manager/HmsSuperpowersManager.ps1" 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $expectedBootstrap -notmatch '^[0-9a-f]{40}$' -or $expectedBootstrap -cne $trustedBlob) {
+        throw 'Manager trusted bootstrap context does not match the captured committed Manager shim.'
+    }
+    $bootstrapType = ((& git -C $repoRoot cat-file -t $expectedBootstrap 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $bootstrapType -cne 'blob') { throw 'Manager trusted bootstrap object is not a committed blob.' }
+}
+else {
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $head = ((& git -C $repoRoot rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') {
+        throw 'Manager runtime trust boundary could not resolve a canonical HMS repository HEAD.'
+    }
 }
 
 function Get-LiteralGitBlobId {
@@ -42,7 +67,7 @@ function Read-ExactHeadFileBytes {
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Label is missing: $Path" }
-    if ([string]::IsNullOrWhiteSpace($RelativePath) -or $RelativePath.Contains('\\') -or $RelativePath.StartsWith('/') -or $RelativePath -match '^[A-Za-z]:') {
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or $RelativePath.Contains('\') -or $RelativePath.StartsWith('/') -or $RelativePath -match '^[A-Za-z]:') {
         throw "$Label repository-relative path is unsafe: $RelativePath"
     }
     foreach ($segment in @($RelativePath -split '/')) {
@@ -56,9 +81,8 @@ function Read-ExactHeadFileBytes {
 
     $stream = $null
     try {
-        # FileShare.Read blocks cooperating Windows writers/deleters during the snapshot.
-        # Security does not rely on that lock: the exact bytes read here are the same bytes
-        # hashed below and later decoded/executed, so pathname swaps after this read are inert.
+        # The exact bytes read here are the bytes hashed and later decoded/executed.
+        # A pathname replacement after this snapshot cannot change executed code.
         $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
         if ($stream.Length -gt [int]::MaxValue) { throw "$Label is too large to verify safely." }
         $bytes = New-Object byte[] ([int]$stream.Length)
@@ -81,19 +105,26 @@ function Read-ExactHeadFileBytes {
     return [pscustomobject]@{ Bytes=$bytes; ExpectedBlob=$expected; ActualBlob=$actual }
 }
 
-# Detect drift in the currently executing public shim. The implementation and every
-# later executable dependency are additionally executed only from the exact byte
-# snapshots returned by Read-ExactHeadFileBytes, eliminating verify-then-open TOCTOU.
-$null = Read-ExactHeadFileBytes -Path $PSCommandPath -RelativePath 'manager/HmsSuperpowersManager.ps1' -Label 'Manager public shim'
-$implementationPath = Join-Path $PSScriptRoot 'HmsSuperpowersManager.utf8.ps1'
+# Direct -File use remains fail-closed by authenticating the executing pathname.
+# The official .cmd launcher supplies a trusted outer snapshot context instead,
+# because code inside a modified file cannot authenticate statements that ran before it.
+if (-not $trustedBootstrap) {
+    if ([string]::IsNullOrWhiteSpace([string]$PSCommandPath)) { throw 'Manager direct bootstrap has no file-backed path to authenticate.' }
+    $null = Read-ExactHeadFileBytes -Path $PSCommandPath -RelativePath 'manager/HmsSuperpowersManager.ps1' -Label 'Manager public shim'
+}
+
+$implementationPath = Join-Path $repoRoot 'manager\HmsSuperpowersManager.utf8.ps1'
 $implementationRecord = Read-ExactHeadFileBytes -Path $implementationPath -RelativePath 'manager/HmsSuperpowersManager.utf8.ps1' -Label 'Manager UTF-8 implementation'
 $strictReaderPath = Join-Path $repoRoot 'scripts\Read-HmsCompositeModuleState.ps1'
 $strictReaderRecord = Read-ExactHeadFileBytes -Path $strictReaderPath -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Label 'Strict composite manifest reader'
+$modelSettingsShimPath = Join-Path $repoRoot 'manager\HmsModelSettings.ps1'
+$modelSettingsShimRecord = Read-ExactHeadFileBytes -Path $modelSettingsShimPath -RelativePath 'manager/HmsModelSettings.ps1' -Label 'Model settings public shim'
 
 $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
 try {
     $source = $utf8Strict.GetString([byte[]]$implementationRecord.Bytes)
     $strictReaderSource = $utf8Strict.GetString([byte[]]$strictReaderRecord.Bytes)
+    $modelSettingsShimSource = $utf8Strict.GetString([byte[]]$modelSettingsShimRecord.Bytes)
 }
 catch {
     throw "Manager executable dependency is not valid UTF-8: $($_.Exception.Message)"
@@ -101,13 +132,17 @@ catch {
 
 try {
     $__HmsVerifiedStrictReaderScriptBlock_v1 = [ScriptBlock]::Create($strictReaderSource)
+    $__HmsVerifiedModelSettingsShimScriptBlock_v1 = [ScriptBlock]::Create($modelSettingsShimSource)
 }
 catch {
-    throw "Strict composite manifest reader failed to parse from its verified byte snapshot: $($_.Exception.Message)"
+    throw "Manager verified dependency failed to parse from its byte snapshot: $($_.Exception.Message)"
 }
+$__HmsTrustedRepoRoot_v1 = $repoRoot
+$__HmsTrustedHead_v1 = $head
+$__HmsVerifiedModelSettingsShimBlob_v1 = [string]$modelSettingsShimRecord.ExpectedBlob
 
 # ScriptBlock.Create has no file-backed PSScriptRoot. Replace the implementation's
-# single repo-root bootstrap line with the path proven by this file-backed shim.
+# single repo-root bootstrap line with the captured repository root.
 $needle = '$RepoRoot = Split-Path -Parent $PSScriptRoot'
 $occurrences = [regex]::Matches($source, [regex]::Escape($needle)).Count
 if ($occurrences -ne 1) {
@@ -117,9 +152,7 @@ $escapedRepoRoot = $repoRoot.Replace("'", "''")
 $replacement = '$RepoRoot = ''' + $escapedRepoRoot + ''''
 $source = $source.Replace($needle, $replacement)
 
-# The UTF-8 implementation retains its legacy parser for source readability, but
-# the public runtime replaces that entry point with the shared strict reader loaded
-# from the verified in-memory bytes above. No later live-path execution is allowed.
+# Replace the legacy manifest parser with the strict reader loaded from verified bytes.
 $stateNeedle = 'function Get-CurrentModuleState {'
 $stateOccurrences = [regex]::Matches($source, [regex]::Escape($stateNeedle)).Count
 if ($stateOccurrences -ne 1) {
@@ -139,15 +172,29 @@ if ($insertOccurrences -ne 1) {
 }
 $source = $source.Replace($insertMarker, $strictWrapper + "`r`n" + $insertMarker)
 
+# Model Settings must not reopen its live public shim after Manager launch. Replace
+# that process/file invocation with the exact Model Settings shim bytes snapshotted
+# above and pass the same captured repository HEAD into its own dependency checks.
+$modelInvokeNeedle = '        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ModelSettingsScript'
+$modelInvokeReplacement = '        & $__HmsVerifiedModelSettingsShimScriptBlock_v1 -TrustedRepoRoot $__HmsTrustedRepoRoot_v1 -TrustedHead $__HmsTrustedHead_v1 -TrustedBootstrapBlob $__HmsVerifiedModelSettingsShimBlob_v1'
+$modelInvokeCount = [regex]::Matches($source, [regex]::Escape($modelInvokeNeedle)).Count
+if ($modelInvokeCount -ne 1) { throw "Manager Model Settings launch contract mismatch: expected one live shim invocation, found $modelInvokeCount." }
+$source = $source.Replace($modelInvokeNeedle, $modelInvokeReplacement)
+$modelExitNeedle = '        if ($LASTEXITCODE -ne 0) { throw "Model Settings popup exited with code $LASTEXITCODE." }'
+$modelExitCount = [regex]::Matches($source, [regex]::Escape($modelExitNeedle)).Count
+if ($modelExitCount -ne 1) { throw "Manager Model Settings exit-code contract mismatch: expected one legacy process check, found $modelExitCount." }
+$source = $source.Replace($modelExitNeedle, '        # Verified Model Settings executes in-process; terminating errors propagate directly.')
+
 try {
     $implementation = [ScriptBlock]::Create($source)
 }
 catch {
-    throw "Manager UTF-8 implementation failed to parse after deterministic bootstrap binding: $($_.Exception.Message)"
+    throw "Manager UTF-8 implementation failed to parse after deterministic trust binding: $($_.Exception.Message)"
 }
 
 if ($SelfTest) {
     & $implementation -SelfTest
+    & $__HmsVerifiedModelSettingsShimScriptBlock_v1 -SelfTest -TrustedRepoRoot $__HmsTrustedRepoRoot_v1 -TrustedHead $__HmsTrustedHead_v1 -TrustedBootstrapBlob $__HmsVerifiedModelSettingsShimBlob_v1
 }
 else {
     & $implementation
