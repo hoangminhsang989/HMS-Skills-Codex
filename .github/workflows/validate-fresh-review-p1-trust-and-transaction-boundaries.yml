@@ -40,14 +40,27 @@ jobs:
             if (@($errors).Count -ne 0) { throw "PowerShell parser rejected $path : $((@($errors) | ForEach-Object Message) -join ' | ')" }
           }
 
-          foreach ($shim in @($managerShim,$modelShim)) {
-            $text=[IO.File]::ReadAllText($shim)
-            foreach ($literal in @('rev-parse HEAD','hash-object --no-filters','cat-file -t','Assert-ExactHeadFile')) {
-              if ($text -notmatch [regex]::Escape($literal)) { throw "Executable trust shim is missing '$literal': $shim" }
+          $managerText=[IO.File]::ReadAllText($managerShim)
+          $modelText=[IO.File]::ReadAllText($modelShim)
+          foreach ($entry in @(
+            [pscustomobject]@{Label='Manager';Text=$managerText},
+            [pscustomobject]@{Label='Model Settings';Text=$modelText}
+          )) {
+            foreach ($literal in @('rev-parse HEAD','cat-file -t','Get-LiteralGitBlobId','Read-ExactHeadFileBytes','[IO.File]::Open','[IO.FileShare]::Read')) {
+              if ($entry.Text -notmatch [regex]::Escape($literal)) { throw "$($entry.Label) executable trust shim is missing verified-snapshot contract '$literal'." }
             }
+            if ($entry.Text -match [regex]::Escape('function Assert-ExactHeadFile')) { throw "$($entry.Label) regressed to verify-then-open pathname authentication." }
+            if ($entry.Text -match [regex]::Escape('[IO.File]::ReadAllText($implementationPath')) { throw "$($entry.Label) reopens the implementation pathname after verification." }
           }
-          if ([IO.File]::ReadAllText($managerShim) -notmatch [regex]::Escape('scripts/Read-HmsCompositeModuleState.ps1')) { throw 'Manager shim does not authenticate the strict manifest reader.' }
-          if ([IO.File]::ReadAllText($modelShim) -notmatch [regex]::Escape('scripts/Resolve-HmsModelRoute.ps1')) { throw 'Model Settings shim does not authenticate the resolver.' }
+          foreach ($literal in @('scripts/Read-HmsCompositeModuleState.ps1','$__HmsVerifiedStrictReaderScriptBlock_v1','return & $__HmsVerifiedStrictReaderScriptBlock_v1 -ManifestPath $ManifestPath')) {
+            if ($managerText -notmatch [regex]::Escape($literal)) { throw "Manager shim does not execute the strict reader from its verified byte snapshot: $literal" }
+          }
+          foreach ($literal in @('scripts/Resolve-HmsModelRoute.ps1','$__HmsVerifiedResolverScriptBlock_v1','return & $__HmsVerifiedResolverScriptBlock_v1 -RiskClass $RiskClass -RequiredFloor $RequiredFloor -SettingsPath $Path')) {
+            if ($modelText -notmatch [regex]::Escape($literal)) { throw "Model Settings shim does not execute the resolver from its verified byte snapshot: $literal" }
+          }
+          if ($modelText -match [regex]::Escape('return & $ResolverPath -RiskClass $RiskClass -RequiredFloor $RequiredFloor -SettingsPath $Path')) {
+            throw 'Model Settings retained live-path resolver execution after verified snapshot creation.'
+          }
 
           function Invoke-HiddenDriftRejection {
             param([Parameter(Mandatory)][string]$RelativePath,[Parameter(Mandatory)][string]$Launcher,[Parameter(Mandatory)][string]$Label)
@@ -74,7 +87,7 @@ jobs:
           Invoke-HiddenDriftRejection -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Launcher $managerShim -Label 'Manager strict reader'
           Invoke-HiddenDriftRejection -RelativePath 'manager/HmsModelSettings.utf8.ps1' -Launcher $modelShim -Label 'Model Settings implementation'
           Invoke-HiddenDriftRejection -RelativePath 'scripts/Resolve-HmsModelRoute.ps1' -Launcher $modelShim -Label 'Model Settings resolver'
-          Write-Host 'PASS: Manager and Model Settings reject hidden executable dependency drift before execution.'
+          Write-Host 'PASS: Manager and Model Settings reject hidden dependency drift and execute dependencies only from verified byte snapshots.'
 
           $implText=[IO.File]::ReadAllText($builderImpl)
           if ($implText -notmatch [regex]::Escape('ls-tree -r --name-only $collectionHead')) { throw 'Composite collection membership is not derived from the committed Git tree.' }
@@ -175,4 +188,4 @@ jobs:
           [IO.File]::WriteAllText($codeHarness,$codeScript,(New-Object System.Text.UTF8Encoding($false)))
           try { & $codeHarness -Root $codeRoot } finally { Remove-Item $codeHarness -Force -ErrorAction SilentlyContinue; Remove-Item $codeRoot -Recurse -Force -ErrorAction SilentlyContinue }
           Write-Host 'PASS: CodeGraph success and rollback transaction cleanup delete only revalidated bundle quarantines and preserve foreign replacement pathnames.'
-          Write-Host 'PASS: all five fresh-review P1 trust/transaction boundaries are qualified on exact candidate HEAD.'
+          Write-Host 'PASS: all fresh-review P1 trust/transaction boundaries, including verification-to-use closure, are qualified on exact candidate HEAD.'
