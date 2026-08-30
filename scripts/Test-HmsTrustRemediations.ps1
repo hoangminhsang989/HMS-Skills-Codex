@@ -19,18 +19,68 @@ foreach ($path in @($builderPath,$builderImplPath,$copyHelperPath)) {
 }
 
 $builderText = Get-Content -LiteralPath $builderPath -Raw
+$helperText = Get-Content -LiteralPath $copyHelperPath -Raw
 $canonicalAuthority = 'Authority precedence is fixed, highest to lowest: Owner instruction > latest valid HMS checkpoint / frozen authority > HMS fail-closed + safety rules > HMS model risk floor + dedicated model dispatcher > HMS project-specific product / UI authority > explicitly requested Three-Level Delivery governance > enabled Superpowers engineering method > CodeGraph context/evidence + enabled UI advisors > Codex defaults.'
 $badAuthority = 'Owner instruction and current project authority always outrank every internal module.'
 foreach ($literal in @(
     'Copy-HmsCommittedGitPath.ps1',
+    'support file does not match exact HEAD blob',
     $canonicalAuthority,
     'Project-specific authority never bypasses an HMS checkpoint, fail-closed/safety rule, or required model floor.',
     'Generated composite omitted the canonical HMS authority precedence.'
 )) {
     if ($builderText -notmatch [regex]::Escape($literal)) { throw "Builder trust wrapper is missing required contract literal: $literal" }
 }
+foreach ($literal in @(
+    'Assert-MaterializedFilesMatchHead',
+    'Archive attributes/filters must not transform committed bytes.',
+    'hash-object --no-filters'
+)) {
+    if ($helperText -notmatch [regex]::Escape($literal)) { throw "Committed-copy helper is missing required exact-blob contract literal: $literal" }
+}
 if ($builderText -match [regex]::Escape("'$badAuthority'")) {
     throw 'Builder trust wrapper retained the superseded generated authority rule.'
+}
+
+# Trust-root regression: hidden drift in builder support bytes must be rejected before support execution.
+$supportTemp = Join-Path ([IO.Path]::GetTempPath()) ('hms-support-bind-' + [guid]::NewGuid().ToString('N'))
+$supportRepo = Join-Path $supportTemp 'repo'
+$supportScripts = Join-Path $supportRepo 'scripts'
+$supportRelative = 'scripts/Build-HmsCompositeSkill.impl.ps1'
+$supportFlagSet = $false
+try {
+    New-Item -ItemType Directory -Force -Path $supportScripts | Out-Null
+    Copy-Item -LiteralPath $builderPath -Destination (Join-Path $supportScripts 'Build-HmsCompositeSkill.ps1') -Force
+    Copy-Item -LiteralPath $builderImplPath -Destination (Join-Path $supportScripts 'Build-HmsCompositeSkill.impl.ps1') -Force
+    Copy-Item -LiteralPath $copyHelperPath -Destination (Join-Path $supportScripts 'Copy-HmsCommittedGitPath.ps1') -Force
+    & git -C $supportRepo init | Out-Null
+    & git -C $supportRepo config user.email 'hms-ci@example.invalid'
+    & git -C $supportRepo config user.name 'HMS Support Regression'
+    & git -C $supportRepo add scripts
+    & git -C $supportRepo commit -m 'fixture: exact builder support bytes' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to commit builder support regression fixture.' }
+
+    & git -C $supportRepo update-index --skip-worktree -- $supportRelative
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to set skip-worktree on builder implementation fixture.' }
+    $supportFlagSet = $true
+    Add-Content -LiteralPath (Join-Path $supportRepo ($supportRelative -replace '/', '\')) -Value "`n# HMS_HIDDEN_SUPPORT_DRIFT"
+    $supportStatus = ((& git -C $supportRepo status --porcelain=v1 --untracked-files=all) -join "`n")
+    if (-not [string]::IsNullOrWhiteSpace($supportStatus)) { throw "Support hidden-drift premise was not reproduced: $supportStatus" }
+
+    $supportRejected = $false
+    try {
+        & (Join-Path $supportScripts 'Build-HmsCompositeSkill.ps1') -InstallRoot $supportRepo -OutputRoot (Join-Path $supportTemp 'out') -SkillsRoot (Join-Path $supportTemp 'skills') -Hms $false -Superpowers $false -Taste $false -Impeccable $false
+    }
+    catch {
+        if ($_.Exception.Message -match 'Composite implementation support file does not match exact HEAD blob') { $supportRejected = $true } else { throw }
+    }
+    if (-not $supportRejected) { throw 'Builder accepted hidden drift in its implementation support file.' }
+}
+finally {
+    if ($supportFlagSet -and (Test-Path -LiteralPath $supportRepo)) {
+        & git -C $supportRepo update-index --no-skip-worktree -- $supportRelative 2>$null
+    }
+    if (Test-Path -LiteralPath $supportTemp) { Remove-Item -LiteralPath $supportTemp -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-skip-worktree-' + [guid]::NewGuid().ToString('N'))
@@ -38,6 +88,7 @@ $repo = Join-Path $tempRoot 'repo'
 $skill = Join-Path $repo 'skills\test-skill'
 $relativeSkill = 'skills/test-skill/SKILL.md'
 $destination = Join-Path $tempRoot 'published\test-skill'
+$attributeDestination = Join-Path $tempRoot 'published-attribute\test-skill'
 $skipFlagSet = $false
 try {
     New-Item -ItemType Directory -Force -Path $skill | Out-Null
@@ -49,7 +100,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Failed to configure skip-worktree regression repository.' }
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    $committedText = "---`nname: test-skill`ndescription: committed source fixture`n---`n`n# committed bytes`n"
+    $committedText = (@('---','name: test-skill','description: committed source fixture','---','','# committed bytes','$Format:%H$','') -join "`n")
     $skillPath = Join-Path $skill 'SKILL.md'
     [IO.File]::WriteAllText($skillPath, $committedText, $utf8NoBom)
     & git -C $repo add -- $relativeSkill
@@ -91,6 +142,26 @@ try {
     if ($LASTEXITCODE -ne 0 -or $publishedBlob -cne $committedBlob) {
         throw "Published bytes are not the committed Git blob. Expected $committedBlob, found $publishedBlob."
     }
+
+    # git archive consults repository-local info/attributes. export-subst must not silently transform committed bytes.
+    $infoAttributes = Join-Path $repo '.git\info\attributes'
+    $hadInfoAttributes = Test-Path -LiteralPath $infoAttributes
+    $originalInfoAttributes = if ($hadInfoAttributes) { [IO.File]::ReadAllText($infoAttributes) } else { $null }
+    try {
+        [IO.File]::WriteAllText($infoAttributes, "skills/test-skill/SKILL.md export-subst`n", $utf8NoBom)
+        $attributeRejected = $false
+        try { & $copyHelperPath -Source $skill -Destination $attributeDestination }
+        catch {
+            if ($_.Exception.Message -match 'materialized blob mismatch') { $attributeRejected = $true } else { throw }
+        }
+        if (-not $attributeRejected) { throw 'Committed-copy helper accepted git-archive export-subst byte transformation.' }
+        if (Test-Path -LiteralPath $attributeDestination) { throw 'Archive-attribute rejection published a destination.' }
+    }
+    finally {
+        if ($hadInfoAttributes) { [IO.File]::WriteAllText($infoAttributes, $originalInfoAttributes, $utf8NoBom) }
+        else { Remove-Item -LiteralPath $infoAttributes -Force -ErrorAction SilentlyContinue }
+    }
+
     if ([IO.File]::ReadAllText($skillPath) -notmatch [regex]::Escape($sentinel)) {
         throw 'Committed-object helper mutated the adversarial source worktree.'
     }
@@ -102,4 +173,4 @@ finally {
     if (Test-Path -LiteralPath $tempRoot) { Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
-Write-Host 'PASS: committed Git-object copy defeats skip-worktree worktree substitution; generated authority precedence contract is enforced by the build wrapper.'
+Write-Host 'PASS: builder support bytes are HEAD-blob-bound; committed Git-object copy defeats skip-worktree and rejects archive-attribute byte transformation; generated authority precedence is enforced.'
