@@ -138,9 +138,9 @@ function Test-ExactHeadLifecycleCaller {
             if ($resolvedCaller -ine $resolvedCandidate) { continue }
 
             $expectedCaller = Get-ExpectedSupportBlob -RelativePath $relative -Label "Lifecycle caller $relative"
-            $actualCaller = ((& git -C $repoRoot hash-object "--path=$relative" -- $resolvedCandidate 2>$null) -join '').Trim().ToLowerInvariant()
+            $actualCaller = ((& git -C $repoRoot hash-object --no-filters -- $resolvedCandidate 2>$null) -join '').Trim().ToLowerInvariant()
             if ($LASTEXITCODE -ne 0 -or $actualCaller -notmatch '^[0-9a-f]{40}$') {
-                throw "Lifecycle caller bytes could not be hashed with Git clean semantics: $relative"
+                throw "Lifecycle caller literal bytes could not be hashed: $relative"
             }
             if ($actualCaller -cne $expectedCaller) {
                 throw "Lifecycle caller bytes do not match HMS HEAD $head; refusing inherited composite-lock ownership. Expected $expectedCaller, found ${actualCaller}: $relative"
@@ -152,9 +152,9 @@ function Test-ExactHeadLifecycleCaller {
 }
 
 $expectedSelf = Get-ExpectedSupportBlob -RelativePath $selfRelative -Label 'Public composite bootstrap'
-$actualSelf = ((& git -C $repoRoot hash-object "--path=$selfRelative" -- $PSCommandPath 2>$null) -join '').Trim().ToLowerInvariant()
+$actualSelf = ((& git -C $repoRoot hash-object --no-filters -- $PSCommandPath 2>$null) -join '').Trim().ToLowerInvariant()
 if ($LASTEXITCODE -ne 0 -or $actualSelf -notmatch '^[0-9a-f]{40}$') {
-    throw 'Public composite bootstrap worktree bytes could not be hashed with Git clean semantics.'
+    throw 'Public composite bootstrap literal worktree bytes could not be hashed.'
 }
 if ($actualSelf -cne $expectedSelf) {
     throw "Public composite bootstrap bytes do not match HMS HEAD $head; refusing hidden worktree drift. Expected $expectedSelf, found $actualSelf."
