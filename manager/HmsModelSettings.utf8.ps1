@@ -44,6 +44,15 @@ public static class HmsModelSettingsNative
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetFileInformationByHandle(SafeFileHandle hFile, int infoClass, IntPtr info, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileSizeEx(SafeFileHandle hFile, out long fileSize);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFilePointerEx(SafeFileHandle hFile, long distance, out long newPosition, uint moveMethod);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReadFile(SafeFileHandle hFile, IntPtr buffer, uint bytesToRead, out uint bytesRead, IntPtr overlapped);
 
     public static SafeFileHandle OpenLockedModelSettingsFile(string path, out int error)
     {
@@ -52,6 +61,38 @@ public static class HmsModelSettingsNative
         SafeFileHandle h = CreateFileW(path, 0x80010000u, 0x00000001u, IntPtr.Zero, 3u, 0x00200000u, IntPtr.Zero);
         error = h.IsInvalid ? Marshal.GetLastWin32Error() : 0;
         return h;
+    }
+
+    public static byte[] ReadAllHmsModelSettingsBytes(SafeFileHandle handle, out int error)
+    {
+        long size;
+        if (!GetFileSizeEx(handle, out size)) { error = Marshal.GetLastWin32Error(); return null; }
+        if (size < 0 || size > 1048576) { error = 223; return null; } // ERROR_FILE_TOO_LARGE / bounded settings contract.
+        long position;
+        if (!SetFilePointerEx(handle, 0, out position, 0)) { error = Marshal.GetLastWin32Error(); return null; }
+        byte[] result = new byte[(int)size];
+        if (size == 0) { error = 0; return result; }
+        IntPtr buffer = Marshal.AllocHGlobal((int)size);
+        try
+        {
+            int offset = 0;
+            while (offset < result.Length)
+            {
+                uint read;
+                uint remaining = (uint)(result.Length - offset);
+                if (!ReadFile(handle, IntPtr.Add(buffer, offset), remaining, out read, IntPtr.Zero))
+                {
+                    error = Marshal.GetLastWin32Error();
+                    return null;
+                }
+                if (read == 0) { error = 38; return null; } // ERROR_HANDLE_EOF: exact bytes changed/truncated unexpectedly.
+                offset += (int)read;
+            }
+            Marshal.Copy(buffer, result, 0, result.Length);
+            error = 0;
+            return result;
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
     }
 
     public static bool RenameHmsModelSettingsFileByHandle(SafeFileHandle handle, string destination, out int error)
@@ -120,6 +161,19 @@ function Open-HmsModelSettingsFileGuard {
         return [pscustomobject]@{ Handle=$handle; Identity=$identity; Path=$Path }
     }
     catch { $handle.Dispose(); throw }
+}
+
+function Read-HmsModelSettingsTextFromGuard {
+    param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Label)
+    if ($null -eq $Guard.Handle -or $Guard.Handle.IsClosed -or $Guard.Handle.IsInvalid) { throw "$Label exact settings guard is unavailable for read." }
+    $identity = Get-HmsModelSettingsIdentityFromHandle -Handle $Guard.Handle -Label $Label
+    if ($identity -cne [string]$Guard.Identity) { throw "$Label exact settings identity changed before guarded read." }
+    $errorCode = 0
+    $bytes = [HmsModelSettingsNative]::ReadAllHmsModelSettingsBytes($Guard.Handle,[ref]$errorCode)
+    if ($null -eq $bytes) { throw "$Label exact settings bytes could not be read through the locked handle (Win32=$errorCode)." }
+    $strict = New-Object System.Text.UTF8Encoding($false,$true)
+    try { return $strict.GetString([byte[]]$bytes) }
+    catch { throw "$Label exact settings bytes are not valid UTF-8: $($_.Exception.Message)" }
 }
 
 function Move-HmsModelSettingsFileGuard {
@@ -234,21 +288,15 @@ function Assert-RegularSettingsFile {
     }
 }
 
-function Read-ModelState-Unserialized {
-    param([string]$Path = $SettingsPath)
-
-    if (-not (Test-Path -LiteralPath $Path)) { return New-DefaultModelState }
-    Assert-RegularSettingsFile -Path $Path
-
-    try { $settings = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json }
-    catch { throw "Model settings are invalid JSON: $($_.Exception.Message)" }
-
+function Convert-ModelSettingsTextToState {
+    param([Parameter(Mandatory)][string]$Text,[Parameter(Mandatory)][string]$Label)
+    try { $settings = $Text | ConvertFrom-Json }
+    catch { throw "$Label are invalid JSON: $($_.Exception.Message)" }
     if ($null -eq $settings.PSObject.Properties['schema_version']) { throw 'Model settings are missing schema_version.' }
     Assert-ExactSchemaVersionOne -Value $settings.schema_version
     if ([string]$settings.managed_by -cne 'HMS-Skills-Codex') { throw 'Model settings ownership mismatch.' }
     if ([string]$settings.artifact -cne 'hms-model-settings') { throw 'Model settings artifact mismatch.' }
     if ($null -eq $settings.models) { throw 'Model settings are missing models.' }
-
     $state = [ordered]@{}
     foreach ($key in @('luna','terra','sol')) {
         $property = $settings.models.PSObject.Properties[$key]
@@ -257,6 +305,21 @@ function Read-ModelState-Unserialized {
         $state[$key] = $property.Value
     }
     return $state
+}
+
+function Read-ModelStateFromGuard {
+    param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Label)
+    $text = Read-HmsModelSettingsTextFromGuard -Guard $Guard -Label $Label
+    return Convert-ModelSettingsTextToState -Text $text -Label $Label
+}
+
+function Read-ModelState-Unserialized {
+    param([string]$Path = $SettingsPath)
+    if (-not (Test-Path -LiteralPath $Path)) { return New-DefaultModelState }
+    Assert-RegularSettingsFile -Path $Path
+    try { $text = [IO.File]::ReadAllText($Path,(New-Object System.Text.UTF8Encoding($false,$true))) }
+    catch { throw "Model settings could not be read: $($_.Exception.Message)" }
+    return Convert-ModelSettingsTextToState -Text $text -Label 'Model settings'
 }
 
 function Read-ModelState {
@@ -301,15 +364,15 @@ function Write-ModelState {
     try {
         if (Test-Path -LiteralPath $Path) {
             $existingGuard = Open-HmsModelSettingsFileGuard -Path $Path -Label 'Existing model settings'
-            $null = Read-ModelState-Unserialized -Path $Path
+            $null = Read-ModelStateFromGuard -Guard $existingGuard -Label 'Existing model settings'
             $hadExisting = $true
         }
 
         [IO.File]::WriteAllText($temp,$json,$utf8)
         $candidateGuard = Open-HmsModelSettingsFileGuard -Path $temp -Label 'Candidate model settings'
-        $actualCandidateText = [IO.File]::ReadAllText($temp,$utf8)
+        $actualCandidateText = Read-HmsModelSettingsTextFromGuard -Guard $candidateGuard -Label 'Candidate model settings'
         if ($actualCandidateText -cne $json) { throw 'Candidate model settings bytes changed before publication.' }
-        $null = Read-ModelState-Unserialized -Path $temp
+        $null = Read-ModelStateFromGuard -Guard $candidateGuard -Label 'Candidate model settings'
 
         if ($hadExisting) {
             Move-HmsModelSettingsFileGuard -Guard $existingGuard -SourcePath $Path -DestinationPath $previousReserved -Label 'Previous model settings reservation'
@@ -319,7 +382,7 @@ function Write-ModelState {
         Move-HmsModelSettingsFileGuard -Guard $candidateGuard -SourcePath $temp -DestinationPath $Path -Label 'Candidate model settings publication'
         $candidatePublished = $true
 
-        $verified = Read-ModelState-Unserialized -Path $Path
+        $verified = Read-ModelStateFromGuard -Guard $candidateGuard -Label 'Published candidate model settings'
         foreach ($key in @('luna','terra','sol')) {
             if ($verified[$key] -ne $State[$key]) { throw "Model setting verification mismatch for '$key'." }
         }
@@ -350,7 +413,7 @@ function Write-ModelState {
             try {
                 if (Test-Path -LiteralPath $Path) { throw "Canonical model settings pathname became occupied during rollback: $Path" }
                 Move-HmsModelSettingsFileGuard -Guard $existingGuard -SourcePath $previousReserved -DestinationPath $Path -Label 'Previous model settings restoration'
-                $null = Read-ModelState-Unserialized -Path $Path
+                $null = Read-ModelStateFromGuard -Guard $existingGuard -Label 'Restored previous model settings'
                 $existingGuard.Handle.Dispose(); $existingGuard.Handle = $null; $existingGuard = $null
                 $previousMoved = $false
             }

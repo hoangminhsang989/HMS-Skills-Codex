@@ -75,6 +75,11 @@ finally {
 }
 Write-Host 'PASS: validated Model Settings file is pinned against foreign rename and moved/deleted only through its exact handle.'
 
+# Run the production UTF-8 implementation self-test directly so exact-handle sharing/read compatibility
+# is qualified before the public lifecycle workflows. This uses only temp settings files.
+& $modelPath -SelfTest
+Write-Host 'PASS: direct Model Settings self-test is compatible with exact guarded reads/writes.'
+
 # Resolver must not observe the writer's deliberate canonical-path gap.
 $settingsRoot = Join-Path $env:TEMP ('hms-model-settings-reader-lock-' + [guid]::NewGuid().ToString('N'))
 $settingsPath = Join-Path $settingsRoot 'model-settings.json'
