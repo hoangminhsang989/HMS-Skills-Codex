@@ -31,11 +31,7 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $actualSha -cne $expectedSha) { throw "Workflow checkout identity mismatch. Expected $expectedSha, found $actualSha" }
 
           $managerShim = Join-Path $workspace 'manager\HmsSuperpowersManager.ps1'
-          $managerImpl = Join-Path $workspace 'manager\HmsSuperpowersManager.utf8.ps1'
           $modelShim = Join-Path $workspace 'manager\HmsModelSettings.ps1'
-          $modelImpl = Join-Path $workspace 'manager\HmsModelSettings.utf8.ps1'
-          $strictReader = Join-Path $workspace 'scripts\Read-HmsCompositeModuleState.ps1'
-          $resolver = Join-Path $workspace 'scripts\Resolve-HmsModelRoute.ps1'
           $builderImpl = Join-Path $workspace 'scripts\Build-HmsCompositeSkill.impl.ps1'
           $delivery = Join-Path $workspace 'scripts\Sync-DeliveryTools.ps1'
           foreach ($path in @($managerShim,$modelShim,$builderImpl,$delivery)) {
@@ -50,8 +46,8 @@ jobs:
               if ($text -notmatch [regex]::Escape($literal)) { throw "Executable trust shim is missing '$literal': $shim" }
             }
           }
-          if ([IO.File]::ReadAllText($managerShim) -notmatch [regex]::Escape("scripts/Read-HmsCompositeModuleState.ps1")) { throw 'Manager shim does not authenticate the strict manifest reader.' }
-          if ([IO.File]::ReadAllText($modelShim) -notmatch [regex]::Escape("scripts/Resolve-HmsModelRoute.ps1")) { throw 'Model Settings shim does not authenticate the resolver.' }
+          if ([IO.File]::ReadAllText($managerShim) -notmatch [regex]::Escape('scripts/Read-HmsCompositeModuleState.ps1')) { throw 'Manager shim does not authenticate the strict manifest reader.' }
+          if ([IO.File]::ReadAllText($modelShim) -notmatch [regex]::Escape('scripts/Resolve-HmsModelRoute.ps1')) { throw 'Model Settings shim does not authenticate the resolver.' }
 
           function Invoke-HiddenDriftRejection {
             param([Parameter(Mandatory)][string]$RelativePath,[Parameter(Mandatory)][string]$Launcher,[Parameter(Mandatory)][string]$Label)
@@ -95,10 +91,16 @@ jobs:
             $status=((& git -C $workspace status --porcelain=v1 -- $hiddenRelative) -join '').Trim()
             if (-not [string]::IsNullOrWhiteSpace($status)) { throw "Hidden module fixture is not Git-status clean: $status" }
             $outputRoot=Join-Path $testRoot 'out'; $skillsRoot=Join-Path $testRoot 'skills'
-            $output=(& $builderImpl -InstallRoot $workspace -OutputRoot $outputRoot -SkillsRoot $skillsRoot -Hms $true -Superpowers $false -Taste $false -Impeccable $false 2>&1) -join "`n"
-            $failed=$false
-            if ($LASTEXITCODE -ne 0 -or $output -match 'Skill source does not contain SKILL.md') { $failed=$true }
+            $failed=$false; $output=''
+            try {
+              $output=(& $builderImpl -InstallRoot $workspace -OutputRoot $outputRoot -SkillsRoot $skillsRoot -Hms $true -Superpowers $false -Taste $false -Impeccable $false 2>&1) -join "`n"
+            }
+            catch {
+              $failed=$true
+              $output=$_.Exception.Message
+            }
             if (-not $failed) { throw "Committed-tree membership silently omitted the hidden committed module. Output: $output" }
+            if ($output -notmatch 'Skill source does not contain SKILL.md') { throw "Committed-tree membership rejected for the wrong reason. Output: $output" }
           }
           finally {
             & git -C $workspace update-index --no-skip-worktree -- $hiddenRelative 2>$null
@@ -139,10 +141,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path `$Root | Out-Null
           [ordered]@{schema_version=1;managed_by=`$ManagedBy;artifact=`$StageArtifact;stage_id=`$Id}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path `$Root '.hms-stage-owner.json') -Encoding UTF8
           `$sentinel=Join-Path `$Root 'FOREIGN.txt'
-          `$watcher=Start-Job -ScriptBlock { param(`$P,`$S); `$d=[DateTime]::UtcNow.AddSeconds(20); while((Test-Path -LiteralPath `$P)-and [DateTime]::UtcNow-lt`$d){Start-Sleep -Milliseconds 2}; if(Test-Path -LiteralPath `$P){throw 'stage rename not observed'}; New-Item -ItemType Directory -Force -Path `$P|Out-Null; Set-Content -LiteralPath `$S -Value 'foreign' } -ArgumentList `$Root,`$sentinel
-          try { Remove-OwnedCompositeStageQuarantine -Path `$Root -StageId `$Id; `$null=Wait-Job `$watcher -Timeout 20; Receive-Job `$watcher -ErrorAction Stop|Out-Null; if(-not(Test-Path -LiteralPath `$sentinel)){throw 'foreign stage replacement deleted'} } finally { Remove-Job `$watcher -Force -ErrorAction SilentlyContinue }
+          `$watcher=Start-Job -ScriptBlock { param(`$P,`$S); `$d=[DateTime]::UtcNow.AddSeconds(20); while ((Test-Path -LiteralPath `$P) -and [DateTime]::UtcNow -lt `$d) { Start-Sleep -Milliseconds 2 }; if (Test-Path -LiteralPath `$P) { throw 'stage rename not observed' }; New-Item -ItemType Directory -Force -Path `$P|Out-Null; Set-Content -LiteralPath `$S -Value 'foreign' } -ArgumentList `$Root,`$sentinel
+          try { Remove-OwnedCompositeStageQuarantine -Path `$Root -StageId `$Id; `$null=Wait-Job `$watcher -Timeout 20; Receive-Job `$watcher -ErrorAction Stop|Out-Null; if (-not (Test-Path -LiteralPath `$sentinel)) { throw 'foreign stage replacement deleted' } } finally { Remove-Job `$watcher -Force -ErrorAction SilentlyContinue }
           "@
-          [IO.File]::WriteAllText($stageHarness,$stageScript,(New-Object Text.UTF8Encoding($false)))
+          [IO.File]::WriteAllText($stageHarness,$stageScript,(New-Object System.Text.UTF8Encoding($false)))
           try { & $stageHarness -Root $stageRoot -Id $stageId } finally { Remove-Item $stageHarness -Force -ErrorAction SilentlyContinue; Remove-Item $stageRoot -Recurse -Force -ErrorAction SilentlyContinue }
           Write-Host 'PASS: failed-stage cleanup quarantines and revalidates the owned stage while preserving a foreign replacement pathname.'
 
@@ -160,17 +162,17 @@ jobs:
           Set-StrictMode -Version Latest
           `$ErrorActionPreference='Stop'; `$ManagedBy='HMS-Skills-Codex'; `$CodeGraphBundleMarkerName='.hms-codegraph-bundle.json'
           $codeDefs
-          foreach(`$role in @('backup','candidate')) {
+          foreach (`$role in @('backup','candidate')) {
             `$path=Join-Path `$Root `$role; New-Item -ItemType Directory -Force -Path (Join-Path `$path 'bin')|Out-Null
-            '@echo off`r`necho codegraph 1.6.0`r`nexit /b 0`r`n' | Set-Content -LiteralPath (Join-Path `$path 'bin\codegraph.cmd') -Encoding ASCII
-            `$id=[ordered]@{managed_by=`$ManagedBy;artifact='hms-codegraph-transaction-bundle';transaction_id='tx-'+`$role;role=`$role;version='1.6.0';tag='v1.6.0';commit='dfccdf62547fcd76d343344d823a0e1998d3a89f';asset='fixture.zip';sha256=('a'*64)}
-            [ordered]@{schema_version=1;managed_by=`$id.managed_by;artifact=`$id.artifact;transaction_id=`$id.transaction_id;role=`$id.role;version=`$id.version;tag=`$id.tag;commit=`$id.commit;asset=`$id.asset;sha256=`$id.sha256}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path `$path `$CodeGraphBundleMarkerName) -Encoding UTF8
+            Set-Content -LiteralPath (Join-Path `$path 'bin\codegraph.cmd') -Value @('@echo off','echo codegraph 1.6.0','exit /b 0') -Encoding ASCII
+            `$id=[ordered]@{managed_by=`$ManagedBy;artifact='hms-codegraph-transaction-bundle';transaction_id=('tx-'+`$role);role=`$role;version='1.6.0';tag='v1.6.0';commit='dfccdf62547fcd76d343344d823a0e1998d3a89f';asset='fixture.zip';sha256=('a'*64)}
+            [ordered]@{schema_version=1;managed_by=`$id['managed_by'];artifact=`$id['artifact'];transaction_id=`$id['transaction_id'];role=`$id['role'];version=`$id['version'];tag=`$id['tag'];commit=`$id['commit'];asset=`$id['asset'];sha256=`$id['sha256']}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path `$path `$CodeGraphBundleMarkerName) -Encoding UTF8
             `$sentinel=Join-Path `$path 'FOREIGN.txt'
-            `$watcher=Start-Job -ScriptBlock { param(`$P,`$S); `$d=[DateTime]::UtcNow.AddSeconds(20); while((Test-Path -LiteralPath `$P)-and [DateTime]::UtcNow-lt`$d){Start-Sleep -Milliseconds 2}; if(Test-Path -LiteralPath `$P){throw 'CodeGraph delete quarantine rename not observed'}; New-Item -ItemType Directory -Force -Path `$P|Out-Null; Set-Content -LiteralPath `$S -Value 'foreign' } -ArgumentList `$path,`$sentinel
-            try { Remove-CodeGraphTransactionBundle -Path `$path -Identity `$id; `$null=Wait-Job `$watcher -Timeout 20; Receive-Job `$watcher -ErrorAction Stop|Out-Null; if(-not(Test-Path -LiteralPath `$sentinel)){throw "foreign CodeGraph `$role replacement deleted"} } finally { Remove-Job `$watcher -Force -ErrorAction SilentlyContinue }
+            `$watcher=Start-Job -ScriptBlock { param(`$P,`$S); `$d=[DateTime]::UtcNow.AddSeconds(20); while ((Test-Path -LiteralPath `$P) -and [DateTime]::UtcNow -lt `$d) { Start-Sleep -Milliseconds 2 }; if (Test-Path -LiteralPath `$P) { throw 'CodeGraph delete quarantine rename not observed' }; New-Item -ItemType Directory -Force -Path `$P|Out-Null; Set-Content -LiteralPath `$S -Value 'foreign' } -ArgumentList `$path,`$sentinel
+            try { Remove-CodeGraphTransactionBundle -Path `$path -Identity `$id; `$null=Wait-Job `$watcher -Timeout 20; Receive-Job `$watcher -ErrorAction Stop|Out-Null; if (-not (Test-Path -LiteralPath `$sentinel)) { throw "foreign CodeGraph `$role replacement deleted" } } finally { Remove-Job `$watcher -Force -ErrorAction SilentlyContinue }
           }
           "@
-          [IO.File]::WriteAllText($codeHarness,$codeScript,(New-Object Text.UTF8Encoding($false)))
+          [IO.File]::WriteAllText($codeHarness,$codeScript,(New-Object System.Text.UTF8Encoding($false)))
           try { & $codeHarness -Root $codeRoot } finally { Remove-Item $codeHarness -Force -ErrorAction SilentlyContinue; Remove-Item $codeRoot -Recurse -Force -ErrorAction SilentlyContinue }
           Write-Host 'PASS: CodeGraph success and rollback transaction cleanup delete only revalidated bundle quarantines and preserve foreign replacement pathnames.'
           Write-Host 'PASS: all five fresh-review P1 trust/transaction boundaries are qualified on exact candidate HEAD.'
