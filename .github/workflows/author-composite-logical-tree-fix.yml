@@ -1,0 +1,97 @@
+name: Author composite logical tree identity fix
+
+on:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.2.0-ui-design-authority
+    paths:
+      - .github/workflows/author-composite-logical-tree-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  author:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact authoring head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Apply exact composite tree identity remediation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Set-StrictMode -Version Latest
+          $path = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.impl.ps1'
+          $expectedBlob='c6218ac149fadea4f5087d21119c3c0ab3261d65'
+          $actualBlob=((git -C $env:GITHUB_WORKSPACE rev-parse 'HEAD:scripts/Build-HmsCompositeSkill.impl.ps1') -join '').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $actualBlob -cne $expectedBlob) { throw "Composite baseline blob mismatch. Expected $expectedBlob, found $actualBlob" }
+
+          $text=[IO.File]::ReadAllText($path)
+          $pattern='(?ms)^function Get-OwnedCompositeTreeSha256 \{.*?^\}\r?\n\r?\n(?=function Assert-OwnedCompositeIdentity)'
+          $replacement=@'
+function Add-OwnedCompositeTreeRecords {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$LogicalPrefix,
+        [Parameter(Mandatory)]$Records
+    )
+    foreach ($item in @(Get-ChildItem -LiteralPath $Directory -Force -ErrorAction Stop)) {
+        if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Composite tree contains a reparse point: $($item.FullName)"
+        }
+        $logical = if ([string]::IsNullOrEmpty($LogicalPrefix)) { [string]$item.Name } else { $LogicalPrefix + "/" + [string]$item.Name }
+        if ([bool]$item.PSIsContainer) {
+            Add-OwnedCompositeTreeRecords -Directory $item.FullName -LogicalPrefix $logical -Records $Records
+            continue
+        }
+        $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $Records.Add($logical + "`t" + $hash)
+    }
+}
+
+function Get-OwnedCompositeTreeSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    Assert-OwnedCompositeRoot -Path $Path
+    $root = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
+    $records = New-Object System.Collections.Generic.List[string]
+    Add-OwnedCompositeTreeRecords -Directory $root -LogicalPrefix "" -Records $records
+    if ($records.Count -eq 0) { throw "Composite tree contains no authenticated files: $Path" }
+    $sorted = [string[]]@($records)
+    [Array]::Sort($sorted, [StringComparer]::Ordinal)
+    $payload = [string]::Join("`n", $sorted)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant()
+    }
+    finally { $sha.Dispose() }
+}
+
+'@
+          $rx=[regex]::new($pattern)
+          $matches=$rx.Matches($text)
+          if ($matches.Count -ne 1) { throw "Expected exactly one composite tree hash function block, found $($matches.Count)" }
+          $updated=$rx.Replace($text,$replacement,1)
+          [IO.File]::WriteAllText($path,$updated,(New-Object Text.UTF8Encoding($false)))
+
+          $tokens=$null;$errors=$null
+          [Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors)|Out-Null
+          if(@($errors).Count){throw "Patched composite source does not parse: $((@($errors)|ForEach-Object Message)-join ' | ')"}
+          if($updated -match [regex]::Escape('$item.FullName.Substring($root.Length)')){throw 'Absolute-path substring tree derivation remains after remediation.'}
+          foreach($literal in @('function Add-OwnedCompositeTreeRecords','[AllowEmptyString()][string]$LogicalPrefix','[Array]::Sort($sorted, [StringComparer]::Ordinal)','Add-OwnedCompositeTreeRecords -Directory $root -LogicalPrefix "" -Records $records')){
+            if($updated -notmatch [regex]::Escape($literal)){throw "Expected logical-tree remediation literal missing: $literal"}
+          }
+
+          git -C $env:GITHUB_WORKSPACE diff --check
+          if($LASTEXITCODE -ne 0){throw 'git diff --check failed'}
+          git -C $env:GITHUB_WORKSPACE config user.name 'HMS exact-blob remediation'
+          git -C $env:GITHUB_WORKSPACE config user.email '121548965+hoangminhsang989@users.noreply.github.com'
+          git -C $env:GITHUB_WORKSPACE add -- 'scripts/Build-HmsCompositeSkill.impl.ps1'
+          git -C $env:GITHUB_WORKSPACE commit -m 'Make composite tree identity path-independent'
+          if($LASTEXITCODE -ne 0){throw 'Production remediation commit failed'}
+          git -C $env:GITHUB_WORKSPACE push origin 'HEAD:stage/hms-superpowers-v0.2.0-ui-design-authority'
+          if($LASTEXITCODE -ne 0){throw 'Production remediation push failed'}
