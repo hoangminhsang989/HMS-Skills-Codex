@@ -20,7 +20,7 @@ jobs:
         with:
           ref: ${{ env.CANDIDATE_SHA }}
 
-      - name: Qualify cat-file -p exact blob materialization inside Start-Job
+      - name: Qualify git show exact blob materialization inside Start-Job
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -33,7 +33,7 @@ jobs:
           $blob = (& git -C $env:GITHUB_WORKSPACE rev-parse "$expectedSha`:scripts/Build-HmsCompositeSkill.impl.ps1").Trim().ToLowerInvariant()
           if ($LASTEXITCODE -ne 0 -or $blob -notmatch '^[0-9a-f]{40}$') { throw 'Could not resolve implementation blob.' }
           $gitExe = [string](Get-Command git -ErrorAction Stop).Source
-          $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-blob-pretty-' + [guid]::NewGuid().ToString('N'))
+          $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-blob-show-' + [guid]::NewGuid().ToString('N'))
           New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
           $destination = Join-Path $tempRoot 'implementation.ps1'
           $stderrPath = Join-Path $tempRoot 'git.stderr.txt'
@@ -43,9 +43,9 @@ jobs:
             $job = Start-Job -ScriptBlock {
               param($GitExe,$RepoRoot,$Blob,$Destination,$StderrPath)
               $ErrorActionPreference = 'Stop'
-              Write-Output "HMS_BLOB_PRETTY_START pid=$PID blob=$Blob utc=$([DateTime]::UtcNow.ToString('o'))"
+              Write-Output "HMS_BLOB_SHOW_START pid=$PID blob=$Blob utc=$([DateTime]::UtcNow.ToString('o'))"
               $process = Start-Process -FilePath $GitExe `
-                -ArgumentList @('cat-file','-p',$Blob) `
+                -ArgumentList @('show',$Blob) `
                 -WorkingDirectory $RepoRoot `
                 -NoNewWindow `
                 -Wait `
@@ -54,9 +54,9 @@ jobs:
                 -RedirectStandardError $StderrPath
               if ($process.ExitCode -ne 0) {
                 $stderr = if (Test-Path -LiteralPath $StderrPath) { Get-Content -LiteralPath $StderrPath -Raw } else { '' }
-                throw "git cat-file -p failed with exit code $($process.ExitCode): $stderr"
+                throw "git show failed with exit code $($process.ExitCode): $stderr"
               }
-              Write-Output "HMS_BLOB_PRETTY_RETURN pid=$PID blob=$Blob utc=$([DateTime]::UtcNow.ToString('o'))"
+              Write-Output "HMS_BLOB_SHOW_RETURN pid=$PID blob=$Blob utc=$([DateTime]::UtcNow.ToString('o'))"
             } -ArgumentList $gitExe,$env:GITHUB_WORKSPACE,$blob,$destination,$stderrPath
 
             $deadline = [DateTime]::UtcNow.AddSeconds(15)
@@ -65,13 +65,13 @@ jobs:
               Start-Sleep -Milliseconds 100
             }
             Receive-Job -Job $job -ErrorAction Stop | Write-Host
-            if ($job.State -ne 'Completed') { throw "cat-file -p materialization did not complete within 15s. State=$($job.State)" }
+            if ($job.State -ne 'Completed') { throw "git show blob materialization did not complete within 15s. State=$($job.State)" }
 
             $actualBlob = (& git -C $env:GITHUB_WORKSPACE hash-object --no-filters -- $destination).Trim().ToLowerInvariant()
             if ($LASTEXITCODE -ne 0 -or $actualBlob -ne $blob) {
-              throw "cat-file -p materialization mismatch. Expected $blob, found $actualBlob"
+              throw "git show materialization mismatch. Expected $blob, found $actualBlob"
             }
-            Write-Host "PASS: git cat-file -p completed inside Start-Job and preserved exact blob $blob."
+            Write-Host "PASS: git show completed inside Start-Job and preserved exact blob $blob."
           }
           finally {
             if ($null -ne $job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
