@@ -74,7 +74,8 @@ if ($false) {
     Copy-Item -LiteralPath $ModelResolverSource -Destination (Join-Path $modelDispatcherDestination 'Resolve-HmsModelRoute.ps1') -Force
 }
 $lines = @(
-        '1. Owner instruction and current project authority always outrank every internal module.'
+        '1. Owner instruction and current project authority always outrank every internal module.',
+        'fixture continuation'
 )
 $uiSequence = 'Apply only enabled work modules, sequentially, inside owner/project UI authority. Taste owns unresolved direction when enabled; Impeccable owns audit/polish when enabled; Superpowers owns implementation when enabled; HMS owns evidence/release when enabled.'
 $target = Join-Path $OutputRoot 'hms-superpowers'
