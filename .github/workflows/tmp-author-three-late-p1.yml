@@ -37,9 +37,7 @@ jobs:
           python scripts/.tmp_patch_three_late_p1.py
 
           # The Windows implementation intentionally retains pathname-recursive cleanup only in
-          # the non-Windows branch. The first author run proved the runtime boundary but its static
-          # assertion rejected that legitimate fallback merely because the literal existed anywhere
-          # in the function. Bind the permanent proof to control-flow order instead: any root
+          # the non-Windows branch. Bind the permanent proof to control-flow order: any root
           # pathname-recursive delete must occur only after the Windows exact-handle branch returns.
           $testPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Test-HmsOwnedTempCleanup.ps1'
           $testText = [IO.File]::ReadAllText($testPath)
@@ -47,6 +45,16 @@ jobs:
           $new = "`$rootRemovePos = `$removeFunction.IndexOf('Remove-Item -LiteralPath `$quarantine -Recurse -Force')`nif (`$deletePos -lt 0 -or `$disposePos -lt 0 -or `$deletePos -ge `$disposePos) { throw 'Owned-temp exact handle is not retained through the root delete-pending transition.' }`n`$windowsReturnPos = `$removeFunction.IndexOf('        return',`$disposePos)`nif (`$windowsReturnPos -lt 0) { throw 'Windows owned-temp exact-handle branch has no terminal return before the non-Windows fallback.' }`nif (`$rootRemovePos -ge 0 -and `$rootRemovePos -lt `$windowsReturnPos) { throw 'Windows owned-temp cleanup still contains pathname-recursive root deletion before its exact-handle return.' }"
           if (($testText.Split($old).Count - 1) -ne 1) { throw 'Owned-temp static proof contract changed before author retry.' }
           [IO.File]::WriteAllText($testPath,$testText.Replace($old,$new),(New-Object Text.UTF8Encoding($false)))
+
+          # The generated late-trust regression must search for the literal PowerShell mutex name,
+          # where backslash has no escape semantics. The patcher intentionally stores its source as
+          # a Python raw string; normalize the over-escaped test literal before committing the test.
+          $latePath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Test-HmsLateTrustBoundaries.ps1'
+          $lateText = [IO.File]::ReadAllText($latePath)
+          $overEscaped = 'Local\\HMS-Skills-Codex-ModelSettings-v1'
+          $literal = 'Local\HMS-Skills-Codex-ModelSettings-v1'
+          if (($lateText.Split($overEscaped).Count - 1) -ne 1) { throw 'Late-trust mutex literal contract changed before author retry.' }
+          [IO.File]::WriteAllText($latePath,$lateText.Replace($overEscaped,$literal),(New-Object Text.UTF8Encoding($false)))
 
       - name: Parse changed PowerShell
         shell: pwsh
