@@ -1,4 +1,4 @@
-name: Invoke review 486 P1 remediation
+name: Harden CodeGraph rollback manifest ordering
 
 on:
   pull_request:
@@ -14,47 +14,40 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
-      - name: Execute staged exact remediation script
+      - name: Patch rollback ordering and push
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
-          $message = ((& git log -1 --format=%s) -join '').Trim()
-          if($message -cne 'chore: invoke registered review 486 P1 remediation v7') {
-            Write-Host "No remediation action for head message: $message"
-            exit 0
-          }
-          $source = Join-Path $env:GITHUB_WORKSPACE '.github\workflows\remediate-review-486-p1.yml'
-          $lines = [IO.File]::ReadAllLines($source)
-          $marker = -1
-          for($i=0;$i -lt $lines.Length;$i++) { if($lines[$i].Trim() -ceq 'run: |') { $marker=$i; break } }
-          if($marker -lt 0) { throw 'Staged remediation workflow has no run block.' }
-          $body = New-Object System.Collections.Generic.List[string]
-          for($i=$marker+1;$i -lt $lines.Length;$i++) {
-            $line=$lines[$i]
-            if($line.Length -ge 10 -and $line.Substring(0,10) -ceq '          ') { $body.Add($line.Substring(10)) }
-            else { $body.Add($line) }
-          }
-          $oldPatch = "sync=replace_once(sync,old_remove,new_remove,'CodeGraph destructive helper block')"
-          $newPatch = "start=sync.index('function Remove-CodeGraphTransactionBundle {'); end=sync.index(chr(10)+'function Assert-CodeGraphBundleAgainstManifest',start); sync=sync[:start]+new_remove+sync[end+1:]"
-          $patchIndex = $body.IndexOf($oldPatch)
-          if($patchIndex -lt 0) { throw 'Could not locate staged CodeGraph whole-function replacement.' }
-          $body[$patchIndex] = $newPatch
-
-          $manifestPatch = "sync=replace_once(sync,old_manifest,new_manifest,'atomic manifest publication')"
-          $manifestReplacement = "start=sync.index('                `$manifest = [ordered]@{'); end=sync.index('                if (`$null -ne `$backup -and (Test-Path -LiteralPath `$backup)) {',start); sync=sync[:start]+new_manifest+sync[end:]"
-          $manifestIndex = $body.IndexOf($manifestPatch)
-          if($manifestIndex -lt 0) { throw 'Could not locate staged manifest publication replacement.' }
-          $body[$manifestIndex] = $manifestReplacement
-
-          $addOld = "git add scripts/Build-HmsCompositeSkill.impl.ps1 scripts/Build-HmsCompositeSkill.ps1 scripts/Sync-DeliveryTools.ps1 .github/workflows/validate-review-486-latest-p1.yml"
-          $addNew = "git add scripts/Build-HmsCompositeSkill.impl.ps1 scripts/Build-HmsCompositeSkill.ps1 scripts/Sync-DeliveryTools.ps1"
-          $addIndex = $body.IndexOf($addOld)
-          if($addIndex -lt 0) { throw 'Could not locate staged git add command.' }
-          $body[$addIndex] = $addNew
-
-          $pythonEnd = $body.IndexOf("'@ | python -")
-          if($pythonEnd -lt 0) { throw 'Could not locate staged Python patch invocation.' }
-          $body.Insert($pythonEnd+1,"if(`$LASTEXITCODE -ne 0){throw 'Python remediation patch failed'}")
-          $script = Join-Path $env:RUNNER_TEMP 'apply-review-486-p1.ps1'
-          [IO.File]::WriteAllLines($script,$body,(New-Object Text.UTF8Encoding($false)))
-          & $script
+          $message=((& git log -1 --format=%s)-join '').Trim()
+          if($message -cne 'chore: harden CodeGraph rollback manifest ordering'){ Write-Host "No remediation action for $message"; exit 0 }
+          @'
+          from pathlib import Path
+          p=Path('scripts/Sync-DeliveryTools.ps1')
+          s=p.read_text(encoding='utf-8')
+          old="""                try {
+                    if ($manifestPublished) { Restore-CodeGraphManifestAfterFailure -CandidateManifest $publishedManifest -PreviousBytes $existingManifestBytes -HadPrevious $wasInstalled }
+                }
+                catch { $rollbackErrors += $_.Exception.Message }
+"""
+          new="""                try {
+                    if ($rollbackErrors.Count -eq 0 -and $manifestPublished) {
+                        Restore-CodeGraphManifestAfterFailure -CandidateManifest $publishedManifest -PreviousBytes $existingManifestBytes -HadPrevious $wasInstalled
+                    }
+                }
+                catch { $rollbackErrors += $_.Exception.Message }
+"""
+          if s.count(old)!=1: raise SystemExit(f'rollback manifest ordering: expected 1 block, found {s.count(old)}')
+          p.write_text(s.replace(old,new,1),encoding='utf-8',newline='\n')
+          '@ | python -
+          if($LASTEXITCODE -ne 0){throw 'rollback ordering patch failed'}
+          $t=$null;$e=$null;[Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE 'scripts\Sync-DeliveryTools.ps1'),[ref]$t,[ref]$e)|Out-Null
+          if(@($e).Count){throw "Parser rejected Sync-DeliveryTools.ps1: $((@($e)|ForEach-Object Message)-join ' | ')"}
+          git diff --check
+          if($LASTEXITCODE -ne 0){throw 'git diff --check failed'}
+          git config user.name 'HMS Remediation Bot'
+          git config user.email 'hms-remediation@users.noreply.github.com'
+          git add scripts/Sync-DeliveryTools.ps1
+          git commit -m 'fix: restore CodeGraph manifest only after bundle rollback'
+          if($LASTEXITCODE -ne 0){throw 'commit failed'}
+          git push origin HEAD:stage/hms-superpowers-v0.2.0-ui-design-authority
+          if($LASTEXITCODE -ne 0){throw 'push failed'}
