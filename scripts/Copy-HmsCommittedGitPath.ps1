@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$Source,
-    [Parameter(Mandatory)][string]$Destination
+    [Parameter(Mandatory)][string]$Destination,
+    [string]$ExpectedHead
 )
 
 Set-StrictMode -Version Latest
@@ -94,9 +95,19 @@ else {
     throw "Committed-copy source escaped its Git repository root: $Source"
 }
 
-$head = ((& git -C $repoRoot rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
-if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') {
-    throw "Committed-copy source HEAD is not a canonical 40-hex commit: $repoRoot"
+if ([string]::IsNullOrWhiteSpace($ExpectedHead)) {
+    $head = ((& git -C $repoRoot rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') {
+        throw "Committed-copy source HEAD is not a canonical 40-hex commit: $repoRoot"
+    }
+}
+else {
+    $head = $ExpectedHead.Trim().ToLowerInvariant()
+    if ($head -notmatch '^[0-9a-f]{40}$') { throw "Committed-copy expected HEAD is invalid: $ExpectedHead" }
+    $commitType = ((& git -C $repoRoot cat-file -t $head 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $commitType -cne 'commit') {
+        throw "Committed-copy expected source commit is unavailable: $head"
+    }
 }
 
 $objectSpec = if ($pathSpec -ceq '.') { "$head`:" } else { "$head`:$pathSpec" }
@@ -165,14 +176,14 @@ try {
     [IO.File]::WriteAllText($alternatesPath, ($objectsPath.Replace('\','/') + "`n"), (New-Object System.Text.UTF8Encoding($false)))
 
     # Source-repository worktree/info attributes are outside this isolated transport. These highest-precedence
-    # attributes neutralize archive/EOL transforms; every extracted file must still hash to its exact HEAD blob.
+    # attributes neutralize archive/EOL transforms; every extracted file must still hash to its exact qualified blob.
     $attributesPath = Join-Path $transportGit 'info\attributes'
     $neutralAttributes = '** -text -crlf -eol -ident -filter -working-tree-encoding -export-ignore -export-subst' + "`n"
     [IO.File]::WriteAllText($attributesPath, $neutralAttributes, (New-Object System.Text.UTF8Encoding($false)))
 
     & $gitExe "--git-dir=$transportGit" -c core.autocrlf=false -c core.eol=lf archive --format=zip "--output=$archivePath" $head -- $pathSpec
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
-        throw "Committed-copy exact-HEAD archive transport failed: $pathSpec"
+        throw "Committed-copy exact-commit archive transport failed: $pathSpec"
     }
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -220,7 +231,7 @@ try {
             $actual = Get-LiteralBlobHash -RepoRoot $repoRoot -Path $target
             if ($actual -cne [string]$entry.Blob) {
                 Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
-                throw "Committed-copy exact-HEAD archive transport changed committed bytes for '$archiveEntryPath'. Expected $($entry.Blob), found $actual."
+                throw "Committed-copy exact-commit archive transport changed committed bytes for '$archiveEntryPath'. Expected $($entry.Blob), found $actual."
             }
             Restore-ExecutableMode -Destination $target -Mode ([string]$entry.Mode)
         }
