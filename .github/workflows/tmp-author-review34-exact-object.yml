@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   author:
-    if: github.event.head_commit.message == 'Retry temporary review34 exact-object author workflow'
+    if: github.event.head_commit.message == 'Retry review34 author with self-contained late probe'
     runs-on: windows-latest
     steps:
       - name: Checkout author head
@@ -45,6 +45,13 @@ jobs:
           '@
           $text = $text.Replace($needle,$insert + $needle)
           [IO.File]::WriteAllText($path,$text,(New-Object Text.UTF8Encoding($false)))
+
+      - name: Replace cross-script regression helper with self-contained probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m py_compile scripts/.tmp_fix_review34_late_probe.py
+          python scripts/.tmp_fix_review34_late_probe.py
 
       - name: Normalize generated exact-object helper syntax
         shell: pwsh
@@ -103,7 +110,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          git restore --worktree -- scripts/.tmp_patch_exact_object_review34.py
+          git restore --worktree -- scripts/.tmp_patch_exact_object_review34.py scripts/.tmp_fix_review34_late_probe.py
           $allowed = @(
             'scripts/Resolve-HmsModelRoute.ps1',
             'scripts/Build-HmsCompositeSkill.impl.ps1',
