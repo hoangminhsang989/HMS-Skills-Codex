@@ -8,6 +8,174 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+if (-not ('HmsOwnedTempNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class HmsOwnedTempNative
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILETIME_PARTS
+    {
+        public uint Low;
+        public uint High;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public FILETIME_PARTS CreationTime;
+        public FILETIME_PARTS LastAccessTime;
+        public FILETIME_PARTS LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern SafeFileHandle CreateFileW(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetFileInformationByHandle(
+        SafeFileHandle hFile,
+        out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+}
+'@
+}
+
+function Open-HmsOwnedDirectoryIdentityHandle {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][uint32]$ShareMode,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    if ($env:OS -cne 'Windows_NT') {
+        throw "$Label filesystem-identity boundary is supported only on Windows: $Path"
+    }
+
+    # OPEN_EXISTING + BACKUP_SEMANTICS + OPEN_REPARSE_POINT.
+    # During active use ShareMode excludes FILE_SHARE_DELETE so the owned root cannot be renamed away.
+    $handle = [HmsOwnedTempNative]::CreateFileW(
+        $Path,
+        [uint32]0,
+        $ShareMode,
+        [IntPtr]::Zero,
+        [uint32]3,
+        [uint32]0x02200000,
+        [IntPtr]::Zero
+    )
+    if ($null -eq $handle -or $handle.IsInvalid) {
+        $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if ($null -ne $handle) { $handle.Dispose() }
+        throw "$Label could not open owned-directory identity handle (Win32=$code): $Path"
+    }
+
+    try {
+        $info = New-Object 'HmsOwnedTempNative+BY_HANDLE_FILE_INFORMATION'
+        if (-not [HmsOwnedTempNative]::GetFileInformationByHandle($handle, [ref]$info)) {
+            $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "$Label could not read owned-directory identity (Win32=$code): $Path"
+        }
+        if (($info.FileAttributes -band [uint32]0x10) -eq 0) {
+            throw "$Label owned path is not a directory: $Path"
+        }
+        if (($info.FileAttributes -band [uint32]0x400) -ne 0) {
+            throw "$Label owned directory became a reparse point: $Path"
+        }
+        $identity = ([string]$info.VolumeSerialNumber + ':' + [string]$info.FileIndexHigh + ':' + [string]$info.FileIndexLow)
+        return [pscustomobject]@{ Handle=$handle; Identity=$identity }
+    }
+    catch {
+        $handle.Dispose()
+        throw
+    }
+}
+
+function Get-HmsOwnedDirectoryIdentity {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Label
+    )
+    $opened = Open-HmsOwnedDirectoryIdentityHandle -Path $Path -ShareMode ([uint32]7) -Label $Label
+    try { return [string]$opened.Identity }
+    finally { $opened.Handle.Dispose() }
+}
+
+function New-HmsOwnedTempDirectory {
+    param(
+        [Parameter(Mandatory)][string]$Prefix,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    $path = Join-Path ([IO.Path]::GetTempPath()) ($Prefix + [guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $path) { throw "$Label random path already exists: $path" }
+    New-Item -ItemType Directory -Path $path -ErrorAction Stop | Out-Null
+    $guarded = Open-HmsOwnedDirectoryIdentityHandle -Path $path -ShareMode ([uint32]3) -Label $Label
+    return [pscustomobject]@{
+        Path = $path
+        Identity = [string]$guarded.Identity
+        Guard = $guarded.Handle
+    }
+}
+
+function Remove-HmsOwnedTempDirectory {
+    param(
+        [Parameter(Mandatory)]$Owned,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    $path = [string]$Owned.Path
+    $expectedIdentity = [string]$Owned.Identity
+    if ($null -ne $Owned.Guard) {
+        $Owned.Guard.Dispose()
+        $Owned.Guard = $null
+    }
+    if ([string]::IsNullOrWhiteSpace($path) -or [string]::IsNullOrWhiteSpace($expectedIdentity)) {
+        throw "$Label cleanup identity is incomplete."
+    }
+    if (-not (Test-Path -LiteralPath $path)) {
+        throw "$Label owned directory disappeared before cleanup: $path"
+    }
+
+    $currentIdentity = Get-HmsOwnedDirectoryIdentity -Path $path -Label $Label
+    if ($currentIdentity -cne $expectedIdentity) {
+        throw "$Label cleanup rejected a foreign pathname replacement. Expected identity $expectedIdentity, found ${currentIdentity}: $path"
+    }
+
+    $parent = Split-Path -Parent $path
+    $quarantine = Join-Path $parent ('.hms-owned-temp-quarantine-' + [guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $quarantine) {
+        throw "$Label random quarantine path already exists: $quarantine"
+    }
+
+    Rename-Item -LiteralPath $path -NewName (Split-Path -Leaf $quarantine) -ErrorAction Stop
+    $quarantineIdentity = Get-HmsOwnedDirectoryIdentity -Path $quarantine -Label "$Label quarantine"
+    if ($quarantineIdentity -cne $expectedIdentity) {
+        throw "$Label quarantine identity changed across rename. Expected $expectedIdentity, found ${quarantineIdentity}: $quarantine"
+    }
+
+    Remove-Item -LiteralPath $quarantine -Recurse -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $quarantine) {
+        throw "$Label quarantine still exists after cleanup: $quarantine"
+    }
+}
+
+
 function Get-FullPathWithoutExistenceRequirement {
     param([Parameter(Mandatory)][string]$Path)
     $trimChars = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
@@ -157,12 +325,12 @@ $gitCommand = Get-Command git -ErrorAction Stop
 $gitExe = [string]$gitCommand.Source
 if ([string]::IsNullOrWhiteSpace($gitExe)) { throw 'Unable to resolve git executable for exact-HEAD archive transport.' }
 
-$transportRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-committed-copy-transport-' + [guid]::NewGuid().ToString('N'))
+$transportOwned = New-HmsOwnedTempDirectory -Prefix 'hms-committed-copy-transport-' -Label 'Committed-copy transport root'
+$transportRoot = [string]$transportOwned.Path
 $transportGit = Join-Path $transportRoot 'repo.git'
 $archivePath = Join-Path $transportRoot 'committed.zip'
 $destinationCreated = $false
 try {
-    New-Item -ItemType Directory -Force -Path $transportRoot | Out-Null
     & $gitExe init --bare --quiet $transportGit
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $transportGit -PathType Container)) {
         throw 'Committed-copy could not initialize isolated Git object transport.'
@@ -230,7 +398,6 @@ try {
 
             $actual = Get-LiteralBlobHash -RepoRoot $repoRoot -Path $target
             if ($actual -cne [string]$entry.Blob) {
-                Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
                 throw "Committed-copy exact-commit archive transport changed committed bytes for '$archiveEntryPath'. Expected $($entry.Blob), found $actual."
             }
             Restore-ExecutableMode -Destination $target -Mode ([string]$entry.Mode)
@@ -248,14 +415,14 @@ try {
     }
 }
 catch {
-    if (Test-Path -LiteralPath $Destination) {
-        if ($sourceType -ceq 'tree' -or $destinationCreated) { Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction SilentlyContinue }
-        else { Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue }
-    }
+    # Destination belongs to the caller's identity-guarded staging root. Never recursively delete
+    # a caller pathname after failure because a non-cooperating process may have replaced it.
     throw
 }
 finally {
-    if (Test-Path -LiteralPath $transportRoot) { Remove-Item -LiteralPath $transportRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($null -ne $transportOwned) {
+        Remove-HmsOwnedTempDirectory -Owned $transportOwned -Label 'Committed-copy transport root'
+    }
 }
 
 Write-Host "PASS: materialized exact committed Git blobs from HEAD $head through an isolated no-EOL archive transport with literal per-file blob verification: $pathSpec"
