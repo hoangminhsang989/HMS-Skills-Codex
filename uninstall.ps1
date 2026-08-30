@@ -15,6 +15,7 @@ $SuperpowersRemote = 'https://github.com/obra/superpowers.git'
 $TasteRemote = 'https://github.com/Leonxlnx/taste-skill.git'
 $ImpeccableRemote = 'https://github.com/pbakaus/impeccable.git'
 $ThreeLevelRemote = 'https://github.com/nguyenduytamgithub/three-level-delivery.git'
+$BuildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
 
 $skillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
 $compositeRoot = Join-Path $env:USERPROFILE '.codex\hms-composite\hms-superpowers'
@@ -134,57 +135,76 @@ function Remove-VerifiedDirectory {
     }
 }
 
-# Preflight all selected managed paths before mutation.
-if (Test-Path -LiteralPath $compositeRoot) { Assert-OwnedCompositeRoot }
-Get-ExactJunctionState -Path $compositeLink -ExpectedTarget $compositeRoot | Out-Null
-Get-ExactJunctionState -Path $hmsLegacyLink -ExpectedTarget (Join-Path $hmsClone 'skills') | Out-Null
-if ($IncludeSuperpowers) { Get-ExactJunctionState -Path $superpowersLegacyLink -ExpectedTarget (Join-Path $superpowersClone 'skills') | Out-Null }
-if ($IncludeUiSkills) {
-    Get-ExactJunctionState -Path $tasteLegacyLink -ExpectedTarget (Join-Path $tasteClone 'skills\gpt-tasteskill') | Out-Null
-    Get-ExactJunctionState -Path $impeccableLegacyLink -ExpectedTarget (Join-Path $impeccableClone '.agents\skills\impeccable') | Out-Null
-}
+$buildMutex = New-Object System.Threading.Mutex($false, $BuildMutexName)
+$mutexOwned = $false
+try {
+    try {
+        $mutexOwned = $buildMutex.WaitOne([TimeSpan]::FromSeconds(120))
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        $mutexOwned = $true
+    }
+    if (-not $mutexOwned) { throw "Timed out waiting for composite build lock: $BuildMutexName" }
 
-if ($RemoveClones) {
-    Assert-OwnedCompositeRoot
-    Assert-CloneIdentity -Path $hmsClone -ExpectedRemote $HmsRemote -MarkerRelativePath 'skills\hms-superpowers\SKILL.md'
-    if ($IncludeSuperpowers) { Assert-CloneIdentity -Path $superpowersClone -ExpectedRemote $SuperpowersRemote -MarkerRelativePath 'skills\brainstorming\SKILL.md' }
+    # Preflight all selected managed paths before mutation while the same lock excludes
+    # builders/installers/updaters/source reconcilers from touching these paths.
+    if (Test-Path -LiteralPath $compositeRoot) { Assert-OwnedCompositeRoot }
+    Get-ExactJunctionState -Path $compositeLink -ExpectedTarget $compositeRoot | Out-Null
+    Get-ExactJunctionState -Path $hmsLegacyLink -ExpectedTarget (Join-Path $hmsClone 'skills') | Out-Null
+    if ($IncludeSuperpowers) { Get-ExactJunctionState -Path $superpowersLegacyLink -ExpectedTarget (Join-Path $superpowersClone 'skills') | Out-Null }
     if ($IncludeUiSkills) {
-        Assert-CloneIdentity -Path $tasteClone -ExpectedRemote $TasteRemote -MarkerRelativePath 'skills\gpt-tasteskill\SKILL.md'
-        Assert-CloneIdentity -Path $impeccableClone -ExpectedRemote $ImpeccableRemote -MarkerRelativePath '.agents\skills\impeccable\SKILL.md'
+        Get-ExactJunctionState -Path $tasteLegacyLink -ExpectedTarget (Join-Path $tasteClone 'skills\gpt-tasteskill') | Out-Null
+        Get-ExactJunctionState -Path $impeccableLegacyLink -ExpectedTarget (Join-Path $impeccableClone '.agents\skills\impeccable') | Out-Null
     }
+
+    if ($RemoveClones) {
+        Assert-OwnedCompositeRoot
+        Assert-CloneIdentity -Path $hmsClone -ExpectedRemote $HmsRemote -MarkerRelativePath 'skills\hms-superpowers\SKILL.md'
+        if ($IncludeSuperpowers) { Assert-CloneIdentity -Path $superpowersClone -ExpectedRemote $SuperpowersRemote -MarkerRelativePath 'skills\brainstorming\SKILL.md' }
+        if ($IncludeUiSkills) {
+            Assert-CloneIdentity -Path $tasteClone -ExpectedRemote $TasteRemote -MarkerRelativePath 'skills\gpt-tasteskill\SKILL.md'
+            Assert-CloneIdentity -Path $impeccableClone -ExpectedRemote $ImpeccableRemote -MarkerRelativePath '.agents\skills\impeccable\SKILL.md'
+        }
+        if ($IncludeDeliveryTools) {
+            Assert-ManagedCodeGraphRoot -Path $codeGraphRoot
+            Assert-CloneIdentity -Path $threeLevelClone -ExpectedRemote $ThreeLevelRemote -MarkerRelativePath 'three-level-delivery\SKILL.md'
+        }
+    }
+
     if ($IncludeDeliveryTools) {
-        Assert-ManagedCodeGraphRoot -Path $codeGraphRoot
-        Assert-CloneIdentity -Path $threeLevelClone -ExpectedRemote $ThreeLevelRemote -MarkerRelativePath 'three-level-delivery\SKILL.md'
+        if (-not (Test-Path -LiteralPath (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1'))) { throw 'Cannot safely remove delivery-tool configuration because Sync-DeliveryTools.ps1 is unavailable.' }
+        if ($PSCmdlet.ShouldProcess('Codex MCP server codegraph', 'Remove HMS-managed CodeGraph MCP configuration')) {
+            & (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') -RemoveCodeGraphConfig -SkipThreeLevelDelivery
+        }
     }
-}
 
-if ($IncludeDeliveryTools) {
-    if (-not (Test-Path -LiteralPath (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1'))) { throw 'Cannot safely remove delivery-tool configuration because Sync-DeliveryTools.ps1 is unavailable.' }
-    if ($PSCmdlet.ShouldProcess('Codex MCP server codegraph', 'Remove HMS-managed CodeGraph MCP configuration')) {
-        & (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') -RemoveCodeGraphConfig -SkipThreeLevelDelivery
-    }
-}
-
-Remove-VerifiedJunction -Path $compositeLink -ExpectedTarget $compositeRoot
-Remove-VerifiedJunction -Path $hmsLegacyLink -ExpectedTarget (Join-Path $hmsClone 'skills')
-if ($IncludeSuperpowers) { Remove-VerifiedJunction -Path $superpowersLegacyLink -ExpectedTarget (Join-Path $superpowersClone 'skills') }
-if ($IncludeUiSkills) {
-    Remove-VerifiedJunction -Path $tasteLegacyLink -ExpectedTarget (Join-Path $tasteClone 'skills\gpt-tasteskill')
-    Remove-VerifiedJunction -Path $impeccableLegacyLink -ExpectedTarget (Join-Path $impeccableClone '.agents\skills\impeccable')
-}
-
-if ($RemoveClones) {
-    Remove-VerifiedDirectory -Path $compositeRoot -Action 'Remove verified HMS composite bundle'
-    if ($IncludeSuperpowers) { Remove-VerifiedDirectory -Path $superpowersClone -Action 'Remove verified Superpowers clone' }
+    Remove-VerifiedJunction -Path $compositeLink -ExpectedTarget $compositeRoot
+    Remove-VerifiedJunction -Path $hmsLegacyLink -ExpectedTarget (Join-Path $hmsClone 'skills')
+    if ($IncludeSuperpowers) { Remove-VerifiedJunction -Path $superpowersLegacyLink -ExpectedTarget (Join-Path $superpowersClone 'skills') }
     if ($IncludeUiSkills) {
-        Remove-VerifiedDirectory -Path $tasteClone -Action 'Remove verified Taste clone'
-        Remove-VerifiedDirectory -Path $impeccableClone -Action 'Remove verified Impeccable clone'
+        Remove-VerifiedJunction -Path $tasteLegacyLink -ExpectedTarget (Join-Path $tasteClone 'skills\gpt-tasteskill')
+        Remove-VerifiedJunction -Path $impeccableLegacyLink -ExpectedTarget (Join-Path $impeccableClone '.agents\skills\impeccable')
     }
-    if ($IncludeDeliveryTools) {
-        Remove-VerifiedDirectory -Path $threeLevelClone -Action 'Remove verified Three-Level Delivery clone'
-        Remove-VerifiedDirectory -Path $codeGraphRoot -Action 'Remove verified HMS CodeGraph directory'
-    }
-    Remove-VerifiedDirectory -Path $hmsClone -Action 'Remove verified HMS clone'
-}
 
-Write-Host 'Requested HMS Skills Codex uninstall actions completed.'
+    if ($RemoveClones) {
+        Remove-VerifiedDirectory -Path $compositeRoot -Action 'Remove verified HMS composite bundle'
+        if ($IncludeSuperpowers) { Remove-VerifiedDirectory -Path $superpowersClone -Action 'Remove verified Superpowers clone' }
+        if ($IncludeUiSkills) {
+            Remove-VerifiedDirectory -Path $tasteClone -Action 'Remove verified Taste clone'
+            Remove-VerifiedDirectory -Path $impeccableClone -Action 'Remove verified Impeccable clone'
+        }
+        if ($IncludeDeliveryTools) {
+            Remove-VerifiedDirectory -Path $threeLevelClone -Action 'Remove verified Three-Level Delivery clone'
+            Remove-VerifiedDirectory -Path $codeGraphRoot -Action 'Remove verified HMS CodeGraph directory'
+        }
+        Remove-VerifiedDirectory -Path $hmsClone -Action 'Remove verified HMS clone'
+    }
+
+    Write-Host 'Requested HMS Skills Codex uninstall actions completed.'
+}
+finally {
+    if ($mutexOwned) {
+        try { $buildMutex.ReleaseMutex() } catch { }
+    }
+    $buildMutex.Dispose()
+}
