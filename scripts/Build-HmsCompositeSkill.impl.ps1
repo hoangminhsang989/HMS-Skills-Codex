@@ -225,12 +225,45 @@ function Remove-ExactJunction {
 
 function Assert-OwnedCompositeRoot {
     param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+    if (-not [bool]$item.PSIsContainer) { throw "Refusing composite operation on a non-directory path: $Path" }
+    if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Refusing composite operation on a reparse point: $Path" }
     $manifestPath = Join-Path $Path 'manifest.json'
-    if (-not (Test-Path -LiteralPath $manifestPath)) { throw "Refusing to replace unowned composite directory: $Path" }
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "Refusing to replace unowned composite directory: $Path" }
     try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json }
     catch { throw "Refusing to replace composite directory with invalid manifest: $Path" }
     if ([string]$manifest.managed_by -cne $ManagedBy -or [string]$manifest.artifact -cne $Artifact) { throw "Refusing to replace composite directory with unexpected ownership: $Path" }
+}
+
+function Remove-OwnedCompositeQuarantine {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-OwnedCompositeRoot -Path $Path
+    $parent = Split-Path -Parent $Path
+    $leaf = '.hms-composite-deleting-' + [guid]::NewGuid().ToString('N')
+    $quarantine = Join-Path $parent $leaf
+    $deleteStarted = $false
+    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    try {
+        # Destructive-boundary revalidation: a non-cooperating process may replace a pathname
+        # after earlier checks, so only this fresh random quarantine can cross into recursive deletion.
+        Assert-OwnedCompositeRoot -Path $quarantine
+        $deleteStarted = $true
+        Remove-Item -LiteralPath $quarantine -Recurse -Force
+        if (Test-Path -LiteralPath $quarantine) { throw "Composite quarantine removal did not complete: $quarantine" }
+    }
+    catch {
+        $e = $_
+        if (-not $deleteStarted) {
+            try { Restore-Quarantine -Original $Path -Quarantine $quarantine }
+            catch { throw "Composite quarantine pre-delete validation failed and rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)" }
+        }
+        elseif (Test-Path -LiteralPath $quarantine) {
+            throw "Composite deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+        }
+        throw $e
+    }
 }
 
 function Copy-SkillModule {
@@ -475,6 +508,9 @@ try {
         if (Test-Path -LiteralPath $FinalRoot) {
             Rename-Item -LiteralPath $FinalRoot -NewName (Split-Path -Leaf $backup) -ErrorAction Stop
             $oldMovedToBackup = $true
+            # Revalidate the exact path that crossed the rename boundary before any further mutation.
+            # A foreign replacement raced into FinalRoot must be restored, never treated as HMS-owned backup.
+            Assert-OwnedCompositeRoot -Path $backup
         }
 
         if ($env:HMS_TEST_FAIL_STAGE_ACTIVATION -ceq '1') {
@@ -542,7 +578,7 @@ try {
         throw $mutationError
     }
 
-    if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
+    if (Test-Path -LiteralPath $backup) { Remove-OwnedCompositeQuarantine -Path $backup }
     $enabledText = if ($enabled.Count -eq 0) { 'none' } else { $enabled -join ', ' }
     Write-Host "PASS: compiled one Codex skill '$CompositeName' from enabled work modules: $enabledText; committed-only source trees, stable source snapshots, serialized activation, and rollback-qualified bundle swap verified."
     Write-Host "Composite bundle: $FinalRoot"
