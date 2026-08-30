@@ -20,14 +20,27 @@ $CompositeLink = Join-Path $SkillsRoot $CompositeName
 $SuperpowersRoot = Join-Path $env:USERPROFILE '.codex\superpowers'
 $TasteRoot = Join-Path $env:USERPROFILE '.codex\taste-skill'
 $ImpeccableRoot = Join-Path $env:USERPROFILE '.codex\impeccable'
+$SuperpowersLockPath = Join-Path $InstallRoot 'superpowers.lock.json'
 $UiLockPath = Join-Path $InstallRoot 'ui-skills.lock.json'
+$ModelRouterSource = Join-Path $InstallRoot 'skills\hms-model-router'
 $ModelDispatcherSource = Join-Path $InstallRoot 'skills\hms-model-dispatcher'
 $ModelResolverSource = Join-Path $InstallRoot 'scripts\Resolve-HmsModelRoute.ps1'
 $ModelSettingsPath = Join-Path $OutputRoot 'model-settings.json'
+$BuildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
+$CanonicalHmsRemote = 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
 
 function Get-CanonicalPath {
     param([Parameter(Mandatory)][string]$Path)
     return (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\')
+}
+
+function Normalize-GitRemote {
+    param([Parameter(Mandatory)][string]$Remote)
+    $value = $Remote.Trim().TrimEnd('/')
+    if ($value.EndsWith('.git', [StringComparison]::OrdinalIgnoreCase)) {
+        $value = $value.Substring(0, $value.Length - 4)
+    }
+    return $value.ToLowerInvariant()
 }
 
 function Get-GitHeadOrNull {
@@ -35,18 +48,77 @@ function Get-GitHeadOrNull {
     if (-not (Test-Path -LiteralPath (Join-Path $Path '.git'))) { return $null }
     $head = & git -C $Path rev-parse HEAD 2>$null
     if ($LASTEXITCODE -ne 0) { return $null }
-    $value = $head.Trim().ToLowerInvariant()
+    $value = ($head -join '').Trim().ToLowerInvariant()
     if ($value -notmatch '^[0-9a-f]{40}$') { return $null }
     return $value
+}
+
+function Assert-GitSourceIdentity {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ExpectedRepository,
+        [string]$ExpectedCommit,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    if (-not (Test-Path -LiteralPath (Join-Path $Path '.git'))) { throw "$Label source is not a Git checkout: $Path" }
+
+    $origin = (& git -C $Path remote get-url origin 2>$null) -join ''
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($origin)) { throw "$Label source origin could not be read: $Path" }
+    if ((Normalize-GitRemote -Remote $origin) -cne (Normalize-GitRemote -Remote $ExpectedRepository)) {
+        throw "$Label source origin mismatch. Expected '$ExpectedRepository', found '$($origin.Trim())'."
+    }
+
+    $head = Get-GitHeadOrNull -Path $Path
+    if ($null -eq $head) { throw "$Label source HEAD is not a canonical 40-hex commit: $Path" }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedCommit)) {
+        $expected = $ExpectedCommit.Trim().ToLowerInvariant()
+        if ($expected -notmatch '^[0-9a-f]{40}$') { throw "$Label expected commit is invalid: $ExpectedCommit" }
+        if ($head -cne $expected) { throw "$Label source HEAD mismatch. Expected $expected, found $head." }
+    }
+
+    $status = (& git -C $Path status --porcelain=v1 --untracked-files=all 2>$null) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw "$Label source clean-state check failed: $Path" }
+    if (-not [string]::IsNullOrWhiteSpace($status)) { throw "$Label source is dirty; refusing to compile unreviewed bytes: $Path" }
+
+    return $head
+}
+
+function Read-SuperpowersLock {
+    if (-not (Test-Path -LiteralPath $SuperpowersLockPath)) { throw "Superpowers lock file not found: $SuperpowersLockPath" }
+    try { $lock = Get-Content -LiteralPath $SuperpowersLockPath -Raw | ConvertFrom-Json }
+    catch { throw "Superpowers lock is invalid JSON: $($_.Exception.Message)" }
+    if ([string]$lock.repository -cne 'https://github.com/obra/superpowers.git') { throw 'Unexpected Superpowers repository in superpowers.lock.json.' }
+    if ([string]$lock.commit -notmatch '^[0-9a-f]{40}$') { throw 'Invalid Superpowers commit in superpowers.lock.json.' }
+    return $lock
 }
 
 function Read-UiLock {
     if (-not (Test-Path -LiteralPath $UiLockPath)) { throw "UI skills lock file not found: $UiLockPath" }
     try { $lock = Get-Content -LiteralPath $UiLockPath -Raw | ConvertFrom-Json }
     catch { throw "UI skills lock is invalid JSON: $($_.Exception.Message)" }
+    if ([string]$lock.taste.repository -cne 'https://github.com/Leonxlnx/taste-skill.git') { throw 'Unexpected Taste repository in ui-skills.lock.json.' }
     if ([string]$lock.taste.skill_path -cne 'skills/gpt-tasteskill') { throw 'Unexpected Taste skill path in ui-skills.lock.json.' }
+    if ([string]$lock.taste.commit -notmatch '^[0-9a-f]{40}$') { throw 'Invalid Taste commit in ui-skills.lock.json.' }
+    if ([string]$lock.impeccable.repository -cne 'https://github.com/pbakaus/impeccable.git') { throw 'Unexpected Impeccable repository in ui-skills.lock.json.' }
     if ([string]$lock.impeccable.skill_path -cne '.agents/skills/impeccable') { throw 'Unexpected Impeccable skill path in ui-skills.lock.json.' }
+    if ([string]$lock.impeccable.commit -notmatch '^[0-9a-f]{40}$') { throw 'Invalid Impeccable commit in ui-skills.lock.json.' }
     return $lock
+}
+
+function Assert-SelectedSourceIdentities {
+    param([Parameter(Mandatory)]$SuperLock,[Parameter(Mandatory)]$UiLock)
+
+    $null = Assert-GitSourceIdentity -Path $InstallRoot -ExpectedRepository $CanonicalHmsRemote -Label 'HMS Skills Codex'
+    if ($Superpowers) {
+        $null = Assert-GitSourceIdentity -Path $SuperpowersRoot -ExpectedRepository ([string]$SuperLock.repository) -ExpectedCommit ([string]$SuperLock.commit) -Label 'Superpowers'
+    }
+    if ($Taste) {
+        $null = Assert-GitSourceIdentity -Path $TasteRoot -ExpectedRepository ([string]$UiLock.taste.repository) -ExpectedCommit ([string]$UiLock.taste.commit) -Label 'GPT Taste'
+    }
+    if ($Impeccable) {
+        $null = Assert-GitSourceIdentity -Path $ImpeccableRoot -ExpectedRepository ([string]$UiLock.impeccable.repository) -ExpectedCommit ([string]$UiLock.impeccable.commit) -Label 'Impeccable'
+    }
 }
 
 function Get-ExactJunctionState {
@@ -151,6 +223,7 @@ function Write-CompositeSkill {
     param(
         [Parameter(Mandatory)][string]$StageRoot,
         [Parameter(Mandatory)]$Modules,
+        [Parameter(Mandatory)][string]$ModelRouterReference,
         [Parameter(Mandatory)][string]$ModelDispatcherReference,
         [string[]]$HmsReferences,
         [string[]]$SuperpowersReferences,
@@ -162,7 +235,7 @@ function Write-CompositeSkill {
     $lines = @(
         '---',
         'name: hms-superpowers',
-        'description: Use as the single HMS entry point for project work; it routes each task to exactly one enabled internal module owner and assigns an enabled GPT-5.6 model through the dedicated model dispatcher.',
+        'description: Use as the single HMS entry point for project work; it routes each task to exactly one enabled internal work-module owner and assigns an enabled GPT-5.6 model through the dedicated model router and dispatcher.',
         '---',
         '',
         '# HMS Unified Superpower',
@@ -174,43 +247,59 @@ function Write-CompositeSkill {
         '## Arbitration kernel',
         '',
         '1. Owner instruction and current project authority always outrank every internal module.',
-        '2. Assign exactly one primary work-module owner for each decision or task slice.',
-        '3. The model dispatcher is always internal when the public skill is exposed; it assigns models but never owns product/work decisions.',
-        '4. Other enabled modules may advise or provide method, but they must not compete for ownership.',
-        '5. Never let two modules mutate the same files or design authority concurrently.',
-        '6. If module guidance conflicts, apply the role matrix below instead of blending incompatible instructions.',
-        '7. Load only the module references needed for the current task; MODULE.md files are references, not separately invokable Codex skills.',
+        '2. Assign exactly one enabled primary work-module owner for each decision or task slice.',
+        '3. The model router and model dispatcher are always internal when the public skill is exposed; they classify/assign models but never own product/work decisions.',
+        '4. Never assign exclusive work ownership to a disabled module. If a required owner is OFF and no higher authority defines a safe fallback, report MODULE_REQUIRED=<module> and stop that slice.',
+        '5. Other enabled modules may advise or provide method, but they must not compete for ownership.',
+        '6. Never let two modules mutate the same files or design authority concurrently.',
+        '7. If module guidance conflicts, apply the enabled-role matrix below instead of blending incompatible instructions.',
+        '8. Load only the module references needed for the current task; MODULE.md files are references, not separately invokable Codex skills.',
         '',
-        '## Model dispatcher',
+        '## Model routing',
         '',
-        ('Always-internal reference: ' + $ModelDispatcherReference),
+        ('Always-internal risk router: ' + $ModelRouterReference),
+        ('Always-internal model dispatcher: ' + $ModelDispatcherReference),
         ('Model settings: ' + $ModelSettingsPath),
-        'Before every non-trivial model-routed task slice, classify the required floor and use the dispatcher/resolver. Safe reassignment is upward only: Luna -> Terra -> Sol, Terra -> Sol, and Sol-required work with Sol disabled is BLOCKED.',
+        'For each non-trivial model-routed slice, the risk router emits RISK_CLASS plus REQUIRED_MODEL_FLOOR. Pass that floor directly to the dispatcher/resolver. Do not recompute or lower it.',
+        'Safe reassignment is upward only: Luna -> Terra -> Sol, Terra -> Sol, and Sol-required work with Sol disabled is BLOCKED.',
         'Model ON/OFF policy is not proof that the runtime switched model. Never claim a switch without observable runtime evidence.',
         '',
-        '## Exclusive role matrix',
+        '## Enabled exclusive role matrix',
         '',
         '| Work type | Primary owner | Other modules |',
-        '| --- | --- | --- |',
-        '| Authority, checkpoint, scope, model floor, evidence, review gate, release, handoff | HMS Core | Others are subordinate |',
-        '| Engineering plan, worktree method, debugging, TDD, implementation workflow | Superpowers | HMS governs boundaries; UI advisors do not own engineering |',
-        '| Visual direction, aesthetic options, taste critique | GPT Taste | Advisory only; cannot override project UI authority |',
-        '| UI audit, consistency, typography, spacing, accessibility, final polish | Impeccable | Advisory/polish only; cannot redesign frozen authority |',
-        '| Model assignment from enabled pool | HMS Model Dispatcher | Not a work owner; cannot lower mandatory capability floor |',
-        '| UI production implementation | Superpowers | Taste proposes direction; Impeccable audits/polishes; HMS governs if enabled |',
-        '',
-        '## UI sequence when multiple UI modules are enabled',
-        '',
-        'Run UI work sequentially: project/HMS UI authority -> GPT Taste direction -> Impeccable audit/polish -> Superpowers implementation -> HMS evidence/release gates.',
-        'Do not ask Taste and Impeccable to independently redesign the same artifact. Taste owns direction; Impeccable owns quality audit and polish inside the accepted direction.',
-        '',
-        '## Module loading contract',
-        '',
-        '### HMS Model Dispatcher',
-        'Always load the model dispatcher for non-trivial model-routed work. It reads the model pool and safely reassigns work only to an equal-or-stronger enabled model.',
-        ('- ' + $ModelDispatcherReference),
-        ''
+        '| --- | --- | --- |'
     )
+    if ([bool]$Modules['hms']) {
+        $lines += '| Authority, checkpoint, scope, model floor, evidence, review gate, release, handoff | HMS Core | Others are subordinate |'
+    }
+    if ([bool]$Modules['superpowers']) {
+        $lines += '| Engineering plan, worktree method, debugging, TDD, implementation workflow | Superpowers | HMS governs boundaries when enabled; UI advisors do not own engineering |'
+        $lines += '| UI production implementation | Superpowers | Taste direction and Impeccable audit/polish may support when enabled; HMS governs when enabled |'
+    }
+    if ([bool]$Modules['taste']) {
+        $lines += '| Visual direction, aesthetic options, taste critique | GPT Taste | Advisory only; cannot override project UI authority |'
+    }
+    if ([bool]$Modules['impeccable']) {
+        $lines += '| UI audit, consistency, typography, spacing, accessibility, final polish | Impeccable | Advisory/polish only; cannot redesign frozen authority |'
+    }
+    $lines += '| Model assignment from enabled pool | HMS Model Dispatcher | Not a work owner; cannot lower mandatory capability floor |'
+    $lines += ''
+    $lines += '## UI sequence when multiple UI modules are enabled'
+    $lines += ''
+    $lines += 'Apply only enabled work modules, sequentially, inside owner/project UI authority. Taste owns unresolved direction when enabled; Impeccable owns audit/polish when enabled; Superpowers owns implementation when enabled; HMS owns evidence/release when enabled.'
+    $lines += 'Do not ask disabled modules to act, and do not let Taste and Impeccable independently redesign the same artifact.'
+    $lines += ''
+    $lines += '## Module loading contract'
+    $lines += ''
+    $lines += '### HMS Model Router'
+    $lines += 'Always load the risk router for non-trivial model-routed work so the required model floor is explicit before assignment.'
+    $lines += ('- ' + $ModelRouterReference)
+    $lines += ''
+    $lines += '### HMS Model Dispatcher'
+    $lines += 'Pass the required floor directly to the dispatcher. It reads the model pool and safely reassigns work only to an equal-or-stronger enabled model.'
+    $lines += ('- ' + $ModelDispatcherReference)
+    $lines += ''
+
     if ([bool]$Modules['hms']) {
         $lines += '### HMS Core'
         $lines += 'HMS Core owns governance and final arbitration. Read references/hms/hms-superpowers/MODULE.md first, then load only supporting HMS MODULE.md files required by the current gate.'
@@ -236,56 +325,79 @@ function Write-CompositeSkill {
         $lines += ''
     }
     if ($enabled.Count -eq 0) {
-        $lines += 'No work modules are enabled. This bundle must not be exposed to Codex discovery even though model settings and the dispatcher source remain managed.'
+        $lines += 'No work modules are enabled. This bundle must not be exposed to Codex discovery even though model settings and the model-routing sources remain managed.'
     }
     else {
         $lines += '## Completion rule'
         $lines += ''
-        $lines += 'Use one public entry point, one primary work owner per slice, one dedicated model assignment, sequential advisors, and the strongest applicable evidence gate.'
+        $lines += 'Use one public entry point, one enabled primary work owner per slice, one explicit risk floor, one dedicated model assignment, sequential advisors, and the strongest applicable evidence gate.'
     }
     Set-Content -LiteralPath (Join-Path $StageRoot 'SKILL.md') -Value ($lines -join "`r`n") -Encoding UTF8
 }
 
-$uiLock = Read-UiLock
-$modules = [ordered]@{ hms=[bool]$Hms; superpowers=[bool]$Superpowers; taste=[bool]$Taste; impeccable=[bool]$Impeccable }
-if (-not (Test-Path -LiteralPath (Join-Path $ModelDispatcherSource 'SKILL.md'))) { throw 'Dedicated model dispatcher source is missing.' }
-if (-not (Test-Path -LiteralPath $ModelResolverSource)) { throw 'Dedicated model route resolver script is missing.' }
-if ($Hms -and -not (Test-Path -LiteralPath (Join-Path $InstallRoot 'skills\hms-superpowers\SKILL.md'))) { throw 'HMS Core is enabled but HMS skill sources are missing.' }
-if ($Superpowers -and -not (Test-Path -LiteralPath (Join-Path $SuperpowersRoot 'skills'))) { throw 'Superpowers is enabled but the pinned source repository is missing.' }
-$tasteSource = Join-Path $TasteRoot ([string]$uiLock.taste.skill_path)
-$impeccableSource = Join-Path $ImpeccableRoot ([string]$uiLock.impeccable.skill_path)
-if ($Taste -and -not (Test-Path -LiteralPath (Join-Path $tasteSource 'SKILL.md'))) { throw 'GPT Taste is enabled but its pinned skill source is missing.' }
-if ($Impeccable -and -not (Test-Path -LiteralPath (Join-Path $impeccableSource 'SKILL.md'))) { throw 'Impeccable is enabled but its pinned skill source is missing.' }
-
-New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
-New-Item -ItemType Directory -Force -Path $SkillsRoot | Out-Null
-Assert-OwnedCompositeRoot -Path $FinalRoot
-
-$legacy = @(
-    [pscustomobject]@{ Name='hms'; Link=(Join-Path $SkillsRoot 'hms'); Target=(Join-Path $InstallRoot 'skills') },
-    [pscustomobject]@{ Name='superpowers'; Link=(Join-Path $SkillsRoot 'superpowers'); Target=(Join-Path $SuperpowersRoot 'skills') },
-    [pscustomobject]@{ Name='taste'; Link=(Join-Path $SkillsRoot 'gpt-taste'); Target=$tasteSource },
-    [pscustomobject]@{ Name='impeccable'; Link=(Join-Path $SkillsRoot 'impeccable'); Target=$impeccableSource }
-)
-foreach ($entry in $legacy) {
-    if ($null -eq (Get-Item -LiteralPath $entry.Link -Force -ErrorAction SilentlyContinue)) { continue }
-    $state = Get-ExactJunctionState -Link $entry.Link -Target $entry.Target
-    if ($state.State -ne 'Exact') { throw "Legacy discovery conflict blocks single-skill migration: $($entry.Link) : $($state.Detail)" }
-}
-if (Test-Path -LiteralPath $FinalRoot) {
-    $state = Get-ExactJunctionState -Link $CompositeLink -Target $FinalRoot
-    if ($state.State -eq 'Conflict') { throw "Composite discovery conflict: $($state.Detail)" }
-}
-elseif ($null -ne (Get-Item -LiteralPath $CompositeLink -Force -ErrorAction SilentlyContinue)) {
-    throw "Composite discovery path exists before its managed target exists: $CompositeLink"
-}
-
-$stage = Join-Path $OutputRoot ('.stage-' + [guid]::NewGuid().ToString('N'))
-$backup = Join-Path $OutputRoot ('.backup-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $stage | Out-Null
+$buildMutex = New-Object System.Threading.Mutex($false, $BuildMutexName)
+$mutexOwned = $false
+$stage = $null
 try {
+    try {
+        $mutexOwned = $buildMutex.WaitOne([TimeSpan]::FromSeconds(120))
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        $mutexOwned = $true
+    }
+    if (-not $mutexOwned) { throw "Timed out waiting for composite build lock: $BuildMutexName" }
+
+    # The HMS checkout contains the compiler, internal model routing sources, and lock
+    # files. Refuse dirty/foreign source before any bundle or discovery mutation.
+    $null = Assert-GitSourceIdentity -Path $InstallRoot -ExpectedRepository $CanonicalHmsRemote -Label 'HMS Skills Codex'
+    $superLock = Read-SuperpowersLock
+    $uiLock = Read-UiLock
+    Assert-SelectedSourceIdentities -SuperLock $superLock -UiLock $uiLock
+
+    $modules = [ordered]@{ hms=[bool]$Hms; superpowers=[bool]$Superpowers; taste=[bool]$Taste; impeccable=[bool]$Impeccable }
+    if (-not (Test-Path -LiteralPath (Join-Path $ModelRouterSource 'SKILL.md'))) { throw 'Dedicated model router source is missing.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $ModelDispatcherSource 'SKILL.md'))) { throw 'Dedicated model dispatcher source is missing.' }
+    if (-not (Test-Path -LiteralPath $ModelResolverSource)) { throw 'Dedicated model route resolver script is missing.' }
+    if ($Hms -and -not (Test-Path -LiteralPath (Join-Path $InstallRoot 'skills\hms-superpowers\SKILL.md'))) { throw 'HMS Core is enabled but HMS skill sources are missing.' }
+    if ($Superpowers -and -not (Test-Path -LiteralPath (Join-Path $SuperpowersRoot 'skills'))) { throw 'Superpowers is enabled but the pinned source repository is missing.' }
+    $tasteSource = Join-Path $TasteRoot ([string]$uiLock.taste.skill_path)
+    $impeccableSource = Join-Path $ImpeccableRoot ([string]$uiLock.impeccable.skill_path)
+    if ($Taste -and -not (Test-Path -LiteralPath (Join-Path $tasteSource 'SKILL.md'))) { throw 'GPT Taste is enabled but its pinned skill source is missing.' }
+    if ($Impeccable -and -not (Test-Path -LiteralPath (Join-Path $impeccableSource 'SKILL.md'))) { throw 'Impeccable is enabled but its pinned skill source is missing.' }
+
+    New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
+    New-Item -ItemType Directory -Force -Path $SkillsRoot | Out-Null
+    Assert-OwnedCompositeRoot -Path $FinalRoot
+
+    $legacy = @(
+        [pscustomobject]@{ Name='hms'; Link=(Join-Path $SkillsRoot 'hms'); Target=(Join-Path $InstallRoot 'skills') },
+        [pscustomobject]@{ Name='superpowers'; Link=(Join-Path $SkillsRoot 'superpowers'); Target=(Join-Path $SuperpowersRoot 'skills') },
+        [pscustomobject]@{ Name='taste'; Link=(Join-Path $SkillsRoot 'gpt-taste'); Target=$tasteSource },
+        [pscustomobject]@{ Name='impeccable'; Link=(Join-Path $SkillsRoot 'impeccable'); Target=$impeccableSource }
+    )
+    foreach ($entry in $legacy) {
+        if ($null -eq (Get-Item -LiteralPath $entry.Link -Force -ErrorAction SilentlyContinue)) { continue }
+        $state = Get-ExactJunctionState -Link $entry.Link -Target $entry.Target
+        if ($state.State -ne 'Exact') { throw "Legacy discovery conflict blocks single-skill migration: $($entry.Link) : $($state.Detail)" }
+    }
+    if (Test-Path -LiteralPath $FinalRoot) {
+        $state = Get-ExactJunctionState -Link $CompositeLink -Target $FinalRoot
+        if ($state.State -eq 'Conflict') { throw "Composite discovery conflict: $($state.Detail)" }
+    }
+    elseif ($null -ne (Get-Item -LiteralPath $CompositeLink -Force -ErrorAction SilentlyContinue)) {
+        throw "Composite discovery path exists before its managed target exists: $CompositeLink"
+    }
+
+    $stage = Join-Path $OutputRoot ('.stage-' + [guid]::NewGuid().ToString('N'))
+    $backup = Join-Path $OutputRoot ('.backup-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
     $refsRoot = Join-Path $stage 'references'
     $hmsRefs = @(); $superRefs = @(); $tasteRef = $null; $impeccableRef = $null
+
+    $modelRouterDestination = Join-Path $refsRoot 'model-router'
+    Copy-SkillModule -Source $ModelRouterSource -Destination $modelRouterDestination
+    $modelRouterRef = 'references/model-router/MODULE.md'
 
     $modelDispatcherDestination = Join-Path $refsRoot 'model-dispatcher'
     Copy-SkillModule -Source $ModelDispatcherSource -Destination $modelDispatcherDestination
@@ -293,25 +405,31 @@ try {
     $modelDispatcherRef = 'references/model-dispatcher/MODULE.md'
 
     if ($Hms) {
-        $hmsRefs = @(Copy-SkillCollection -SkillsDirectory (Join-Path $InstallRoot 'skills') -DestinationRoot (Join-Path $refsRoot 'hms') -ModulePrefix 'references/hms' -ExcludeNames @('hms-model-dispatcher'))
+        $hmsRefs = @(Copy-SkillCollection -SkillsDirectory (Join-Path $InstallRoot 'skills') -DestinationRoot (Join-Path $refsRoot 'hms') -ModulePrefix 'references/hms' -ExcludeNames @('hms-model-router','hms-model-dispatcher'))
     }
     if ($Superpowers) { $superRefs = @(Copy-SkillCollection -SkillsDirectory (Join-Path $SuperpowersRoot 'skills') -DestinationRoot (Join-Path $refsRoot 'superpowers') -ModulePrefix 'references/superpowers') }
     if ($Taste) { Copy-SkillModule -Source $tasteSource -Destination (Join-Path $refsRoot 'taste'); $tasteRef = 'references/taste/MODULE.md' }
     if ($Impeccable) { Copy-SkillModule -Source $impeccableSource -Destination (Join-Path $refsRoot 'impeccable'); $impeccableRef = 'references/impeccable/MODULE.md' }
-    Write-CompositeSkill -StageRoot $stage -Modules $modules -ModelDispatcherReference $modelDispatcherRef -HmsReferences $hmsRefs -SuperpowersReferences $superRefs -TasteReference $tasteRef -ImpeccableReference $impeccableRef
+
+    # Detect a source checkout changing while it was being copied. A mismatch/dirty
+    # source aborts before the staged bundle can become active.
+    Assert-SelectedSourceIdentities -SuperLock $superLock -UiLock $uiLock
+
+    Write-CompositeSkill -StageRoot $stage -Modules $modules -ModelRouterReference $modelRouterRef -ModelDispatcherReference $modelDispatcherRef -HmsReferences $hmsRefs -SuperpowersReferences $superRefs -TasteReference $tasteRef -ImpeccableReference $impeccableRef
 
     $enabled = @($modules.Keys | Where-Object { [bool]$modules[$_] })
     $manifest = [ordered]@{
         schema_version=1; managed_by=$ManagedBy; artifact=$Artifact; composite_skill=$CompositeName; generated_at_utc=[DateTime]::UtcNow.ToString('o'); modules=$modules; enabled_modules=$enabled
         source_heads=[ordered]@{ hms=(Get-GitHeadOrNull -Path $InstallRoot); superpowers=(Get-GitHeadOrNull -Path $SuperpowersRoot); taste=(Get-GitHeadOrNull -Path $TasteRoot); impeccable=(Get-GitHeadOrNull -Path $ImpeccableRoot) }
         routing_contract=[ordered]@{
-            governance='hms'; engineering_method='superpowers'; visual_direction='taste'; ui_audit_polish='impeccable'; concurrency='one-primary-owner-per-task-slice'; model_dispatcher='always-internal'; model_fallback='upward-only'; model_settings=$ModelSettingsPath
+            governance='hms'; engineering_method='superpowers'; visual_direction='taste'; ui_audit_polish='impeccable'; concurrency='one-primary-owner-per-task-slice'; composite_build_lock=$BuildMutexName; model_router='always-internal'; model_dispatcher='always-internal'; model_fallback='upward-only'; model_settings=$ModelSettingsPath
         }
     }
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stage 'manifest.json') -Encoding UTF8
 
     if (Test-Path -LiteralPath $FinalRoot) { Rename-Item -LiteralPath $FinalRoot -NewName (Split-Path -Leaf $backup) -ErrorAction Stop }
     Rename-Item -LiteralPath $stage -NewName (Split-Path -Leaf $FinalRoot) -ErrorAction Stop
+    $stage = $null
 
     $removedLegacy = @(); $createdComposite = $false
     try {
@@ -344,10 +462,14 @@ try {
 
     if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Recurse -Force }
     $enabledText = if ($enabled.Count -eq 0) { 'none' } else { $enabled -join ', ' }
-    Write-Host "PASS: compiled one Codex skill '$CompositeName' from enabled work modules: $enabledText; dedicated model dispatcher embedded."
+    Write-Host "PASS: compiled one Codex skill '$CompositeName' from enabled work modules: $enabledText; dedicated model router and dispatcher embedded under serialized exact-source compilation."
     Write-Host "Composite bundle: $FinalRoot"
     if ($enabled.Count -gt 0) { Write-Host "Codex discovery: $CompositeLink" } else { Write-Host 'Codex discovery disabled because no work modules are enabled.' }
 }
 finally {
-    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+    if ($null -ne $stage -and (Test-Path -LiteralPath $stage)) { Remove-Item -LiteralPath $stage -Recurse -Force }
+    if ($mutexOwned) {
+        try { $buildMutex.ReleaseMutex() } catch { }
+    }
+    $buildMutex.Dispose()
 }
