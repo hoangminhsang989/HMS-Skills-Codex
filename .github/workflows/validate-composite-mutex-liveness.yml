@@ -20,7 +20,7 @@ jobs:
         with:
           ref: ${{ env.CANDIDATE_SHA }}
 
-      - name: Prove post-lifecycle external lock acquisition and two-process build liveness
+      - name: Localize post-lifecycle lock and two-process builder liveness
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -76,6 +76,43 @@ jobs:
             Write-Host "PASS: external process acquired and released composite mutex after $Label."
           }
 
+          function Wait-BuilderPair {
+            param(
+              [Parameter(Mandatory)][object[]]$Jobs,
+              [Parameter(Mandatory)][string]$Label,
+              [Parameter(Mandatory)][int]$TimeoutSeconds
+            )
+            $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+            while ([DateTime]::UtcNow -lt $deadline) {
+              foreach ($job in $Jobs) { Receive-Job -Job $job -ErrorAction Stop | Write-Host }
+              if (@($Jobs | Where-Object { $_.State -notin @('Completed','Failed','Stopped') }).Count -eq 0) { break }
+              Start-Sleep -Milliseconds 250
+            }
+            foreach ($job in $Jobs) {
+              Receive-Job -Job $job -ErrorAction Stop | Write-Host
+              if ($job.State -ne 'Completed') {
+                $states = (($Jobs | ForEach-Object { "Id=$($_.Id):$($_.State)" }) -join ', ')
+                throw "$Label did not complete within ${TimeoutSeconds}s. $states"
+              }
+            }
+            Write-Host "PASS: $Label completed within ${TimeoutSeconds}s."
+          }
+
+          $jobScript = {
+            param($Builder,$Install,$Output,$Skills,$HmsEnabled,$Label)
+            $ErrorActionPreference = 'Stop'
+            Write-Output "HMS_JOB_START label=$Label pid=$PID hms=$HmsEnabled utc=$([DateTime]::UtcNow.ToString('o'))"
+            & $Builder `
+              -InstallRoot $Install `
+              -OutputRoot $Output `
+              -SkillsRoot $Skills `
+              -Hms ([bool]$HmsEnabled) `
+              -Superpowers $false `
+              -Taste $false `
+              -Impeccable $false
+            Write-Output "HMS_JOB_RETURN label=$Label pid=$PID hms=$HmsEnabled utc=$([DateTime]::UtcNow.ToString('o'))"
+          }
+
           $runnerHome = $env:USERPROFILE
           $originalHome = $env:HOME
           $originalCodexHome = $env:CODEX_HOME
@@ -105,48 +142,40 @@ jobs:
               -Impeccable $false
             Assert-ExternalMutexAcquire -Label 'direct builder lifecycle'
 
-            $parallelOutput = Join-Path $tempRoot 'parallel-composite'
-            $parallelSkills = Join-Path $tempRoot 'parallel-skills'
-            $jobScript = {
-              param($Builder,$Install,$Output,$Skills,$HmsEnabled)
-              $ErrorActionPreference = 'Stop'
-              & $Builder `
-                -InstallRoot $Install `
-                -OutputRoot $Output `
-                -SkillsRoot $Skills `
-                -Hms ([bool]$HmsEnabled) `
-                -Superpowers $false `
-                -Taste $false `
-                -Impeccable $false
-            }
-            $jobs = @()
+            # Phase A: both children leave public discovery OFF. This removes Junction create/remove transitions from the liveness equation.
+            $offOutput = Join-Path $tempRoot 'parallel-off-composite'
+            $offSkills = Join-Path $tempRoot 'parallel-off-skills'
+            $offJobs = @()
             try {
-              $jobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$parallelOutput,$parallelSkills,$true
-              $jobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$parallelOutput,$parallelSkills,$false
-              $deadline = [DateTime]::UtcNow.AddSeconds(120)
-              while ([DateTime]::UtcNow -lt $deadline) {
-                foreach ($job in $jobs) { Receive-Job -Job $job -ErrorAction Stop | Write-Host }
-                if (@($jobs | Where-Object { $_.State -notin @('Completed','Failed','Stopped') }).Count -eq 0) { break }
-                Start-Sleep -Milliseconds 250
-              }
-              foreach ($job in $jobs) {
-                Receive-Job -Job $job -ErrorAction Stop | Write-Host
-                if ($job.State -ne 'Completed') {
-                  throw "Concurrent lightweight composite build job did not complete: Id=$($job.Id) State=$($job.State)"
-                }
-              }
+              $offJobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$offOutput,$offSkills,$false,'off-a'
+              $offJobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$offOutput,$offSkills,$false,'off-b'
+              Wait-BuilderPair -Jobs $offJobs -Label 'two-process OFF/OFF composite build' -TimeoutSeconds 60
             }
             finally {
-              foreach ($job in $jobs) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+              foreach ($job in $offJobs) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
             }
+            Assert-ExternalMutexAcquire -Label 'two-process OFF/OFF lifecycle'
 
-            Assert-ExternalMutexAcquire -Label 'two-process composite build lifecycle'
-            $parallelManifestPath = Join-Path $parallelOutput 'hms-superpowers\manifest.json'
-            if (-not (Test-Path -LiteralPath $parallelManifestPath)) { throw 'Two-process build did not leave a composite manifest.' }
-            $leftovers = @(Get-ChildItem -LiteralPath $parallelOutput -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.stage-*' -or $_.Name -like '.backup-*' })
-            if ($leftovers.Count -ne 0) { throw 'Two-process build left stage/backup artifacts.' }
+            # Phase B: preserve the original reproducer: one child enables HMS discovery while the other disables it.
+            $toggleOutput = Join-Path $tempRoot 'parallel-toggle-composite'
+            $toggleSkills = Join-Path $tempRoot 'parallel-toggle-skills'
+            $toggleJobs = @()
+            try {
+              $toggleJobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$toggleOutput,$toggleSkills,$true,'toggle-on'
+              $toggleJobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$toggleOutput,$toggleSkills,$false,'toggle-off'
+              Wait-BuilderPair -Jobs $toggleJobs -Label 'two-process ON/OFF composite build' -TimeoutSeconds 120
+            }
+            finally {
+              foreach ($job in $toggleJobs) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+            }
+            Assert-ExternalMutexAcquire -Label 'two-process ON/OFF lifecycle'
 
-            Write-Host 'PASS: composite mutex ownership is externally reacquirable after install/direct-build/two-process lifecycles; 120-second two-process liveness bound holds.'
+            $toggleManifestPath = Join-Path $toggleOutput 'hms-superpowers\manifest.json'
+            if (-not (Test-Path -LiteralPath $toggleManifestPath)) { throw 'Two-process ON/OFF build did not leave a composite manifest.' }
+            $leftovers = @(Get-ChildItem -LiteralPath $toggleOutput -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.stage-*' -or $_.Name -like '.backup-*' })
+            if ($leftovers.Count -ne 0) { throw 'Two-process ON/OFF build left stage/backup artifacts.' }
+
+            Write-Host 'PASS: external mutex reacquisition, OFF/OFF process serialization, and ON/OFF process serialization all satisfy bounded Windows liveness.'
           }
           finally {
             if (Test-Path -LiteralPath $tempRoot) { Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue }
