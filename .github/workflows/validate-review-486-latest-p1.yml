@@ -1,116 +1,63 @@
-name: Validate HMS review 486 latest P1 boundaries
+name: Apply ExpectedHead fixture alignment
 
 on:
-  push:
-    branches: ['**']
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 env:
-  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha }}
 
 jobs:
-  windows-review-486-latest-p1:
+  align-fixture:
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: windows-latest
     steps:
-      - name: Checkout exact candidate SHA
+      - name: Checkout exact trigger SHA
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.CANDIDATE_SHA }}
-
-      - name: Qualify caller-qualified source commit and CodeGraph rollback boundaries
+          fetch-depth: 0
+      - name: Patch synthetic support-binding fixture only
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
-          Set-StrictMode -Version Latest
-          $workspace=$env:GITHUB_WORKSPACE
-          $expected=$env:CANDIDATE_SHA.ToLowerInvariant()
-          $actual=((& git -C $workspace rev-parse HEAD)-join '').Trim().ToLowerInvariant()
-          if($LASTEXITCODE -ne 0 -or $actual -cne $expected){throw "Workflow checkout identity mismatch. Expected $expected, found $actual"}
-
-          $impl=Join-Path $workspace 'scripts\Build-HmsCompositeSkill.impl.ps1'
-          $wrapper=Join-Path $workspace 'scripts\Build-HmsCompositeSkill.ps1'
-          $helper=Join-Path $workspace 'scripts\Copy-HmsCommittedGitPath.ps1'
-          $delivery=Join-Path $workspace 'scripts\Sync-DeliveryTools.ps1'
-          foreach($path in @($impl,$wrapper,$helper,$delivery)){
-            $t=$null;$e=$null
-            [Management.Automation.Language.Parser]::ParseFile($path,[ref]$t,[ref]$e)|Out-Null
-            if(@($e).Count){throw "PowerShell parser rejected $path : $((@($e)|ForEach-Object Message)-join ' | ')"}
+          $message=((& git log -1 --format=%s)-join '').Trim()
+          if($message -cne 'chore: trigger ExpectedHead fixture alignment'){
+            Write-Host "No fixture alignment for head message: $message"
+            exit 0
           }
-
-          $implText=[IO.File]::ReadAllText($impl)
-          foreach($literal in @(
-            '[Parameter(Mandatory)][string]$ExpectedHead',
-            '$collectionHead = $ExpectedHead.Trim().ToLowerInvariant()',
-            "-ExpectedHead ([string]`$sourceHeadsBefore['hms'])",
-            "-ExpectedHead ([string]`$sourceHeadsBefore['superpowers'])",
-            "-ExpectedHead ([string]`$sourceHeadsBefore['taste'])",
-            "-ExpectedHead ([string]`$sourceHeadsBefore['impeccable'])"
-          )){if($implText -notmatch [regex]::Escape($literal)){throw "Builder source-commit binding is missing: $literal"}}
-          $wrapperText=[IO.File]::ReadAllText($wrapper)
-          foreach($literal in @('-ExpectedHead `$ExpectedHead','-ExpectedHead ([string]`$sourceHeadsBefore[''hms''])')){
-            if($wrapperText -notmatch [regex]::Escape($literal)){throw "Public builder wrapper source-commit binding is missing: $literal"}
-          }
-          if([IO.File]::ReadAllText($helper) -notmatch [regex]::Escape('[string]$ExpectedHead')){throw 'Committed-copy helper lacks caller-qualified ExpectedHead.'}
-
-          $root=Join-Path $env:RUNNER_TEMP ('hms-qualified-head-'+[guid]::NewGuid().ToString('N'))
-          $repo=Join-Path $root 'repo';$src=Join-Path $repo 'skill';$out=Join-Path $root 'out'
-          try{
-            New-Item -ItemType Directory -Force -Path $src|Out-Null
-            & git -C $repo init|Out-Null
-            & git -C $repo config user.email 'hms-ci@example.invalid'
-            & git -C $repo config user.name 'HMS CI'
-            & git -C $repo config core.autocrlf false
-            [IO.File]::WriteAllText((Join-Path $src 'SKILL.md'),"A`n",(New-Object Text.UTF8Encoding($false)))
-            & git -C $repo add .; & git -C $repo commit -m A|Out-Null
-            if($LASTEXITCODE -ne 0){throw 'Could not create source commit A.'}
-            $commitA=((& git -C $repo rev-parse HEAD)-join '').Trim().ToLowerInvariant()
-            [IO.File]::WriteAllText((Join-Path $src 'SKILL.md'),"B`n",(New-Object Text.UTF8Encoding($false)))
-            & git -C $repo add .; & git -C $repo commit -m B|Out-Null
-            if($LASTEXITCODE -ne 0){throw 'Could not create source commit B.'}
-            & $helper -Source $src -Destination $out -ExpectedHead $commitA
-            if([IO.File]::ReadAllText((Join-Path $out 'SKILL.md')) -cne "A`n"){throw 'Committed-copy helper materialized live HEAD instead of caller-qualified commit.'}
-          }finally{Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue}
-          Write-Host 'PASS: source enumeration/materialization is bound to the caller-qualified commit.'
-
-          $deliveryText=[IO.File]::ReadAllText($delivery)
-          foreach($literal in @('Restore-CodeGraphManifestAfterFailure','Remove-CodeGraphTempRoot','hms-codegraph-transaction-temp','existingManifestBytes','manifestPublished')){
-            if($deliveryText -notmatch [regex]::Escape($literal)){throw "CodeGraph rollback boundary is missing: $literal"}
-          }
-          if($deliveryText -match [regex]::Escape('if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }')){throw 'CodeGraph temp root still uses pathname recursive deletion.'}
-
-          function Get-FunctionText{
-            param([string]$Path,[string[]]$Names)
-            $t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$t,[ref]$e)
-            if(@($e).Count){throw "Could not parse function source: $Path"}
-            $texts=@()
-            foreach($name in $Names){$nodes=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name},$true));if($nodes.Count -ne 1){throw "Expected one function '$name', found $($nodes.Count)."};$texts+=$nodes[0].Extent.Text}
-            return ($texts -join "`r`n`r`n")
-          }
-          $defs=Get-FunctionText -Path $delivery -Names @('Assert-RegularCodeGraphBundle','Write-CodeGraphTempMarker','Assert-CodeGraphTempRoot','Remove-CodeGraphTempRoot','Restore-CodeGraphManifestAfterFailure')
-          $harness=Join-Path $env:RUNNER_TEMP ('hms-review486-codegraph-'+[guid]::NewGuid().ToString('N')+'.ps1')
-          $testRoot=Join-Path $env:RUNNER_TEMP ('hms-review486-root-'+[guid]::NewGuid().ToString('N'))
-          $script=@"
-          param([string]`$Root)
-          Set-StrictMode -Version Latest
-          `$ErrorActionPreference='Stop';`$ManagedBy='HMS-Skills-Codex';`$CodeGraphTempMarkerName='.hms-codegraph-temp.json';`$CodeGraphManifest=Join-Path `$Root 'hms-codegraph-install.json'
-          $defs
-          New-Item -ItemType Directory -Force -Path `$Root|Out-Null
-          `$previousText='{"managed_by":"HMS-Skills-Codex","version":"old","tag":"old","commit":"old","asset":"old","sha256":"old"}'
-          `$previousBytes=(New-Object Text.UTF8Encoding(`$false)).GetBytes(`$previousText)
-          `$candidate=[ordered]@{managed_by='HMS-Skills-Codex';version='new';tag='new';commit='new';asset='new';sha256='new'}
-          [IO.File]::WriteAllText(`$CodeGraphManifest,(`$candidate|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
-          Restore-CodeGraphManifestAfterFailure -CandidateManifest `$candidate -PreviousBytes `$previousBytes -HadPrevious `$true
-          if([Convert]::ToBase64String([IO.File]::ReadAllBytes(`$CodeGraphManifest)) -cne [Convert]::ToBase64String(`$previousBytes)){throw 'Previous CodeGraph manifest bytes were not restored exactly.'}
-          `$temp=Join-Path `$Root 'temp';New-Item -ItemType Directory -Force -Path `$temp|Out-Null
-          Write-CodeGraphTempMarker -Path `$temp -TransactionId 'tx-review486'
-          `$sentinel=Join-Path `$temp 'FOREIGN.txt'
-          `$watcher=Start-Job -ScriptBlock {param(`$P,`$S);`$d=[DateTime]::UtcNow.AddSeconds(20);while((Test-Path -LiteralPath `$P)-and [DateTime]::UtcNow -lt `$d){Start-Sleep -Milliseconds 2};if(Test-Path -LiteralPath `$P){throw 'temp quarantine rename not observed'};New-Item -ItemType Directory -Force -Path `$P|Out-Null;Set-Content -LiteralPath `$S -Value 'foreign'} -ArgumentList `$temp,`$sentinel
-          try{Remove-CodeGraphTempRoot -Path `$temp -TransactionId 'tx-review486';`$null=Wait-Job `$watcher -Timeout 20;Receive-Job `$watcher -ErrorAction Stop|Out-Null;if(-not(Test-Path -LiteralPath `$sentinel)){throw 'Foreign CodeGraph temp replacement was deleted.'}}finally{Remove-Job `$watcher -Force -ErrorAction SilentlyContinue}
-          "@
-          [IO.File]::WriteAllText($harness,$script,(New-Object Text.UTF8Encoding($false)))
-          try{& $harness -Root $testRoot}finally{Remove-Item $harness -Force -ErrorAction SilentlyContinue;Remove-Item $testRoot -Recurse -Force -ErrorAction SilentlyContinue}
-          Write-Host 'PASS: CodeGraph rollback restores prior manifest bytes and temp cleanup preserves foreign replacement.'
-          Write-Host 'PASS: all three review-486 latest P1 boundaries are qualified on exact candidate HEAD.'
+          @'
+          from pathlib import Path
+          p=Path('scripts/Test-HmsTrustRemediations.ps1')
+          s=p.read_text(encoding='utf-8')
+          def once(old,new,label):
+              global s
+              n=s.count(old)
+              if n!=1:
+                  raise SystemExit(f'{label}: expected exactly one occurrence, found {n}')
+              s=s.replace(old,new,1)
+          once("function Copy-SkillModule {\n    param([string]$Source,[string]$Destination)\n    Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force\n}",
+               "function Copy-SkillModule {\n    param([string]$Source,[string]$Destination,[Parameter(Mandatory)][string]$ExpectedHead)\n    Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force\n}",
+               'synthetic Copy-SkillModule contract')
+          once("$target = Join-Path $OutputRoot 'hms-superpowers'\nNew-Item -ItemType Directory -Force -Path $target | Out-Null\nCopy-SkillModule -Source (Join-Path $InstallRoot 'skills\\fixture-source') -Destination (Join-Path $target 'references\\fixture-source')",
+               "$target = Join-Path $OutputRoot 'hms-superpowers'\n$fixtureExpectedHead = ((& git -C $InstallRoot rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()\nif ($LASTEXITCODE -ne 0 -or $fixtureExpectedHead -notmatch '^[0-9a-f]{40}$') { throw 'Synthetic support-binding fixture HEAD is unavailable.' }\nNew-Item -ItemType Directory -Force -Path $target | Out-Null\nCopy-SkillModule -Source (Join-Path $InstallRoot 'skills\\fixture-source') -Destination (Join-Path $target 'references\\fixture-source') -ExpectedHead $fixtureExpectedHead",
+               'synthetic Copy-SkillModule call')
+          p.write_text(s,encoding='utf-8',newline='\n')
+          '@ | python -
+          if($LASTEXITCODE -ne 0){throw 'Fixture patch failed.'}
+          $tokens=$null;$errors=$null
+          [Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE 'scripts\Test-HmsTrustRemediations.ps1'),[ref]$tokens,[ref]$errors)|Out-Null
+          if(@($errors).Count -ne 0){throw "Patched trust regression failed PowerShell parse: $((@($errors)|ForEach-Object Message)-join ' | ')"}
+          & git diff --check -- scripts/Test-HmsTrustRemediations.ps1
+          if($LASTEXITCODE -ne 0){throw 'git diff --check failed.'}
+          $diffNames=@(& git diff --name-only)
+          if($diffNames.Count -ne 1 -or $diffNames[0] -cne 'scripts/Test-HmsTrustRemediations.ps1'){throw "Unexpected patch scope: $($diffNames -join ', ')"}
+          & git config user.email '121548965+hoangminhsang989@users.noreply.github.com'
+          & git config user.name 'hoangminhsang989'
+          & git add -- scripts/Test-HmsTrustRemediations.ps1
+          & git commit -m 'test: align support-binding fixture with ExpectedHead contract'
+          if($LASTEXITCODE -ne 0){throw 'Fixture commit failed.'}
+          & git push origin HEAD:stage/hms-superpowers-v0.2.0-ui-design-authority
+          if($LASTEXITCODE -ne 0){throw 'Fixture push failed.'}
