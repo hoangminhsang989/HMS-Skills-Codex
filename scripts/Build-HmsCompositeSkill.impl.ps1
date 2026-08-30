@@ -15,6 +15,7 @@ $ErrorActionPreference = 'Stop'
 $CompositeName = 'hms-superpowers'
 $ManagedBy = 'HMS-Skills-Codex'
 $Artifact = 'hms-superpowers-composite'
+$StageArtifact = 'hms-superpowers-composite-stage'
 $FinalRoot = Join-Path $OutputRoot $CompositeName
 $CompositeLink = Join-Path $SkillsRoot $CompositeName
 $SuperpowersRoot = Join-Path $env:USERPROFILE '.codex\superpowers'
@@ -266,6 +267,52 @@ function Remove-OwnedCompositeQuarantine {
     }
 }
 
+function Assert-OwnedCompositeStage {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$StageId)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { throw "Composite stage is missing: $Path" }
+    if (-not [bool]$item.PSIsContainer) { throw "Refusing stage operation on a non-directory path: $Path" }
+    if ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Refusing stage operation on a reparse point: $Path" }
+    $markerPath = Join-Path $Path '.hms-stage-owner.json'
+    $markerItem = Get-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+    if ($null -eq $markerItem -or [bool]$markerItem.PSIsContainer -or [bool]($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Refusing stage operation without a regular ownership marker: $Path"
+    }
+    try { $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json }
+    catch { throw "Refusing stage operation with invalid ownership marker: $Path" }
+    if ([string]$marker.managed_by -cne $ManagedBy -or [string]$marker.artifact -cne $StageArtifact -or [string]$marker.stage_id -cne $StageId) {
+        throw "Refusing stage operation with unexpected ownership identity: $Path"
+    }
+}
+
+function Remove-OwnedCompositeStageQuarantine {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$StageId)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    Assert-OwnedCompositeStage -Path $Path -StageId $StageId
+    $parent = Split-Path -Parent $Path
+    $leaf = '.hms-stage-deleting-' + [guid]::NewGuid().ToString('N')
+    $quarantine = Join-Path $parent $leaf
+    $deleteStarted = $false
+    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    try {
+        Assert-OwnedCompositeStage -Path $quarantine -StageId $StageId
+        $deleteStarted = $true
+        Remove-Item -LiteralPath $quarantine -Recurse -Force
+        if (Test-Path -LiteralPath $quarantine) { throw "Composite stage quarantine removal did not complete: $quarantine" }
+    }
+    catch {
+        $e = $_
+        if (-not $deleteStarted) {
+            try { Restore-Quarantine -Original $Path -Quarantine $quarantine }
+            catch { throw "Composite stage quarantine validation failed and rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)" }
+        }
+        elseif (Test-Path -LiteralPath $quarantine) {
+            throw "Composite stage deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+        }
+        throw $e
+    }
+}
+
 function Copy-SkillModule {
     param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Destination)
     if (-not (Test-Path -LiteralPath (Join-Path $Source 'SKILL.md'))) { throw "Skill source does not contain SKILL.md: $Source" }
@@ -285,15 +332,43 @@ function Copy-SkillCollection {
         [string[]]$ExcludeNames = @()
     )
     if (-not (Test-Path -LiteralPath $SkillsDirectory)) { throw "Skill collection is missing: $SkillsDirectory" }
-    $copied = @()
-    foreach ($dir in @(Get-ChildItem -LiteralPath $SkillsDirectory -Directory | Sort-Object Name)) {
-        if ($ExcludeNames -contains $dir.Name) { continue }
-        if (-not (Test-Path -LiteralPath (Join-Path $dir.FullName 'SKILL.md'))) { continue }
-        $destination = Join-Path $DestinationRoot $dir.Name
-        Copy-SkillModule -Source $dir.FullName -Destination $destination
-        $copied += ($ModulePrefix + '/' + $dir.Name + '/MODULE.md')
+
+    # Collection membership is authority from the committed tree, never from live
+    # Get-ChildItem/Test-Path enumeration. A hidden/missing worktree child therefore
+    # fails during exact committed-object materialization instead of silently vanishing.
+    $skillsRoot = Get-CanonicalPath -Path $SkillsDirectory
+    $repoTopRaw = ((& git -C $SkillsDirectory rev-parse --show-toplevel 2>$null) -join '').Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoTopRaw)) { throw "Skill collection is not inside a readable Git checkout: $SkillsDirectory" }
+    $repoRoot = Get-CanonicalPath -Path $repoTopRaw
+    $repoPrefix = $repoRoot + '\'
+    if ($skillsRoot -ieq $repoRoot) { $pathSpec = '.' }
+    elseif ($skillsRoot.StartsWith($repoPrefix, [StringComparison]::OrdinalIgnoreCase)) { $pathSpec = $skillsRoot.Substring($repoPrefix.Length).Replace('\','/') }
+    else { throw "Skill collection escaped its Git repository root: $SkillsDirectory" }
+
+    $collectionHead = Get-GitHeadOrNull -Path $repoRoot
+    if ($null -eq $collectionHead) { throw "Skill collection HEAD is not canonical: $SkillsDirectory" }
+    $treePaths = @(& git -C $repoRoot ls-tree -r --name-only $collectionHead -- $pathSpec 2>$null)
+    if ($LASTEXITCODE -ne 0) { throw "Committed skill collection tree could not be enumerated: $SkillsDirectory" }
+    $treePrefix = if ($pathSpec -eq '.') { '' } else { $pathSpec.TrimEnd('/') + '/' }
+    $names = @()
+    foreach ($treePathRaw in $treePaths) {
+        $treePath = [string]$treePathRaw
+        if (-not $treePath.StartsWith($treePrefix, [StringComparison]::Ordinal)) { continue }
+        $relative = $treePath.Substring($treePrefix.Length)
+        $parts = @($relative -split '/')
+        if ($parts.Count -eq 2 -and $parts[1] -ceq 'SKILL.md' -and -not [string]::IsNullOrWhiteSpace($parts[0])) { $names += $parts[0] }
     }
-    if ($copied.Count -eq 0) { throw "No skill modules were found under: $SkillsDirectory" }
+    $names = @($names | Sort-Object -Unique)
+
+    $copied = @()
+    foreach ($name in $names) {
+        if ($ExcludeNames -contains $name) { continue }
+        $source = Join-Path $SkillsDirectory $name
+        $destination = Join-Path $DestinationRoot $name
+        Copy-SkillModule -Source $source -Destination $destination
+        $copied += ($ModulePrefix + '/' + $name + '/MODULE.md')
+    }
+    if ($copied.Count -eq 0) { throw "No committed skill modules were found under: $SkillsDirectory" }
     return $copied
 }
 
@@ -412,6 +487,7 @@ function Write-CompositeSkill {
     Set-Content -LiteralPath (Join-Path $StageRoot 'SKILL.md') -Value ($lines -join "`r`n") -Encoding UTF8
 }
 
+$stageId = $null
 $buildMutex = New-Object System.Threading.Mutex($false, $BuildMutexName)
 $mutexOwned = $false
 $stage = $null
@@ -462,9 +538,12 @@ try {
         throw "Composite discovery path exists before its managed target exists: $CompositeLink"
     }
 
-    $stage = Join-Path $OutputRoot ('.stage-' + [guid]::NewGuid().ToString('N'))
+    $stageId = [guid]::NewGuid().ToString('N')
+    $stage = Join-Path $OutputRoot ('.stage-' + $stageId)
     $backup = Join-Path $OutputRoot ('.backup-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    [ordered]@{ schema_version=1; managed_by=$ManagedBy; artifact=$StageArtifact; stage_id=$stageId } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage '.hms-stage-owner.json') -Encoding UTF8
+    Assert-OwnedCompositeStage -Path $stage -StageId $stageId
 
     $refsRoot = Join-Path $stage 'references'
     $hmsRefs = @(); $superRefs = @(); $tasteRef = $null; $impeccableRef = $null
@@ -517,6 +596,7 @@ try {
             throw 'Injected staged-root activation failure for rollback qualification.'
         }
 
+        Assert-OwnedCompositeStage -Path $stage -StageId $stageId
         Rename-Item -LiteralPath $stage -NewName (Split-Path -Leaf $FinalRoot) -ErrorAction Stop
         $newActivated = $true
         $stage = $null
@@ -590,7 +670,8 @@ finally {
     $mutexReleaseError = $null
     if ($null -ne $stage -and (Test-Path -LiteralPath $stage)) {
         try {
-            Remove-Item -LiteralPath $stage -Recurse -Force
+            if ([string]::IsNullOrWhiteSpace([string]$stageId)) { throw 'Composite stage cleanup is missing its ownership identity.' }
+            Remove-OwnedCompositeStageQuarantine -Path $stage -StageId $stageId
         }
         catch {
             $stageCleanupError = $_
