@@ -54,7 +54,8 @@ jobs:
           foreach ($literal in @(
             'function Remove-VerifiedCodeGraphRoot',
             '.hms-codegraph-removing-',
-            'Assert-ManagedCodeGraphRoot -Path $quarantine',
+            '$assertManagedCodeGraphRoot = ${function:Assert-ManagedCodeGraphRoot}',
+            '$validator={param($p) & $assertManagedCodeGraphRoot -Path $p}.GetNewClosure()',
             'Remove-VerifiedCodeGraphRoot -Path $codeGraphRoot'
           )) {
             if ($uninstallText -notmatch [regex]::Escape($literal)) {
@@ -132,7 +133,10 @@ jobs:
 
           # Regression 2: exercise the actual CodeGraph removal primitive under the same race.
           # The harness is advanced because the production function calls $PSCmdlet.ShouldProcess.
-          $codeDefs = Get-FunctionText -Path $uninstallPath -Names @('Assert-SafeRemovalPath','Assert-ManagedCodeGraphRoot','Restore-Quarantine','Remove-VerifiedCodeGraphRoot')
+          $uninstallDefinitionStart=$uninstallText.IndexOf('$HmsRemote = ')
+          $uninstallDefinitionEnd=$uninstallText.IndexOf('$buildMutex = New-Object System.Threading.Mutex')
+          if($uninstallDefinitionStart -lt 0 -or $uninstallDefinitionEnd -le $uninstallDefinitionStart){throw 'Could not isolate uninstall pre-main production definitions.'}
+          $codeDefs=$uninstallText.Substring($uninstallDefinitionStart,$uninstallDefinitionEnd-$uninstallDefinitionStart)
           $codeHarnessPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-codegraph-quarantine-' + [guid]::NewGuid().ToString('N') + '.ps1')
           $codeHome = Join-Path ([IO.Path]::GetTempPath()) ('hms-codegraph-home-' + [guid]::NewGuid().ToString('N'))
           $codeHarness = @"
@@ -141,6 +145,7 @@ jobs:
           Set-StrictMode -Version Latest
           `$ErrorActionPreference='Stop'
           `$env:USERPROFILE=`$TestHome
+          `$InstallRoot=Join-Path `$TestHome '.codex\hms-skills-codex'
           $codeDefs
           `$codeGraphRoot=Join-Path `$TestHome '.codex\codegraph'
           New-Item -ItemType Directory -Force -Path `$codeGraphRoot | Out-Null

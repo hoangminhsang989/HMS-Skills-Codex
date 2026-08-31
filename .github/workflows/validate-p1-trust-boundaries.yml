@@ -68,7 +68,8 @@ jobs:
           foreach ($literal in @(
             'Remove-VerifiedCompositeRoot',
             '.hms-composite-removing-',
-            'Assert-OwnedCompositeRoot -Path $quarantine'
+            '$assertOwnedCompositeRoot = ${function:Assert-OwnedCompositeRoot}',
+            '$validator={param($p) & $assertOwnedCompositeRoot -Path $p}.GetNewClosure()'
           )) {
             if ($uninstallText -notmatch [regex]::Escape($literal)) { throw "Uninstaller is missing composite quarantine trust boundary: $literal" }
           }
@@ -178,18 +179,10 @@ jobs:
           # P1 regression 3: execute the actual uninstall composite-removal function in an isolated
           # advanced-script harness. A replacement created after quarantine rename must survive at
           # the original pathname while only the verified random quarantine is deleted.
-          $tokens=$null; $parseErrors=$null
-          $ast=[System.Management.Automation.Language.Parser]::ParseFile($uninstallPath,[ref]$tokens,[ref]$parseErrors)
-          if (@($parseErrors).Count -ne 0) { throw 'Could not parse uninstall script for function-level destructive-boundary regression.' }
-          $needed = @('Assert-SafeRemovalPath','Assert-OwnedCompositeRoot','Restore-Quarantine','Remove-VerifiedCompositeRoot')
-          $defs = foreach ($name in $needed) {
-            $node = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name },$true))
-            if ($node.Count -ne 1) { throw "Expected exactly one uninstall function '$name', found $($node.Count)." }
-            $node[0].Extent.Text
-          }
-          $harnessPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-uninstall-harness-' + [guid]::NewGuid().ToString('N') + '.ps1')
-          $harnessRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-uninstall-root-' + [guid]::NewGuid().ToString('N'))
-          $definitionText = $defs -join "`r`n`r`n"
+          $definitionStart=$uninstallText.IndexOf('$HmsRemote = ')
+          $definitionEnd=$uninstallText.IndexOf('$buildMutex = New-Object System.Threading.Mutex')
+          if($definitionStart -lt 0 -or $definitionEnd -le $definitionStart){throw 'Could not isolate uninstall pre-main production definitions.'}
+          $definitionText=$uninstallText.Substring($definitionStart,$definitionEnd-$definitionStart)
           $harness = @"
           [CmdletBinding(SupportsShouldProcess)]
           param([Parameter(Mandatory)][string]`$TestHome)
@@ -197,6 +190,7 @@ jobs:
           `$ErrorActionPreference='Stop'
           `$env:USERPROFILE=`$TestHome
           `$compositeRoot = Join-Path `$TestHome '.codex\hms-composite\hms-superpowers'
+          `$InstallRoot = Join-Path `$TestHome '.codex\hms-skills-codex'
           $definitionText
           New-Item -ItemType Directory -Force -Path `$compositeRoot | Out-Null
           `$manifest=[ordered]@{schema_version=1;managed_by='HMS-Skills-Codex';artifact='hms-superpowers-composite';modules=[ordered]@{hms=`$false;superpowers=`$false;taste=`$false;impeccable=`$false}}

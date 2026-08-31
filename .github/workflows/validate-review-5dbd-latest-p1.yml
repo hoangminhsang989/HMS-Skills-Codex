@@ -67,7 +67,9 @@ jobs:
             'HMS_TEST_FAIL_CODEGRAPH_AFTER_BACKUP_RENAME',
             '$previousIdentity = Move-CodeGraphCurrentToRollbackBackup',
             'Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $PreviousIdentity',
-            'Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup'
+            'Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup',
+            '$assertCodeGraphTransactionBundle = ${function:Assert-CodeGraphTransactionBundle}',
+            '$validator={param($p) & $assertCodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()'
           )){if($deliveryText -notmatch [regex]::Escape($literal)){throw "Latest CodeGraph rollback contract is missing: $literal"}}
 
           # Structural proof for review P2: find the production Move command, walk its AST parents to the
@@ -115,28 +117,12 @@ jobs:
             'Remove-OwnedCompositeIdentityQuarantine -Path $FinalRoot -ExpectedTreeSha256 $candidateCompositeTreeSha'
           )){if($compositeText -notmatch [regex]::Escape($literal)){throw "Composite rollback identity contract is missing: $literal"}}
 
-          $deliveryDefs=Get-FunctionText -Path $delivery -Names @(
-            'Assert-RegularCodeGraphBundle',
-            'Add-CodeGraphBundleTreeRecords',
-            'Get-CodeGraphBundleTreeSha256',
-            'New-CodeGraphBundleIdentity',
-            'Write-CodeGraphBundleMarker',
-            'Assert-CodeGraphTransactionBundle',
-            'Remove-CodeGraphTransactionBundle',
-            'Restore-CodeGraphManifestAfterFailure',
-            'Repair-CodeGraphRollbackState',
-            'Assert-CodeGraphBundleAgainstManifest',
-            'Move-CodeGraphCurrentToRollbackBackup'
-          )
-          $compositeDefs=Get-FunctionText -Path $composite -Names @(
-            'Assert-OwnedCompositeRoot',
-            'Add-OwnedCompositeTreeRecords',
-            'Get-OwnedCompositeTreeSha256',
-            'Assert-OwnedCompositeIdentity',
-            'Reserve-OwnedCompositeRollbackBackup',
-            'Restore-OwnedCompositeRollbackBackup',
-            'Remove-OwnedCompositeIdentityQuarantine'
-          )
+          $deliveryLiteral=$delivery.Replace("'","''")
+          $deliveryDefs=". '$deliveryLiteral' -SkipCodeGraph -SkipThreeLevelDelivery"
+          $compositeDefinitionStart=$compositeText.IndexOf('$CompositeName = ')
+          $compositeDefinitionEnd=$compositeText.IndexOf('$stageId = $null')
+          if($compositeDefinitionStart -lt 0 -or $compositeDefinitionEnd -le $compositeDefinitionStart){throw 'Could not isolate composite pre-main production definitions.'}
+          $compositeDefs=$compositeText.Substring($compositeDefinitionStart,$compositeDefinitionEnd-$compositeDefinitionStart)
 
           $harness=Join-Path $env:RUNNER_TEMP ('hms-latest-rollback-identity-'+[guid]::NewGuid().ToString('N')+'.ps1')
           $root=Join-Path $env:RUNNER_TEMP ('hms-latest-rollback-identity-root-'+[guid]::NewGuid().ToString('N'))
@@ -148,6 +134,9 @@ jobs:
           `$Artifact='hms-superpowers-composite'
           `$CodeGraphBundleMarkerName='.hms-codegraph-bundle.json'
           $deliveryDefs
+          `$InstallRoot=`$Root
+          `$OutputRoot=`$Root
+          `$SkillsRoot=`$Root
           $compositeDefs
 
           function New-TestCodeGraphBundle{

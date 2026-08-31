@@ -88,7 +88,9 @@ jobs:
             '$currentBundleState',
             '-PreviousIdentity $previousIdentity',
             'bundle_transaction_id',
-            'bundle_tree_sha256'
+            'bundle_tree_sha256',
+            '$assertCodeGraphTransactionBundle = ${function:Assert-CodeGraphTransactionBundle}',
+            '$validator={param($p) & $assertCodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()'
           )){if($deliveryText -notmatch [regex]::Escape($literal)){throw "CodeGraph rollback boundary is missing: $literal"}}
           if($deliveryText -match [regex]::Escape('if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }')){throw 'CodeGraph temp root still uses pathname recursive deletion.'}
           if($deliveryText -match [regex]::Escape('if ($rollbackErrors.Count -eq 0 -and $manifestPublished)')){throw 'Superseded aggregate-error manifest gate is still present.'}
@@ -106,20 +108,8 @@ jobs:
             return ($texts -join "`r`n`r`n")
           }
 
-          $defs=Get-FunctionText -Path $delivery -Names @(
-            'Assert-RegularCodeGraphBundle',
-            'Add-CodeGraphBundleTreeRecords',
-            'Get-CodeGraphBundleTreeSha256',
-            'New-CodeGraphBundleIdentity',
-            'Write-CodeGraphBundleMarker',
-            'Assert-CodeGraphTransactionBundle',
-            'Remove-CodeGraphTransactionBundle',
-            'Write-CodeGraphTempMarker',
-            'Assert-CodeGraphTempRoot',
-            'Remove-CodeGraphTempRoot',
-            'Restore-CodeGraphManifestAfterFailure',
-            'Repair-CodeGraphRollbackState'
-          )
+          $deliveryLiteral=$delivery.Replace("'","''")
+          $defs=". '$deliveryLiteral' -SkipCodeGraph -SkipThreeLevelDelivery"
 
           $harness=Join-Path $env:RUNNER_TEMP ('hms-review486-codegraph-'+[guid]::NewGuid().ToString('N')+'.ps1')
           $testRoot=Join-Path $env:RUNNER_TEMP ('hms-review486-root-'+[guid]::NewGuid().ToString('N'))

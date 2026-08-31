@@ -165,13 +165,16 @@ jobs:
             '.hms-codegraph-bundle.json',
             'Remove-CodeGraphTransactionBundle -Path $backup -Identity $backupIdentity',
             'Remove-CodeGraphTransactionBundle -Path $CurrentPath -Identity $CandidateIdentity',
-            'Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup'
+            'Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup',
+            '$assertCodeGraphTransactionBundle = ${function:Assert-CodeGraphTransactionBundle}',
+            '$validator={param($p) & $assertCodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()'
           )) {
             if ($deliveryText -notmatch [regex]::Escape($literal)) { throw "CodeGraph transaction cleanup contract is missing: $literal" }
           }
           if ($deliveryText -match [regex]::Escape('Remove-Item -LiteralPath $backup -Recurse -Force') -or $deliveryText -match [regex]::Escape('Remove-Item -LiteralPath $current -Recurse -Force')) { throw 'CodeGraph transaction still contains pathname recursive deletion for backup/current.' }
 
-          $codeDefs=Get-FunctionText -Path $delivery -Names @('Assert-CodeGraphVersion','Assert-RegularCodeGraphBundle','Assert-CodeGraphTransactionBundle','Remove-CodeGraphTransactionBundle')
+          $deliveryLiteral=$delivery.Replace("'","''")
+          $codeDefs=". '$deliveryLiteral' -SkipCodeGraph -SkipThreeLevelDelivery"
           $codeHarness=Join-Path $env:RUNNER_TEMP ('hms-codegraph-transaction-' + [guid]::NewGuid().ToString('N') + '.ps1')
           $codeRoot=Join-Path $env:RUNNER_TEMP ('hms-codegraph-transaction-root-' + [guid]::NewGuid().ToString('N'))
           $codeScript=@"
