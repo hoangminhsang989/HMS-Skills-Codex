@@ -1,0 +1,157 @@
+name: Temporary author CodeGraph marker ABI remediation V7
+
+on:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.2.0-ui-design-authority
+    paths:
+      - .github/workflows/tmp-author-final-p1-batch-v7.yml
+
+permissions:
+  contents: write
+
+jobs:
+  author:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2025
+    env:
+      BASELINE_PARENT: 75446ce1d2dd79fbe664d78e92193e5e24e908bc
+      SELF_PATH: .github/workflows/tmp-author-final-p1-batch-v7.yml
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Bind V7 bootstrap authority
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $parent=((& git rev-parse HEAD^)-join '').Trim().ToLowerInvariant()
+          if($LASTEXITCODE -ne 0 -or $parent -cne $env:BASELINE_PARENT){throw "V7 parent mismatch. Expected $env:BASELINE_PARENT, found $parent"}
+          $changed=@(& git diff --name-only HEAD^ HEAD)
+          if($changed.Count -ne 1 -or [string]$changed[0] -cne $env:SELF_PATH){throw "V7 bootstrap scope mismatch: $($changed -join ', ')"}
+
+      - name: Apply exact two-file V7 remediation
+        shell: python
+        run: |
+          from pathlib import Path
+
+          delivery=Path('scripts/Sync-DeliveryTools.ps1')
+          text=delivery.read_text(encoding='utf-8')
+          native_old='''    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool SetFileInformationByHandle(SafeFileHandle h,int infoClass,IntPtr info,uint size);\n    public static bool RenameByHandle'''
+          native_new='''    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool SetFileInformationByHandle(SafeFileHandle h,int infoClass,IntPtr info,uint size);\n    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool ReplaceFileW(string replacedFileName,string replacementFileName,string backupFileName,uint flags,IntPtr exclude,IntPtr reserved);\n    public static bool ReplaceFileWithoutBackup(string replacedFileName,string replacementFileName,out int error)\n    { bool ok=ReplaceFileW(replacedFileName,replacementFileName,null,0,IntPtr.Zero,IntPtr.Zero);error=ok?0:Marshal.GetLastWin32Error();return ok; }\n    public static bool RenameByHandle'''
+          if text.count(native_old)!=1:
+              raise SystemExit(f'V7 native insertion anchor count={text.count(native_old)}')
+          text=text.replace(native_old,native_new,1)
+          replace_old='''        [IO.File]::Replace($publishTemp,$markerPath,$null,$true)'''
+          replace_new='''        $replaceCode = 0\n        if (-not [HmsDeliveryExactFsNative]::ReplaceFileWithoutBackup($markerPath,$publishTemp,[ref]$replaceCode)) {\n            throw "CodeGraph marker atomic replacement failed (Win32=$replaceCode): $markerPath"\n        }'''
+          if text.count(replace_old)!=1:
+              raise SystemExit(f'V7 marker replace anchor count={text.count(replace_old)}')
+          text=text.replace(replace_old,replace_new,1)
+          delivery.write_text(text,encoding='utf-8',newline='\n')
+
+          workflow=Path('.github/workflows/validate-p1-trust-boundaries.yml')
+          w=workflow.read_text(encoding='utf-8')
+          start=w.find("          foreach ($literal in @('Composite builder public shim'")
+          end_marker="          Write-Host 'PASS: committed source contains literal bootstrap hashing and explicit composite quarantine/revalidation boundaries.'"
+          end=w.find(end_marker,start)
+          if start<0 or end<0:
+              raise SystemExit('V7 could not isolate malformed P1 insertion block.')
+          clean='''          foreach ($literal in @('Composite builder public shim','$__HmsVerifiedBuilderScriptBlock_v1','$__HmsVerifiedBuilderBlob_v1','-TrustedBootstrapBlob $__HmsVerifiedBuilderBlob_v1')) {\n            if ($managerShimText -notmatch [regex]::Escape($literal)) { throw "Manager is missing authenticated builder snapshot contract: $literal" }\n          }\n          if ($managerImplText -match [regex]::Escape("scripts\\Test-HmsSkills.ps1")) { throw 'Production Manager still executes the developer validation suite.' }\n          foreach ($literal in @('ReplaceFileW','ReplaceFileWithoutBackup($markerPath,$publishTemp,[ref]$replaceCode)','intentionally retained rather than pathname-deleted')) {\n            if ($deliveryText -notmatch [regex]::Escape($literal)) { throw "Delivery tools are missing atomic marker publication contract: $literal" }\n          }\n          if ($deliveryText -match [regex]::Escape('$Identity | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $markerPath')) { throw 'CodeGraph marker publication regressed to direct canonical-path Set-Content.' }\n          Write-Host 'PASS: Manager builder execution and production Validate are authenticated/non-developer, and CodeGraph marker publication is atomic.'\n\n'''
+          w=w[:start]+clean+w[end:]
+          workflow.write_text(w,encoding='utf-8',newline='\n')
+
+      - name: Create exact local V7 candidate and run structural qualification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $targets=@('scripts/Sync-DeliveryTools.ps1','.github/workflows/validate-p1-trust-boundaries.yml')
+          Remove-Item -LiteralPath $env:SELF_PATH -Force
+          $allowed=@($targets+$env:SELF_PATH)
+          $changed=@(& git status --porcelain=v1 --untracked-files=all | ForEach-Object {$_.Substring(3).Replace('\','/')} | Sort-Object -Unique)
+          $unexpected=@($changed|Where-Object {$_ -notin $allowed})
+          if($unexpected.Count){throw "Unexpected V7 paths: $($unexpected -join ', ')"}
+          foreach($path in $allowed){if($path -notin $changed){throw "Expected V7 path not changed: $path"}}
+          & git diff --check
+          if($LASTEXITCODE -ne 0){throw 'git diff --check rejected V7.'}
+          $tokens=$null;$errors=$null
+          [Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE 'scripts\Sync-DeliveryTools.ps1'),[ref]$tokens,[ref]$errors)|Out-Null
+          if(@($errors).Count){throw "PowerShell parser rejected delivery V7: $((@($errors)|ForEach-Object Message)-join ' | ')"}
+          $yaml=[IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE '.github\workflows\validate-p1-trust-boundaries.yml'))
+          foreach($line in @($yaml -split "`n")){
+            if($line -match '^(foreach |if \(|Write-Host |    if \()'){throw "P1 workflow retained top-level leaked PowerShell indentation: $line"}
+          }
+          & git config user.name 'github-actions[bot]'
+          & git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          & git add -- $allowed
+          & git commit -m 'Use native atomic CodeGraph marker replacement V7'
+          if($LASTEXITCODE -ne 0){throw 'Local V7 candidate commit failed.'}
+          $net=@(& git diff --name-only $env:BASELINE_PARENT HEAD)
+          if($net.Count -ne 2 -or @($net|Where-Object {$_ -notin $targets}).Count){throw "V7 net scope mismatch: $($net -join ', ')"}
+          $localHead=((& git rev-parse HEAD)-join '').Trim().ToLowerInvariant()
+          $localTree=((& git rev-parse 'HEAD^{tree}')-join '').Trim().ToLowerInvariant()
+          Write-Host "LOCAL_CANDIDATE=$localHead"
+          Write-Host "LOCAL_TREE=$localTree"
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts\Test-HmsSkills.ps1') -RepoRoot $env:GITHUB_WORKSPACE
+          if($LASTEXITCODE -ne 0){throw "Test-HmsSkills failed with exit code $LASTEXITCODE"}
+
+      - name: Qualify successful and failed atomic marker publication
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Set-StrictMode -Version Latest
+          $delivery=Join-Path $env:GITHUB_WORKSPACE 'scripts\Sync-DeliveryTools.ps1'
+          . $delivery -SkipCodeGraph -SkipThreeLevelDelivery
+          $root=Join-Path $env:RUNNER_TEMP ('hms-v7-marker-'+[guid]::NewGuid().ToString('N'))
+          $bundle=Join-Path $root 'current'
+          $marker=Join-Path $bundle '.hms-codegraph-bundle.json'
+          $lock=$null
+          try {
+            New-Item -ItemType Directory -Force -Path (Join-Path $bundle 'bin')|Out-Null
+            [IO.File]::WriteAllText((Join-Path $bundle 'bin\codegraph.cmd'),"@echo off`r`necho v7`r`n",[Text.Encoding]::ASCII)
+            $id1=New-CodeGraphBundleIdentity -TransactionId '11111111111111111111111111111111' -Role 'candidate' -Version 'old' -Tag 'v-old' -Commit 'c-old' -Asset 'a-old' -Sha256 's-old'
+            Write-CodeGraphBundleMarker -Path $bundle -Identity $id1
+            Assert-CodeGraphTransactionBundle -Path $bundle -Identity $id1
+            $id2=New-CodeGraphBundleIdentity -TransactionId '22222222222222222222222222222222' -Role 'backup' -Version 'old' -Tag 'v-old' -Commit 'c-old' -Asset 'a-old' -Sha256 's-old' -BundleTreeSha256 ([string]$id1.bundle_tree_sha256)
+            Write-CodeGraphBundleMarker -Path $bundle -Identity $id2
+            Assert-CodeGraphTransactionBundle -Path $bundle -Identity $id2
+            Write-Host 'PASS: native ReplaceFileW marker success path is operational.'
+
+            $before=[IO.File]::ReadAllBytes($marker)
+            $lock=New-Object IO.FileStream($marker,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+            $id3=New-CodeGraphBundleIdentity -TransactionId '33333333333333333333333333333333' -Role 'candidate' -Version 'new' -Tag 'v-new' -Commit 'c-new' -Asset 'a-new' -Sha256 's-new' -BundleTreeSha256 ([string]$id1.bundle_tree_sha256)
+            $failed=$false
+            try { Write-CodeGraphBundleMarker -Path $bundle -Identity $id3 }
+            catch { if($_.Exception.Message -match 'atomic replacement failed'){ $failed=$true } else { throw } }
+            if(-not $failed){throw 'Locked canonical marker did not force atomic publication failure.'}
+            $after=[IO.File]::ReadAllBytes($marker)
+            if([Convert]::ToBase64String($after) -cne [Convert]::ToBase64String($before)){throw 'Failed marker publication changed canonical marker bytes.'}
+            Assert-CodeGraphTransactionBundle -Path $bundle -Identity $id2
+            Write-Host 'PASS: failed native marker publication preserves prior canonical bytes and identity.'
+          }
+          finally {
+            if($null -ne $lock){$lock.Dispose()}
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Prepare two verified GitHub blobs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $targets=@('scripts/Sync-DeliveryTools.ps1','.github/workflows/validate-p1-trust-boundaries.yml')
+          $headers=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}
+          $repo='hoangminhsang989/HMS-Skills-Codex'
+          foreach($path in $targets){
+            $bytes=[IO.File]::ReadAllBytes((Join-Path $env:GITHUB_WORKSPACE $path))
+            $body=@{content=[Convert]::ToBase64String($bytes);encoding='base64'}|ConvertTo-Json -Compress
+            $blob=Invoke-RestMethod -Method Post -Headers $headers -Uri "https://api.github.com/repos/$repo/git/blobs" -Body $body -ContentType 'application/json'
+            $localBlob=((& git hash-object --no-filters -- $path)-join '').Trim().ToLowerInvariant()
+            if(-not $blob.sha -or $localBlob -cne ([string]$blob.sha).ToLowerInvariant()){throw "GitHub blob identity mismatch for $path"}
+            Write-Host "PREPARED_BLOB $path $($blob.sha)"
+          }
+          $qualifiedHead=((& git rev-parse HEAD)-join '').Trim().ToLowerInvariant()
+          $qualifiedTree=((& git rev-parse 'HEAD^{tree}')-join '').Trim().ToLowerInvariant()
+          Write-Host "QUALIFIED_LOCAL_HEAD=$qualifiedHead"
+          Write-Host "QUALIFIED_LOCAL_TREE=$qualifiedTree"
+          Write-Host 'DETACHED_BLOBS_ONLY=YES'
