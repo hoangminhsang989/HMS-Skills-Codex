@@ -17,13 +17,17 @@ if helper_match is None:
     raise RuntimeError("generated exact uninstall helper not found")
 helper = helper_match.group(0)
 required_helper_literals = (
+    "Open-HmsUninstallDirectoryGuard -Path $Path -Label $Label",
     "Move-HmsUninstallDirectoryGuard -Guard $guard -Destination $q -Label $Label",
-    "&$Validate $q",
     "DeleteByHandle($guard.Handle",
 )
 for literal in required_helper_literals:
     if helper.count(literal) != 1:
         raise RuntimeError(f"generated uninstall helper contract mismatch for: {literal}")
+# This is the exact missing contract being added. If it already exists, the
+# baseline shape changed and this fixer must not silently double-apply it.
+if helper.count("&$Validate $q") != 0:
+    raise RuntimeError("generated uninstall helper unexpectedly already revalidates quarantine")
 
 new_helper = r'''function Invoke-HmsUninstallExactDirectoryRemoval {
     param(
@@ -125,9 +129,9 @@ new_clone = r'''function Remove-VerifiedClone {
 '''
 text = text[:clone_match.start()] + new_clone + "\n" + text[clone_match.end():]
 
-# Semantic/static assertions. The old permanent validator intentionally looks
-# for this exact quarantine revalidation literal; preserve it as executable
-# code, not a comment or dead string.
+# Semantic/static assertions. The permanent validator intentionally looks for
+# this exact quarantine revalidation literal; preserve it as executable code,
+# not a comment or dead string.
 if text.count("Assert-CloneIdentity -Path $quarantine") != 1:
     raise RuntimeError("clone quarantine revalidation literal is not uniquely executable")
 if text.count("-OnQuarantined $quarantineValidator") != 1:
