@@ -39,11 +39,15 @@ function Move-HmsCompositeDirectoryGuard {
 '''
 text = text.replace(anchor, mock_block, 1)
 
-cleanup_anchor = """finally {\n    Remove-Item -LiteralPath $caseB -Recurse -Force -ErrorAction SilentlyContinue\n    Remove-Item -LiteralPath Function:\\Assert-OwnedCompositeIdentity -Force -ErrorAction SilentlyContinue\n}\n\nWrite-Host 'PASS: CodeGraph previous-identity handoff and composite rollback reservation survive post-mutation transition failures.'\n"""
-if text.count(cleanup_anchor) != 1:
-    raise RuntimeError("rollback handoff cleanup anchor changed")
-cleanup_new = """finally {\n    Remove-Item -LiteralPath $caseB -Recurse -Force -ErrorAction SilentlyContinue\n    Remove-Item -LiteralPath Function:\\Assert-OwnedCompositeIdentity -Force -ErrorAction SilentlyContinue\n    Remove-Item -LiteralPath Function:\\Open-HmsCompositeDirectoryGuard -Force -ErrorAction SilentlyContinue\n    Remove-Item -LiteralPath Function:\\Move-HmsCompositeDirectoryGuard -Force -ErrorAction SilentlyContinue\n}\n\nWrite-Host 'PASS: CodeGraph previous-identity handoff and composite rollback reservation survive post-mutation transition failures.'\n"""
-text = text.replace(cleanup_anchor, cleanup_new, 1)
+cleanup_line = "    Remove-Item -LiteralPath Function:\\Assert-OwnedCompositeIdentity -Force -ErrorAction SilentlyContinue"
+if text.count(cleanup_line) != 1:
+    raise RuntimeError("rollback handoff cleanup line changed")
+cleanup_new = "\n".join((
+    cleanup_line,
+    "    Remove-Item -LiteralPath Function:\\Open-HmsCompositeDirectoryGuard -Force -ErrorAction SilentlyContinue",
+    "    Remove-Item -LiteralPath Function:\\Move-HmsCompositeDirectoryGuard -Force -ErrorAction SilentlyContinue",
+))
+text = text.replace(cleanup_line, cleanup_new, 1)
 
 for literal in (
     "Invoke-Expression $reserveFunctionText",
@@ -51,6 +55,8 @@ for literal in (
     "function Open-HmsCompositeDirectoryGuard",
     "function Move-HmsCompositeDirectoryGuard",
     "Caller-visible composite reservation pathname remained null after successful rename.",
+    "Function:\\Open-HmsCompositeDirectoryGuard",
+    "Function:\\Move-HmsCompositeDirectoryGuard",
 ):
     if text.count(literal) != 1:
         raise RuntimeError(f"rollback handoff regression contract is not unique: {literal}")
