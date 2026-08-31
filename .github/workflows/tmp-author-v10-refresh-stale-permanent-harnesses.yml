@@ -1,0 +1,238 @@
+name: Temporary author V10 stale permanent harness refresh
+
+on:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.2.0-ui-design-authority
+    paths:
+      - .github/workflows/tmp-author-v10-refresh-stale-permanent-harnesses.yml
+
+permissions:
+  contents: write
+
+jobs:
+  author:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2025
+    env:
+      BASELINE_PARENT: f1c8112d8b50593f9e54d1e14e812768615cc431
+      SELF_PATH: .github/workflows/tmp-author-v10-refresh-stale-permanent-harnesses.yml
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Bind V10 author to exact clean V9 authority
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $parent=((& git rev-parse HEAD^)-join '').Trim().ToLowerInvariant()
+          if($LASTEXITCODE -ne 0 -or $parent -cne $env:BASELINE_PARENT){throw "V10 parent mismatch. Expected $env:BASELINE_PARENT, found $parent"}
+          $changed=@(& git diff --name-only HEAD^ HEAD)
+          if($changed.Count -ne 1 -or [string]$changed[0] -cne $env:SELF_PATH){throw "V10 bootstrap scope mismatch: $($changed -join ', ')"}
+
+      - name: Refresh exactly three stale permanent harnesses for V9 contracts
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def load(path): return Path(path).read_text(encoding='utf-8')
+          def save(path,text): Path(path).write_text(text,encoding='utf-8',newline='\n')
+          def once(text,old,new,label):
+              n=text.count(old)
+              if n != 1: raise SystemExit(f'{label}: expected exactly one anchor, found {n}')
+              return text.replace(old,new,1)
+          def replace_between(text,start,end,replacement,label):
+              a=text.find(start)
+              if a < 0: raise SystemExit(f'{label}: start anchor missing')
+              if text.find(start,a+1) >= 0: raise SystemExit(f'{label}: duplicate start anchor')
+              b=text.find(end,a+len(start))
+              if b < 0: raise SystemExit(f'{label}: end anchor missing')
+              return text[:a] + replacement + text[b:]
+
+          # 1) Latest CodeGraph rollback harness: V9 deliberately forbids execution of freshly
+          # extracted release bytes before publication. Replace the old one-version-execution oracle
+          # with locked-archive, archive-derived-tree, exact-candidate-guard structural proof.
+          p='.github/workflows/validate-review-5dbd-latest-p1.yml'; t=load(p)
+          start='          # Persisted or renamed previous bundles must never be executed. The only version execution inside Sync\n'
+          end='          $compositeAst=Parse-CheckedAst -Path $composite\n'
+          replacement='''          # V9 trust contract: no persisted, renamed, or freshly extracted CodeGraph launcher may execute
+          # before publication. Locked release bytes plus the archive-derived logical tree authenticate
+          # the candidate, and exact directory handles carry that identity across activation.
+          foreach($name in @('Assert-CodeGraphBundleAgainstManifest','Move-CodeGraphCurrentToRollbackBackup','Assert-CodeGraphTransactionBundle')){
+            $fn=Get-OneFunctionAst -Ast $deliveryAst -Name $name
+            $bad=@($fn.Body.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Assert-CodeGraphVersion'},$true))
+            if($bad.Count -ne 0){throw "Previous-bundle trust function '$name' executes CodeGraph version bytes."}
+          }
+          $versionCalls=@($sync.Body.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Assert-CodeGraphVersion'},$true))
+          if($versionCalls.Count -ne 0){throw 'Sync-CodeGraphBundle executes extracted CodeGraph bytes before trusted publication.'}
+
+          $archiveFn=Get-OneFunctionAst -Ast $deliveryAst -Name 'Open-CodeGraphVerifiedArchive'
+          $archiveText=$archiveFn.Extent.Text
+          foreach($literal in @(
+            'New-Object IO.FileStream($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)',
+            'Get-FileHash -LiteralPath $Path -Algorithm SHA256',
+            '$tree = Get-CodeGraphArchiveLogicalTreeSha256 -ArchivePath $Path -Architecture $Architecture',
+            'return [pscustomobject]@{ Stream=$stream; ExpectedTreeSha256=$tree; AssetSha256=$actual }'
+          )){if($archiveText -notmatch [regex]::Escape($literal)){throw "Verified CodeGraph archive contract is missing: $literal"}}
+
+          $candidateMove=Get-OneFunctionAst -Ast $deliveryAst -Name 'Move-CodeGraphCandidateToCurrent'
+          $candidateMoveText=$candidateMove.Extent.Text
+          foreach($literal in @(
+            "Open-HmsDeliveryDirectoryGuard -Path $CandidatePath -Label 'CodeGraph candidate activation'",
+            "Move-HmsDeliveryDirectoryGuard -Guard $guard -Destination $CurrentPath -Label 'CodeGraph candidate activation'",
+            'Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $Identity'
+          )){if($candidateMoveText -notmatch [regex]::Escape($literal)){throw "Exact CodeGraph candidate activation contract is missing: $literal"}}
+
+          $syncText=$sync.Extent.Text
+          foreach($literal in @(
+            '$archiveAuthority = Open-CodeGraphVerifiedArchive -Path $zip -ExpectedSha256 $expectedSha -Architecture $arch',
+            '$actualCandidateTree = Get-CodeGraphBundleTreeSha256 -Path $candidate',
+            '$candidateTreeSha = [string]$archiveAuthority.ExpectedTreeSha256',
+            '$candidateActivationGuard = Move-CodeGraphCandidateToCurrent -CandidatePath $candidate -CurrentPath $current -Identity $candidateIdentity'
+          )){if($syncText -notmatch [regex]::Escape($literal)){throw "V9 CodeGraph immutable-candidate contract is missing: $literal"}}
+
+'''
+          t=replace_between(t,start,end,replacement,'refresh CodeGraph prepublication oracle')
+          save(p,t)
+
+          # 2) Destructive-boundary harness: isolated function copying became stale when the
+          # production quarantine gained native exact-handle helpers. Use the exact pre-main
+          # production definition closure instead, so the exercised primitive has its real dependencies.
+          p='.github/workflows/validate-fresh-review-destructive-boundaries.yml'; t=load(p)
+          old="          $implDefs = Get-FunctionText -Path $implPath -Names @('Assert-OwnedCompositeRoot','Add-OwnedCompositeTreeRecords','Get-OwnedCompositeTreeSha256','Assert-OwnedCompositeIdentity','Remove-OwnedCompositeIdentityQuarantine')\n"
+          new="""          $v10CompositeDefinitionStart=$implText.IndexOf('$CompositeName = ')
+          $v10CompositeDefinitionEnd=$implText.IndexOf('$stageId = $null')
+          if($v10CompositeDefinitionStart -lt 0 -or $v10CompositeDefinitionEnd -le $v10CompositeDefinitionStart){throw 'Could not isolate composite pre-main production definitions for destructive-boundary regression.'}
+          $v10CompositeDefs=$implText.Substring($v10CompositeDefinitionStart,$v10CompositeDefinitionEnd-$v10CompositeDefinitionStart)
+"""
+          t=once(t,old,new,'destructive composite definition closure')
+          t=once(t,'          $implDefs\n',"""          `$InstallRoot=`$TestRoot
+          `$OutputRoot=`$TestRoot
+          `$SkillsRoot=`$TestRoot
+          $v10CompositeDefs
+""",'destructive harness embedded closure')
+          save(p,t)
+
+          # 3) Trust/transaction harness: same stale isolated stage-function dependency. Embed the
+          # exact pre-main composite closure so native guard/open/move/delete dependencies are real.
+          p='.github/workflows/validate-fresh-review-p1-trust-and-transaction-boundaries.yml'; t=load(p)
+          old="          $stageDefs=Get-FunctionText -Path $builderImpl -Names @('Restore-Quarantine','Assert-OwnedCompositeStage','Remove-OwnedCompositeStageQuarantine')\n"
+          new="""          $v10StageDefinitionStart=$implText.IndexOf('$CompositeName = ')
+          $v10StageDefinitionEnd=$implText.IndexOf('$stageId = $null')
+          if($v10StageDefinitionStart -lt 0 -or $v10StageDefinitionEnd -le $v10StageDefinitionStart){throw 'Could not isolate composite pre-main production definitions for stage regression.'}
+          $v10StageDefs=$implText.Substring($v10StageDefinitionStart,$v10StageDefinitionEnd-$v10StageDefinitionStart)
+"""
+          t=once(t,old,new,'stage composite definition closure')
+          t=once(t,'          $stageDefs\n',"""          `$InstallRoot=`$Root
+          `$OutputRoot=`$Root
+          `$SkillsRoot=`$Root
+          $v10StageDefs
+""",'stage harness embedded closure')
+          save(p,t)
+
+      - name: Create exact local V10 candidate and run full structural suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $targets=@(
+            '.github/workflows/validate-review-5dbd-latest-p1.yml',
+            '.github/workflows/validate-fresh-review-destructive-boundaries.yml',
+            '.github/workflows/validate-fresh-review-p1-trust-and-transaction-boundaries.yml'
+          )
+          Remove-Item -LiteralPath $env:SELF_PATH -Force
+          $allowed=@($targets+$env:SELF_PATH)
+          $changed=@(& git status --porcelain=v1 --untracked-files=all | ForEach-Object {$_.Substring(3).Replace('\','/')} | Sort-Object -Unique)
+          $unexpected=@($changed|Where-Object{$_ -notin $allowed})
+          if($unexpected.Count){throw "Unexpected V10 author paths: $($unexpected -join ', ')"}
+          foreach($path in $allowed){if($path -notin $changed){throw "Expected V10 path not changed: $path"}}
+          & git diff --check
+          if($LASTEXITCODE -ne 0){throw 'git diff --check rejected V10.'}
+          & git config user.name 'github-actions[bot]'
+          & git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          & git add -- $allowed
+          & git commit -m 'Refresh V9 exact-object permanent harnesses'
+          if($LASTEXITCODE -ne 0){throw 'Local V10 candidate commit failed.'}
+          $net=@(& git diff --name-only $env:BASELINE_PARENT HEAD)
+          if($net.Count -ne 3 -or @($net|Where-Object{$_ -notin $targets}).Count){throw "V10 net scope mismatch: $($net -join ', ')"}
+          Write-Host "LOCAL_CANDIDATE=$(((& git rev-parse HEAD)-join '').Trim().ToLowerInvariant())"
+          Write-Host "LOCAL_TREE=$(((& git rev-parse 'HEAD^{tree}')-join '').Trim().ToLowerInvariant())"
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts\Test-HmsSkills.ps1') -RepoRoot $env:GITHUB_WORKSPACE
+          if($LASTEXITCODE -ne 0){throw "Test-HmsSkills failed with exit code $LASTEXITCODE"}
+
+      - name: Extract three refreshed permanent run blocks
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          specs=[
+            ('.github/workflows/validate-review-5dbd-latest-p1.yml','      - name: Qualify production catch enclosure and exact rollback identities\n','v10-5dbd.ps1'),
+            ('.github/workflows/validate-fresh-review-destructive-boundaries.yml','      - name: Qualify rollback and CodeGraph quarantine boundaries\n','v10-destructive.ps1'),
+            ('.github/workflows/validate-fresh-review-p1-trust-and-transaction-boundaries.yml','      - name: Qualify executable trust committed membership and transaction cleanup\n','v10-trust-transaction.ps1'),
+          ]
+          for path,step,out_name in specs:
+              text=Path(path).read_text(encoding='utf-8')
+              s=text.find(step)
+              if s < 0 or text.find(step,s+1) >= 0: raise SystemExit(f'{path}: permanent step missing or duplicated')
+              r=text.find('        run: |\n',s)
+              if r < 0: raise SystemExit(f'{path}: run block missing')
+              body=text[r+len('        run: |\n'):]
+              script=[]
+              for line in body.splitlines():
+                  if line.startswith('          '): script.append(line[10:])
+                  elif line == '': script.append('')
+                  elif line.startswith('      - name: ') or line.startswith('      - uses: '): break
+                  else: raise SystemExit(f'{path}: run block escaped expected indentation: {line!r}')
+              if not script: raise SystemExit(f'{path}: extracted empty run block')
+              Path(os.environ['RUNNER_TEMP'],out_name).write_text('\n'.join(script)+'\n',encoding='utf-8',newline='\n')
+
+      - name: Execute refreshed CodeGraph rollback permanent harness
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $env:CANDIDATE_SHA=((& git rev-parse HEAD)-join '').Trim().ToLowerInvariant()
+          & (Join-Path $env:RUNNER_TEMP 'v10-5dbd.ps1')
+          if($LASTEXITCODE -ne 0){throw "Refreshed CodeGraph rollback harness failed with exit code $LASTEXITCODE"}
+
+      - name: Execute refreshed destructive-boundary permanent harness
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $env:CANDIDATE_SHA=((& git rev-parse HEAD)-join '').Trim().ToLowerInvariant()
+          & (Join-Path $env:RUNNER_TEMP 'v10-destructive.ps1')
+          if($LASTEXITCODE -ne 0){throw "Refreshed destructive-boundary harness failed with exit code $LASTEXITCODE"}
+
+      - name: Execute refreshed trust-transaction permanent harness
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $env:CANDIDATE_SHA=((& git rev-parse HEAD)-join '').Trim().ToLowerInvariant()
+          & (Join-Path $env:RUNNER_TEMP 'v10-trust-transaction.ps1')
+          if($LASTEXITCODE -ne 0){throw "Refreshed trust-transaction harness failed with exit code $LASTEXITCODE"}
+          $dirty=@(& git status --porcelain=v1 --untracked-files=all)
+          if($dirty.Count){throw "V10 qualification left worktree drift: $($dirty -join ' | ')"}
+
+      - name: Prepare three verified GitHub blobs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $targets=@(
+            '.github/workflows/validate-review-5dbd-latest-p1.yml',
+            '.github/workflows/validate-fresh-review-destructive-boundaries.yml',
+            '.github/workflows/validate-fresh-review-p1-trust-and-transaction-boundaries.yml'
+          )
+          $headers=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}
+          $repo='hoangminhsang989/HMS-Skills-Codex'
+          foreach($path in $targets){
+            $bytes=[IO.File]::ReadAllBytes((Join-Path $env:GITHUB_WORKSPACE $path))
+            $body=@{content=[Convert]::ToBase64String($bytes);encoding='base64'}|ConvertTo-Json -Compress
+            $blob=Invoke-RestMethod -Method Post -Headers $headers -Uri "https://api.github.com/repos/$repo/git/blobs" -Body $body -ContentType 'application/json'
+            $localBlob=((& git hash-object --no-filters -- $path)-join '').Trim().ToLowerInvariant()
+            if(-not $blob.sha -or $localBlob -cne ([string]$blob.sha).ToLowerInvariant()){throw "GitHub blob identity mismatch for $path"}
+            Write-Host "PREPARED_BLOB $path $($blob.sha)"
+          }
+          Write-Host "QUALIFIED_LOCAL_HEAD=$(((& git rev-parse HEAD)-join '').Trim().ToLowerInvariant())"
+          Write-Host "QUALIFIED_LOCAL_TREE=$(((& git rev-parse 'HEAD^{tree}')-join '').Trim().ToLowerInvariant())"
+          Write-Host 'PRODUCTION_BYTE_DRIFT=0'
+          Write-Host 'DETACHED_BLOBS_ONLY=YES'
