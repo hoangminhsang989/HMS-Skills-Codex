@@ -93,7 +93,7 @@ if (Test-Path -LiteralPath $modelSettingsShimPath) {
 $uninstallPath = Join-Path $RepoRoot 'uninstall.ps1'
 if (Test-Path -LiteralPath $uninstallPath) {
     $uninstallText = Get-Content -LiteralPath $uninstallPath -Raw
-    foreach ($literal in @('function Remove-VerifiedClone','Assert-CloneIdentity -Path $quarantine')) {
+    foreach ($literal in @('function Remove-VerifiedClone','$assertCloneIdentity = ${function:Assert-CloneIdentity}','& $assertCloneIdentity -Path $p','& $assertCloneIdentity -Path $quarantine','--git-dir=$gitDir')) {
         if ($uninstallText -notmatch [regex]::Escape($literal)) { $errors.Add("Uninstall clone quarantine contract missing literal: $literal") }
     }
 }

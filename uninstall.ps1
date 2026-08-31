@@ -172,7 +172,8 @@ function Assert-CloneIdentity {
     Assert-SafeRemovalPath -Path $Path
     if (-not (Test-Path -LiteralPath (Join-Path $Path '.git'))) { throw "Refusing to remove non-Git clone path: $Path" }
     if (-not (Test-Path -LiteralPath (Join-Path $Path $MarkerRelativePath))) { throw "Refusing to remove clone without expected marker '$MarkerRelativePath': $Path" }
-    $origin = & git -C $Path remote get-url origin
+    $gitDir = Join-Path $Path '.git'
+    $origin = & git "--git-dir=$gitDir" config --get remote.origin.url
     if ($LASTEXITCODE -ne 0) { throw "git remote get-url origin failed for $Path" }
     if ((ConvertTo-NormalizedRemote $origin) -ne (ConvertTo-NormalizedRemote $ExpectedRemote)) { throw "Refusing to remove clone with unexpected origin: $Path" }
 }
@@ -257,13 +258,14 @@ function Remove-VerifiedClone {
     Assert-CloneIdentity -Path $Path -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
     if (-not $PSCmdlet.ShouldProcess($Path, $Action)) { return }
 
+    $assertCloneIdentity = ${function:Assert-CloneIdentity}
     $validator = {
         param($p)
-        Assert-CloneIdentity -Path $p -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
+        & $assertCloneIdentity -Path $p -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
     }.GetNewClosure()
     $quarantineValidator = {
         param($quarantine)
-        Assert-CloneIdentity -Path $quarantine -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
+        & $assertCloneIdentity -Path $quarantine -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
     }.GetNewClosure()
 
     Invoke-HmsUninstallExactDirectoryRemoval `
@@ -281,7 +283,8 @@ function Remove-VerifiedCompositeRoot {
     if (-not (Test-Path -LiteralPath $Path)) { return }
     Assert-OwnedCompositeRoot -Path $Path
     if (-not $PSCmdlet.ShouldProcess($Path, $Action)) { return }
-    $validator={param($p) Assert-OwnedCompositeRoot -Path $p}.GetNewClosure()
+    $assertOwnedCompositeRoot = ${function:Assert-OwnedCompositeRoot}
+    $validator={param($p) & $assertOwnedCompositeRoot -Path $p}.GetNewClosure()
     Invoke-HmsUninstallExactDirectoryRemoval -Path $Path -Prefix '.hms-composite-removing-' -Label 'Verified composite uninstall cleanup' -Validate $validator
 }
 
@@ -292,7 +295,8 @@ function Remove-VerifiedCodeGraphRoot {
     if (-not (Test-Path -LiteralPath $Path)) { return }
     Assert-ManagedCodeGraphRoot -Path $Path
     if (-not $PSCmdlet.ShouldProcess($Path, $Action)) { return }
-    $validator={param($p) Assert-ManagedCodeGraphRoot -Path $p}.GetNewClosure()
+    $assertManagedCodeGraphRoot = ${function:Assert-ManagedCodeGraphRoot}
+    $validator={param($p) & $assertManagedCodeGraphRoot -Path $p}.GetNewClosure()
     Invoke-HmsUninstallExactDirectoryRemoval -Path $Path -Prefix '.hms-codegraph-removing-' -Label 'Verified CodeGraph uninstall cleanup' -Validate $validator
 }
 

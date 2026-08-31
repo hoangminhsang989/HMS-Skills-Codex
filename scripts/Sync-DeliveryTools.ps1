@@ -365,7 +365,8 @@ function Assert-CodeGraphTransactionBundle {
 
 function Remove-CodeGraphTransactionBundle {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Identity)
-    $validator={param($p) Assert-CodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()
+    $assertCodeGraphTransactionBundle = ${function:Assert-CodeGraphTransactionBundle}
+    $validator={param($p) & $assertCodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()
     Invoke-HmsDeliveryExactDirectoryRemoval -Path $Path -QuarantinePrefix '.hms-codegraph-deleting-' -Label 'CodeGraph transaction bundle cleanup' -Validate $validator
 }
 
@@ -394,7 +395,8 @@ function Assert-CodeGraphTempRoot {
 
 function Remove-CodeGraphTempRoot {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$TransactionId)
-    $validator={param($p) Assert-CodeGraphTempRoot -Path $p -TransactionId $TransactionId}.GetNewClosure()
+    $assertCodeGraphTempRoot = ${function:Assert-CodeGraphTempRoot}
+    $validator={param($p) & $assertCodeGraphTempRoot -Path $p -TransactionId $TransactionId}.GetNewClosure()
     Invoke-HmsDeliveryExactDirectoryRemoval -Path $Path -QuarantinePrefix '.hms-codegraph-temp-removing-' -Label 'CodeGraph temporary-root cleanup' -Validate $validator
 }
 
