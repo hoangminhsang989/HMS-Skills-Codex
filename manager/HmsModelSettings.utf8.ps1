@@ -316,10 +316,12 @@ function Read-ModelStateFromGuard {
 function Read-ModelState-Unserialized {
     param([string]$Path = $SettingsPath)
     if (-not (Test-Path -LiteralPath $Path)) { return New-DefaultModelState }
-    Assert-RegularSettingsFile -Path $Path
-    try { $text = [IO.File]::ReadAllText($Path,(New-Object System.Text.UTF8Encoding($false,$true))) }
-    catch { throw "Model settings could not be read: $($_.Exception.Message)" }
-    return Convert-ModelSettingsTextToState -Text $text -Label 'Model settings'
+    $guard = $null
+    try {
+        $guard = Open-HmsModelSettingsFileGuard -Path $Path -Label 'Model settings'
+        return Read-ModelStateFromGuard -Guard $guard -Label 'Model settings'
+    }
+    finally { if ($null -ne $guard -and $null -ne $guard.Handle) { $guard.Handle.Dispose(); $guard.Handle = $null } }
 }
 
 function Read-ModelState {

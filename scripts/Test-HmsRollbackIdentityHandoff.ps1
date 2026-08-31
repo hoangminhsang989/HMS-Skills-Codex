@@ -45,8 +45,8 @@ if ($compositeText -notmatch [regex]::Escape('-ReservedPathRef ([ref]$reservedBa
     throw 'Production composite reservation does not hand the random reservation path to caller-visible state before post-rename validation.'
 }
 
-# P1 regression A: execute the production CodeGraph transition helper with an injected Move-Item
-# failure after its marker rewrite. Caller-visible previous identity must already be populated, and
+# P1 regression A: execute the production CodeGraph transition helper with an injected exact-handle
+# rename failure after its marker rewrite. Caller-visible previous identity must already be populated, and
 # the helper must restore the original candidate-role marker while current remains in place.
 $moveFunctionText=Get-FunctionText -Path $deliveryPath -Name 'Move-CodeGraphCurrentToRollbackBackup'
 Invoke-Expression $moveFunctionText
@@ -97,20 +97,23 @@ function Assert-CodeGraphTransactionBundle {
         throw "Injected marker identity mismatch at $Path"
     }
 }
-function Move-Item {
-    param(
-        [string]$LiteralPath,
-        [string]$Destination,
-        [string]$Path,
-        [string]$NewName,
-        [switch]$Force,
-        [object]$ErrorAction
-    )
-    if ($LiteralPath -ceq $currentA -and $Destination -ceq $backupA) {
-        throw 'Injected Windows current-to-backup rename failure after marker rewrite.'
+function Open-HmsDeliveryDirectoryGuard {
+    param([string]$Path,[string]$Label)
+    if ($Path -cne $currentA) { throw "Injected CodeGraph guard opened an unexpected path: $Path" }
+    return [pscustomobject]@{
+        Path = $Path
+        Identity = 'injected-current-directory'
+        Handle = [IO.MemoryStream]::new()
     }
-    Microsoft.PowerShell.Management\Move-Item @PSBoundParameters
 }
+function Move-HmsDeliveryDirectoryGuard {
+    param($Guard,[string]$Destination,[string]$Label)
+    if ([string]$Guard.Path -ceq $currentA -and $Destination -ceq $backupA) {
+        throw 'Injected Windows current-to-backup exact-handle rename failure after marker rewrite.'
+    }
+    throw "Injected CodeGraph guard received an unexpected transition: $($Guard.Path) -> $Destination"
+}
+
 
 $capturedPrevious=$null
 $failedA=$false
@@ -121,7 +124,8 @@ catch {
     $failedA=$true
 }
 finally {
-    Remove-Item -LiteralPath Function:\Move-Item -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Function:\Open-HmsDeliveryDirectoryGuard -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Function:\Move-HmsDeliveryDirectoryGuard -Force -ErrorAction SilentlyContinue
 }
 try {
     if (-not $failedA) { throw 'Injected CodeGraph post-marker/pre-rename failure did not fail.' }

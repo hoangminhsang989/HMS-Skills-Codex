@@ -395,38 +395,48 @@ function Remove-OwnedCompositeIdentityQuarantine {
         [Parameter(Mandatory)][string]$ExpectedTreeSha256
     )
     if (-not (Test-Path -LiteralPath $Path)) { return }
-    Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
     $parent = Split-Path -Parent $Path
-    $leaf = '.hms-composite-deleting-' + [guid]::NewGuid().ToString('N')
-    $quarantine = Join-Path $parent $leaf
+    $quarantine = Join-Path $parent ('.hms-composite-deleting-' + [guid]::NewGuid().ToString('N'))
     if (Test-Path -LiteralPath $quarantine) { throw "Composite identity quarantine path already exists: $quarantine" }
+    if ($env:OS -cne 'Windows_NT') {
+        Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
+        Rename-Item -LiteralPath $Path -NewName (Split-Path -Leaf $quarantine) -ErrorAction Stop
+        Assert-OwnedCompositeIdentity -Path $quarantine -ExpectedTreeSha256 $ExpectedTreeSha256
+        Remove-Item -LiteralPath $quarantine -Recurse -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $quarantine) { throw "Composite identity quarantine removal did not complete: $quarantine" }
+        return
+    }
+    $guard = Open-HmsCompositeDirectoryGuard -Path $Path -Label 'Composite identity quarantine'
+    $renamed = $false
     $deleteStarted = $false
-    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
     try {
+        Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
+        Move-HmsCompositeDirectoryGuard -Guard $guard -Destination $quarantine -Label 'Composite identity quarantine'
+        $renamed = $true
         Assert-OwnedCompositeIdentity -Path $quarantine -ExpectedTreeSha256 $ExpectedTreeSha256
         $deleteStarted = $true
-        Remove-Item -LiteralPath $quarantine -Recurse -Force
-        if (Test-Path -LiteralPath $quarantine) { throw "Composite identity quarantine removal did not complete: $quarantine" }
+        foreach ($child in @(Get-ChildItem -LiteralPath $quarantine -Force -ErrorAction Stop)) {
+            Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop
+        }
+        $code = 0
+        if (-not [HmsCompositeExactFsNative]::DeleteByHandle($guard.Handle,[ref]$code)) { throw "Composite exact quarantine delete-pending transition failed (Win32=$code): $quarantine" }
+        $guard.Handle.Dispose(); $guard.Handle = $null
+        if (Test-Path -LiteralPath $quarantine) { throw "Composite exact quarantine remained after handle deletion: $quarantine" }
     }
     catch {
         $e = $_
-        if (-not $deleteStarted) {
-  try {
-      if (-not (Test-Path -LiteralPath $Path) -and (Test-Path -LiteralPath $quarantine)) {
-          Assert-OwnedCompositeIdentity -Path $quarantine -ExpectedTreeSha256 $ExpectedTreeSha256
-          Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop
-          Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
-      }
-  }
-  catch {
-      throw "Composite identity quarantine validation failed and rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)"
-  }
+        if (-not $deleteStarted -and $renamed -and $null -ne $guard.Handle -and -not $guard.Handle.IsClosed -and -not (Test-Path -LiteralPath $Path)) {
+            try {
+                Move-HmsCompositeDirectoryGuard -Guard $guard -Destination $Path -Label 'Composite identity quarantine rollback'
+                Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
+            } catch { throw "Composite identity quarantine validation failed and exact-object rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)" }
         }
-        elseif (Test-Path -LiteralPath $quarantine) {
-  throw "Composite identity deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
+        elseif ($deleteStarted -and (Test-Path -LiteralPath $quarantine)) {
+            throw "Composite identity deletion failed after destructive child removal started; exact quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
         }
         throw $e
     }
+    finally { if ($null -ne $guard -and $null -ne $guard.Handle) { $guard.Handle.Dispose() } }
 }
 
 function Remove-OwnedCompositeQuarantine {
@@ -477,32 +487,86 @@ function Assert-OwnedCompositeStage {
     }
 }
 
+function Move-OwnedCompositeStageToFinal {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$FinalPath,
+        [Parameter(Mandatory)][string]$StageId,
+        [Parameter(Mandatory)][string]$ExpectedTreeSha256
+    )
+    if (Test-Path -LiteralPath $FinalPath) { throw "Composite FinalRoot is occupied before staged activation: $FinalPath" }
+    if ($env:OS -cne 'Windows_NT') {
+        Assert-OwnedCompositeStage -Path $Path -StageId $StageId
+        Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
+        Rename-Item -LiteralPath $Path -NewName (Split-Path -Leaf $FinalPath) -ErrorAction Stop
+        Assert-OwnedCompositeStage -Path $FinalPath -StageId $StageId
+        Assert-OwnedCompositeIdentity -Path $FinalPath -ExpectedTreeSha256 $ExpectedTreeSha256
+        return $null
+    }
+    $guard = Open-HmsCompositeDirectoryGuard -Path $Path -Label 'Composite stage activation'
+    try {
+        Assert-OwnedCompositeStage -Path $Path -StageId $StageId
+        Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
+        $probe = [string]$env:HMS_TEST_STAGE_ACTIVATION_GUARD_READY
+        if (-not [string]::IsNullOrWhiteSpace($probe)) {
+            [IO.File]::WriteAllText($probe,$Path,(New-Object Text.UTF8Encoding($false)))
+            Start-Sleep -Milliseconds 1200
+        }
+        Move-HmsCompositeDirectoryGuard -Guard $guard -Destination $FinalPath -Label 'Composite stage activation'
+        Assert-OwnedCompositeStage -Path $FinalPath -StageId $StageId
+        Assert-OwnedCompositeIdentity -Path $FinalPath -ExpectedTreeSha256 $ExpectedTreeSha256
+        return $guard
+    }
+    catch {
+        $activationError = $_
+        if ($null -ne $guard -and $null -ne $guard.Handle -and -not $guard.Handle.IsClosed -and [string]$guard.Path -ceq $FinalPath -and -not (Test-Path -LiteralPath $Path)) {
+            try {
+                Move-HmsCompositeDirectoryGuard -Guard $guard -Destination $Path -Label 'Composite stage activation verification rollback'
+                Assert-OwnedCompositeStage -Path $Path -StageId $StageId
+                Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
+            }
+            catch { throw "Composite stage activation validation failed and exact-object return also failed. Validation: $($activationError.Exception.Message). Return: $($_.Exception.Message)" }
+        }
+        if ($null -ne $guard -and $null -ne $guard.Handle) { $guard.Handle.Dispose(); $guard.Handle = $null }
+        throw $activationError
+    }
+}
+
 function Remove-OwnedCompositeStageQuarantine {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$StageId)
     if (-not (Test-Path -LiteralPath $Path)) { return }
-    Assert-OwnedCompositeStage -Path $Path -StageId $StageId
     $parent = Split-Path -Parent $Path
-    $leaf = '.hms-stage-deleting-' + [guid]::NewGuid().ToString('N')
-    $quarantine = Join-Path $parent $leaf
-    $deleteStarted = $false
-    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+    $quarantine = Join-Path $parent ('.hms-stage-deleting-' + [guid]::NewGuid().ToString('N'))
+    if ($env:OS -cne 'Windows_NT') {
+        Assert-OwnedCompositeStage -Path $Path -StageId $StageId
+        Rename-Item -LiteralPath $Path -NewName (Split-Path -Leaf $quarantine) -ErrorAction Stop
+        Assert-OwnedCompositeStage -Path $quarantine -StageId $StageId
+        Remove-Item -LiteralPath $quarantine -Recurse -Force -ErrorAction Stop
+        return
+    }
+    $guard = Open-HmsCompositeDirectoryGuard -Path $Path -Label 'Composite stage cleanup'
+    $renamed = $false; $deleteStarted = $false
     try {
+        Assert-OwnedCompositeStage -Path $Path -StageId $StageId
+        Move-HmsCompositeDirectoryGuard -Guard $guard -Destination $quarantine -Label 'Composite stage cleanup'
+        $renamed = $true
         Assert-OwnedCompositeStage -Path $quarantine -StageId $StageId
         $deleteStarted = $true
-        Remove-Item -LiteralPath $quarantine -Recurse -Force
-        if (Test-Path -LiteralPath $quarantine) { throw "Composite stage quarantine removal did not complete: $quarantine" }
+        foreach ($child in @(Get-ChildItem -LiteralPath $quarantine -Force -ErrorAction Stop)) { Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop }
+        $code = 0
+        if (-not [HmsCompositeExactFsNative]::DeleteByHandle($guard.Handle,[ref]$code)) { throw "Composite stage exact delete-pending transition failed (Win32=$code): $quarantine" }
+        $guard.Handle.Dispose(); $guard.Handle = $null
     }
     catch {
-        $e = $_
-        if (-not $deleteStarted) {
-            try { Restore-Quarantine -Original $Path -Quarantine $quarantine }
-            catch { throw "Composite stage quarantine validation failed and rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)" }
+        $e=$_
+        if (-not $deleteStarted -and $renamed -and $null -ne $guard.Handle -and -not (Test-Path -LiteralPath $Path)) {
+            try { Move-HmsCompositeDirectoryGuard -Guard $guard -Destination $Path -Label 'Composite stage cleanup rollback'; Assert-OwnedCompositeStage -Path $Path -StageId $StageId }
+            catch { throw "Composite stage cleanup failed and exact-object rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)" }
         }
-        elseif (Test-Path -LiteralPath $quarantine) {
-            throw "Composite stage deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
-        }
+        elseif ($deleteStarted -and (Test-Path -LiteralPath $quarantine)) { throw "Composite stage deletion failed after destructive child removal started; exact quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)" }
         throw $e
     }
+    finally { if ($null -ne $guard -and $null -ne $guard.Handle) { $guard.Handle.Dispose() } }
 }
 
 function Copy-SkillModule {
@@ -784,12 +848,26 @@ try {
     $oldMovedToBackup = $false
     $reservedBackup = $null
     $newActivated = $false
+    $stageActivationGuard = $null
     try {
         if (Test-Path -LiteralPath $FinalRoot) {
             if ([string]::IsNullOrWhiteSpace([string]$previousCompositeTreeSha)) { throw 'Previous composite identity was not captured before activation.' }
-            Rename-Item -LiteralPath $FinalRoot -NewName (Split-Path -Leaf $backup) -ErrorAction Stop
-            $oldMovedToBackup = $true
-            Assert-OwnedCompositeIdentity -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha
+            if ($env:OS -ceq 'Windows_NT') {
+                $previousGuard = Open-HmsCompositeDirectoryGuard -Path $FinalRoot -Label 'Previous composite backup transition'
+                try {
+                    Assert-OwnedCompositeIdentity -Path $FinalRoot -ExpectedTreeSha256 $previousCompositeTreeSha
+                    Move-HmsCompositeDirectoryGuard -Guard $previousGuard -Destination $backup -Label 'Previous composite backup transition'
+                    $oldMovedToBackup = $true
+                    Assert-OwnedCompositeIdentity -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha
+                }
+                finally { if ($null -ne $previousGuard -and $null -ne $previousGuard.Handle) { $previousGuard.Handle.Dispose() } }
+            }
+            else {
+                Assert-OwnedCompositeIdentity -Path $FinalRoot -ExpectedTreeSha256 $previousCompositeTreeSha
+                Rename-Item -LiteralPath $FinalRoot -NewName (Split-Path -Leaf $backup) -ErrorAction Stop
+                $oldMovedToBackup = $true
+                Assert-OwnedCompositeIdentity -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha
+            }
             # Immediately move the exact previous bundle off the predictable backup pathname.
             # Rollback and successful disposal use only this random identity-verified reservation.
             $reservedBackup = Reserve-OwnedCompositeRollbackBackup -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha -ReservedPathRef ([ref]$reservedBackup)
@@ -799,8 +877,7 @@ try {
             throw 'Injected staged-root activation failure for rollback qualification.'
         }
 
-        Assert-OwnedCompositeStage -Path $stage -StageId $stageId
-        Rename-Item -LiteralPath $stage -NewName (Split-Path -Leaf $FinalRoot) -ErrorAction Stop
+        $stageActivationGuard = Move-OwnedCompositeStageToFinal -Path $stage -FinalPath $FinalRoot -StageId $stageId -ExpectedTreeSha256 $candidateCompositeTreeSha
         $newActivated = $true
         $stage = $null
 
@@ -820,9 +897,16 @@ try {
             if ($state.State -eq 'Exact') { Remove-ExactJunction -Link $CompositeLink -Target $FinalRoot }
             elseif ($state.State -eq 'Conflict') { throw $state.Detail }
         }
+        if ($null -ne $stageActivationGuard) {
+            $finalHandleIdentity = Get-HmsCompositeDirectoryIdentityFromHandle -Handle $stageActivationGuard.Handle -Label 'Composite stage discovery publication'
+            if ($finalHandleIdentity -cne [string]$stageActivationGuard.Identity) { throw 'Composite stage exact identity changed before discovery publication completed.' }
+            Assert-OwnedCompositeIdentity -Path $FinalRoot -ExpectedTreeSha256 $candidateCompositeTreeSha
+            $stageActivationGuard.Handle.Dispose(); $stageActivationGuard.Handle = $null; $stageActivationGuard = $null
+        }
     }
     catch {
         $mutationError = $_
+        if ($null -ne $stageActivationGuard -and $null -ne $stageActivationGuard.Handle) { $stageActivationGuard.Handle.Dispose(); $stageActivationGuard.Handle = $null; $stageActivationGuard = $null }
         $rollbackErrors = @()
 
         try {

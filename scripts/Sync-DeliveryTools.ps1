@@ -237,6 +237,75 @@ function Get-CodeGraphArchitecture {
     }
 }
 
+
+function Get-CodeGraphArchiveLogicalTreeSha256 {
+    param([Parameter(Mandatory)][string]$ArchivePath,[Parameter(Mandatory)][string]$Architecture)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $files = @($archive.Entries | Where-Object { -not [string]::IsNullOrEmpty([string]$_.Name) })
+        if ($files.Count -eq 0) { throw "CodeGraph verified archive contains no files: $ArchivePath" }
+        $prefix = "codegraph-win32-$Architecture/"
+        $prefixed = @($files | Where-Object { ([string]$_.FullName).Replace('\\','/').StartsWith($prefix,[StringComparison]::Ordinal) })
+        $selected = if ($prefixed.Count -gt 0) { $prefixed } else { $files }
+        $records = New-Object System.Collections.Generic.List[string]
+        $seen = @{}
+        foreach ($entry in $selected) {
+            $name = ([string]$entry.FullName).Replace('\\','/')
+            $logical = if ($prefixed.Count -gt 0) { $name.Substring($prefix.Length) } else { $name.TrimStart('/') }
+            if ([string]::IsNullOrWhiteSpace($logical) -or $logical.StartsWith('/') -or $logical.Contains('\\') -or $logical -match '(^|/)\.\.(/|$)' -or $logical -match '^[A-Za-z]:') { throw "CodeGraph archive contains unsafe logical path: $name" }
+            $key = $logical.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) { throw "CodeGraph archive contains duplicate Windows logical path: $logical" }
+            $seen[$key] = $true
+            $stream = $entry.Open(); $sha = [Security.Cryptography.SHA256]::Create()
+            try { $hash = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','').ToLowerInvariant() }
+            finally { $sha.Dispose(); $stream.Dispose() }
+            $records.Add($logical + "`t" + $hash)
+        }
+        $sorted = [string[]]@($records); [Array]::Sort($sorted,[StringComparer]::Ordinal)
+        $payload = [string]::Join("`n",$sorted)
+        $treeSha = [Security.Cryptography.SHA256]::Create()
+        try { return ([BitConverter]::ToString($treeSha.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload)))).Replace('-','').ToLowerInvariant() }
+        finally { $treeSha.Dispose() }
+    }
+    finally { $archive.Dispose() }
+}
+
+function Open-CodeGraphVerifiedArchive {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$ExpectedSha256,[Parameter(Mandatory)][string]$Architecture)
+    $stream = New-Object IO.FileStream($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -cne $ExpectedSha256) { throw "CodeGraph release asset SHA-256 mismatch. Expected $ExpectedSha256, found $actual" }
+        $tree = Get-CodeGraphArchiveLogicalTreeSha256 -ArchivePath $Path -Architecture $Architecture
+        return [pscustomobject]@{ Stream=$stream; ExpectedTreeSha256=$tree; AssetSha256=$actual }
+    }
+    catch { $stream.Dispose(); throw }
+}
+
+function Move-CodeGraphCandidateToCurrent {
+    param([Parameter(Mandatory)][string]$CandidatePath,[Parameter(Mandatory)][string]$CurrentPath,[Parameter(Mandatory)]$Identity)
+    if (Test-Path -LiteralPath $CurrentPath) { throw "CodeGraph current path is occupied before candidate activation: $CurrentPath" }
+    $guard = Open-HmsDeliveryDirectoryGuard -Path $CandidatePath -Label 'CodeGraph candidate activation'
+    try {
+        Assert-CodeGraphTransactionBundle -Path $CandidatePath -Identity $Identity
+        $probe = [string]$env:HMS_TEST_CODEGRAPH_CANDIDATE_GUARD_READY
+        if (-not [string]::IsNullOrWhiteSpace($probe)) { [IO.File]::WriteAllText($probe,$CandidatePath,(New-Object Text.UTF8Encoding($false))); Start-Sleep -Milliseconds 1200 }
+        Move-HmsDeliveryDirectoryGuard -Guard $guard -Destination $CurrentPath -Label 'CodeGraph candidate activation'
+        Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $Identity
+        return $guard
+    }
+    catch {
+        $e=$_
+        if ($null -ne $guard -and $null -ne $guard.Handle -and -not $guard.Handle.IsClosed -and [string]$guard.Path -ceq $CurrentPath -and -not (Test-Path -LiteralPath $CandidatePath)) {
+            try { Move-HmsDeliveryDirectoryGuard -Guard $guard -Destination $CandidatePath -Label 'CodeGraph candidate activation rollback'; Assert-CodeGraphTransactionBundle -Path $CandidatePath -Identity $Identity }
+            catch { throw "CodeGraph candidate activation failed and exact-object return also failed. Original: $($e.Exception.Message). Return: $($_.Exception.Message)" }
+        }
+        if ($null -ne $guard -and $null -ne $guard.Handle) { $guard.Handle.Dispose(); $guard.Handle = $null }
+        throw $e
+    }
+}
+
 function Read-ManagedCodeGraphManifest {
     if (-not (Test-Path -LiteralPath $CodeGraphRoot)) { return $null }
     if (-not (Test-Path -LiteralPath $CodeGraphManifest)) {
@@ -636,35 +705,31 @@ function Move-CodeGraphCurrentToRollbackBackup {
     )
     if (-not (Test-Path -LiteralPath $CurrentPath)) { throw "CodeGraph current bundle disappeared before backup preparation: $CurrentPath" }
     if (Test-Path -LiteralPath $BackupPath) { throw "CodeGraph rollback backup path is already occupied: $BackupPath" }
-
-    # Authenticate the existing bundle from the root-manifest-pinned transaction marker and
-    # deterministic tree hash before touching or executing any bytes beneath current.
-    $existingIdentity = Assert-CodeGraphBundleAgainstManifest -Path $CurrentPath -Manifest $ExistingManifest
-    if ($null -ne $PreviousIdentityRef) { $PreviousIdentityRef.Value = $existingIdentity }
-
-    $markerRewritten = $false
+    $currentGuard = Open-HmsDeliveryDirectoryGuard -Path $CurrentPath -Label 'CodeGraph current-to-backup transition'
     try {
-        Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $BackupIdentity
-        $markerRewritten = $true
-        Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
-        Move-Item -LiteralPath $CurrentPath -Destination $BackupPath
-        # Path-independent validation only. Never execute a launcher from a randomized backup path.
-        Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity
-    }
-    catch {
-        $transitionError = $_
-        if ($markerRewritten -and (Test-Path -LiteralPath $CurrentPath) -and -not (Test-Path -LiteralPath $BackupPath)) {
-            try {
-                Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $existingIdentity
-                Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $existingIdentity
-            }
-            catch {
-                throw "CodeGraph current-to-backup transition failed and original marker restoration was incomplete. Original: $($transitionError.Exception.Message). Rollback: $($_.Exception.Message)"
-            }
+        $existingIdentity = Assert-CodeGraphBundleAgainstManifest -Path $CurrentPath -Manifest $ExistingManifest
+        if ($null -ne $PreviousIdentityRef) { $PreviousIdentityRef.Value = $existingIdentity }
+        $markerRewritten = $false
+        try {
+            Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $BackupIdentity
+            $markerRewritten = $true
+            Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
+            $probe = [string]$env:HMS_TEST_CODEGRAPH_CURRENT_GUARD_READY
+            if (-not [string]::IsNullOrWhiteSpace($probe)) { [IO.File]::WriteAllText($probe,$CurrentPath,(New-Object Text.UTF8Encoding($false))); Start-Sleep -Milliseconds 1200 }
+            Move-HmsDeliveryDirectoryGuard -Guard $currentGuard -Destination $BackupPath -Label 'CodeGraph current-to-backup transition'
+            Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity
         }
-        throw $transitionError
+        catch {
+            $transitionError = $_
+            if ($markerRewritten -and [string]$currentGuard.Path -ceq $CurrentPath -and (Test-Path -LiteralPath $CurrentPath) -and -not (Test-Path -LiteralPath $BackupPath)) {
+                try { Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $existingIdentity; Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $existingIdentity }
+                catch { throw "CodeGraph current-to-backup transition failed and original marker restoration was incomplete. Original: $($transitionError.Exception.Message). Rollback: $($_.Exception.Message)" }
+            }
+            throw $transitionError
+        }
+        return $existingIdentity
     }
-    return $existingIdentity
+    finally { if ($null -ne $currentGuard -and $null -ne $currentGuard.Handle) { $currentGuard.Handle.Dispose() } }
 }
 
 function Sync-CodeGraphBundle {
@@ -708,6 +773,7 @@ function Sync-CodeGraphBundle {
         $candidateIdentity = $null
         $backupIdentity = $null
         $previousIdentity = $null
+        $candidateActivationGuard = $null
         $manifestPublished = $false
         $publishedManifest = $null
         try {
@@ -717,25 +783,30 @@ function Sync-CodeGraphBundle {
             New-Item -ItemType Directory -Force -Path $extract | Out-Null
             $url = "https://github.com/colbymchenry/codegraph/releases/download/$([string]$Spec.tag)/$assetName"
             Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
-            $actualSha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($actualSha -ne $expectedSha) { throw "CodeGraph release asset SHA-256 mismatch. Expected $expectedSha, found $actualSha" }
-            Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
-
-            $inner = Join-Path $extract ("codegraph-win32-" + $arch)
-            if (Test-Path -LiteralPath $inner) {
-                $flat = Join-Path $temp 'flat'
-                New-Item -ItemType Directory -Force -Path $flat | Out-Null
-                Get-ChildItem -LiteralPath $inner -Force | ForEach-Object { Move-Item -LiteralPath $_.FullName -Destination $flat -Force }
-                $candidate = $flat
+            $archiveAuthority = $null
+            try {
+                $archiveAuthority = Open-CodeGraphVerifiedArchive -Path $zip -ExpectedSha256 $expectedSha -Architecture $arch
+                Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+                $inner = Join-Path $extract ("codegraph-win32-" + $arch)
+                if (Test-Path -LiteralPath $inner) {
+                    $flat = Join-Path $temp 'flat'
+                    New-Item -ItemType Directory -Force -Path $flat | Out-Null
+                    Get-ChildItem -LiteralPath $inner -Force | ForEach-Object { Move-Item -LiteralPath $_.FullName -Destination $flat -Force }
+                    $candidate = $flat
+                }
+                $candidateCommand = Join-Path $candidate 'bin\codegraph.cmd'
+                $commandItem = Get-Item -LiteralPath $candidateCommand -Force -ErrorAction Stop
+                if ([bool]$commandItem.PSIsContainer -or [bool]($commandItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "CodeGraph launcher must be a regular non-reparse file: $candidateCommand" }
+                # Do not execute extracted release bytes before publication. The exact locked ZIP SHA and
+                # archive-derived logical tree are immutable authority for every persisted candidate byte.
+                $actualCandidateTree = Get-CodeGraphBundleTreeSha256 -Path $candidate
+                if ($actualCandidateTree -cne [string]$archiveAuthority.ExpectedTreeSha256) { throw "CodeGraph extracted candidate tree does not match the exact verified archive. Expected $($archiveAuthority.ExpectedTreeSha256), found $actualCandidateTree" }
+                $candidateTreeSha = [string]$archiveAuthority.ExpectedTreeSha256
+                $candidateIdentity = New-CodeGraphBundleIdentity -TransactionId $transactionId -Role 'candidate' -Version ([string]$Spec.version) -Tag ([string]$Spec.tag) -Commit ([string]$Spec.commit) -Asset $assetName -Sha256 $expectedSha -BundleTreeSha256 $candidateTreeSha
+                Write-CodeGraphBundleMarker -Path $candidate -Identity $candidateIdentity
+                Assert-CodeGraphTransactionBundle -Path $candidate -Identity $candidateIdentity
             }
-            $candidateCommand = Join-Path $candidate 'bin\codegraph.cmd'
-            # Execution is allowed only here, while bytes are still inside the freshly downloaded,
-            # exact-SHA-qualified release candidate. Persisted/renamed bundles are validated by bytes only.
-            Assert-CodeGraphVersion -CommandPath $candidateCommand -ExpectedVersion ([string]$Spec.version)
-            $candidateTreeSha = Get-CodeGraphBundleTreeSha256 -Path $candidate
-            $candidateIdentity = New-CodeGraphBundleIdentity -TransactionId $transactionId -Role 'candidate' -Version ([string]$Spec.version) -Tag ([string]$Spec.tag) -Commit ([string]$Spec.commit) -Asset $assetName -Sha256 $expectedSha -BundleTreeSha256 $candidateTreeSha
-            Write-CodeGraphBundleMarker -Path $candidate -Identity $candidateIdentity
-            Assert-CodeGraphTransactionBundle -Path $candidate -Identity $candidateIdentity
+            finally { if ($null -ne $archiveAuthority -and $null -ne $archiveAuthority.Stream) { $archiveAuthority.Stream.Dispose(); $archiveAuthority.Stream = $null } }
 
             New-Item -ItemType Directory -Force -Path $CodeGraphRoot | Out-Null
             try {
@@ -747,7 +818,7 @@ function Sync-CodeGraphBundle {
                     if ($env:HMS_TEST_FAIL_CODEGRAPH_AFTER_BACKUP_RENAME -ceq '1') { throw 'Injected CodeGraph failure after previous current crossed the backup rename boundary.' }
                 }
 
-                Move-Item -LiteralPath $candidate -Destination $current
+                $candidateActivationGuard = Move-CodeGraphCandidateToCurrent -CandidatePath $candidate -CurrentPath $current -Identity $candidateIdentity
                 Assert-CodeGraphTransactionBundle -Path $current -Identity $candidateIdentity
                 $publishedManifest = [ordered]@{
                     managed_by = $ManagedBy
@@ -764,12 +835,15 @@ function Sync-CodeGraphBundle {
                 if ($wasInstalled) { [IO.File]::Replace($manifestTemp, $CodeGraphManifest, $null, $true) }
                 else { [IO.File]::Move($manifestTemp, $CodeGraphManifest) }
                 $manifestPublished = $true
+                Assert-CodeGraphTransactionBundle -Path $current -Identity $candidateIdentity
+                if ($null -ne $candidateActivationGuard -and $null -ne $candidateActivationGuard.Handle) { $candidateActivationGuard.Handle.Dispose(); $candidateActivationGuard.Handle = $null; $candidateActivationGuard = $null }
                 if ($null -ne $backup -and (Test-Path -LiteralPath $backup)) {
                     Remove-CodeGraphTransactionBundle -Path $backup -Identity $backupIdentity
                 }
             }
             catch {
                 $installError = $_
+                if ($null -ne $candidateActivationGuard -and $null -ne $candidateActivationGuard.Handle) { $candidateActivationGuard.Handle.Dispose(); $candidateActivationGuard.Handle = $null; $candidateActivationGuard = $null }
                 if ($null -eq $candidateIdentity) { throw $installError }
                 $rollback = Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup -CandidateIdentity $candidateIdentity -BackupIdentity $backupIdentity -PreviousIdentity $previousIdentity -ManifestPublished $manifestPublished -PublishedManifest $publishedManifest -PreviousManifestBytes $existingManifestBytes -HadPrevious $wasInstalled
                 $rollbackErrors = @($rollback.RollbackErrors)
@@ -780,6 +854,7 @@ function Sync-CodeGraphBundle {
             }
         }
         finally {
+            if ($null -ne $candidateActivationGuard -and $null -ne $candidateActivationGuard.Handle) { $candidateActivationGuard.Handle.Dispose(); $candidateActivationGuard = $null }
             if (Test-Path -LiteralPath $temp) { Remove-CodeGraphTempRoot -Path $temp -TransactionId $transactionId }
         }
     }

@@ -304,3 +304,38 @@ jobs:
           Write-Host 'PASS: failed existing-marker publication preserves the exact previous CodeGraph marker and identity.'
 
           Write-Host 'PASS: all five remediated P1 trust boundaries are qualified on exact candidate HEAD.'
+
+      - name: Qualify fresh-review V9 exact-object activation boundaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Set-StrictMode -Version Latest
+          $builder=Join-Path $env:GITHUB_WORKSPACE 'scripts\\Build-HmsCompositeSkill.ps1'
+          $impl=Join-Path $env:GITHUB_WORKSPACE 'scripts\\Build-HmsCompositeSkill.impl.ps1'
+          $delivery=Join-Path $env:GITHUB_WORKSPACE 'scripts\\Sync-DeliveryTools.ps1'
+          $model=Join-Path $env:GITHUB_WORKSPACE 'manager\\HmsModelSettings.utf8.ps1'
+          $modelShim=Join-Path $env:GITHUB_WORKSPACE 'manager\\HmsModelSettings.ps1'
+          $it=[IO.File]::ReadAllText($impl);$dt=[IO.File]::ReadAllText($delivery);$mt=[IO.File]::ReadAllText($model)
+          foreach($literal in @('Move-OwnedCompositeStageToFinal','Move-HmsCompositeDirectoryGuard -Guard $previousGuard','Composite stage discovery publication')){if($it -notmatch [regex]::Escape($literal)){throw "Missing V9 composite exact-object contract: $literal"}}
+          if($it -match [regex]::Escape('Rename-Item -LiteralPath $stage -NewName (Split-Path -Leaf $FinalRoot)')){throw 'Composite stage activation still uses the mutable stage pathname.'}
+          foreach($literal in @('Open-CodeGraphVerifiedArchive','Get-CodeGraphArchiveLogicalTreeSha256','Move-HmsDeliveryDirectoryGuard -Guard $currentGuard','Move-CodeGraphCandidateToCurrent','archive-derived logical tree')){if($dt -notmatch [regex]::Escape($literal)){throw "Missing V9 CodeGraph trust contract: $literal"}}
+          foreach($bad in @('Move-Item -LiteralPath $CurrentPath -Destination $BackupPath','Move-Item -LiteralPath $candidate -Destination $current','Assert-CodeGraphVersion -CommandPath $candidateCommand')){if($dt -match [regex]::Escape($bad)){throw "CodeGraph retains superseded mutable/executable transition: $bad"}}
+          $reader=[regex]::Match($mt,'(?s)function Read-ModelState-Unserialized \{.*?\n\}').Value
+          foreach($literal in @('Open-HmsModelSettingsFileGuard','Read-ModelStateFromGuard')){if($reader -notmatch [regex]::Escape($literal)){throw "Model Settings reader missing exact guard contract: $literal"}}
+          if($reader -match [regex]::Escape('[IO.File]::ReadAllText')){throw 'Model Settings reader still reopens canonical pathname after regular-file validation.'}
+
+          # Composite stage guard: while the exact DELETE-capable stage root handle is live,
+          # a second process must be unable to rename/replace that staged object.
+          $r=Join-Path $env:RUNNER_TEMP ('hms-v9-stage-'+[guid]::NewGuid().ToString('N'));$o=Join-Path $r 'out';$s=Join-Path $r 'skills';$signal=Join-Path $r 'ready.txt';New-Item -ItemType Directory -Force -Path $r|Out-Null
+          $job=Start-Job -ScriptBlock {param($b,$repo,$o,$s,$sig);$env:HMS_TEST_STAGE_ACTIVATION_GUARD_READY=$sig;& $b -InstallRoot $repo -OutputRoot $o -SkillsRoot $s -Hms $false -Superpowers $false -Taste $false -Impeccable $false} -ArgumentList $builder,$env:GITHUB_WORKSPACE,$o,$s,$signal
+          try{$deadline=[DateTime]::UtcNow.AddSeconds(40);while(-not(Test-Path -LiteralPath $signal)-and[DateTime]::UtcNow-lt$deadline){Start-Sleep -Milliseconds 50};if(-not(Test-Path -LiteralPath $signal)){throw 'Stage guard probe never became ready.'};$stage=[IO.File]::ReadAllText($signal);$blocked=$false;try{Rename-Item -LiteralPath $stage -NewName 'foreign-stage-swap' -ErrorAction Stop}catch{$blocked=$true};if(-not$blocked){throw 'Exact stage guard allowed hostile stage rename.'};$null=Wait-Job $job -Timeout 60;if($job.State-ne'Completed'){throw "Stage build probe failed: $($job.State)"};Receive-Job $job -ErrorAction Stop|Out-Null}finally{Remove-Job $job -Force -ErrorAction SilentlyContinue;Remove-Item $r -Recurse -Force -ErrorAction SilentlyContinue}
+
+          . $delivery -SkipCodeGraph -SkipThreeLevelDelivery
+          # Exact verified archive: holding authority must block replacement, and archive-derived
+          # logical tree must equal extracted immutable contents.
+          $r=Join-Path $env:RUNNER_TEMP ('hms-v9-zip-'+[guid]::NewGuid().ToString('N'));$src=Join-Path $r 'codegraph-win32-x64';$bin=Join-Path $src 'bin';$zip=Join-Path $r 'cg.zip';$x=Join-Path $r 'x';New-Item -ItemType Directory -Force -Path $bin|Out-Null;[IO.File]::WriteAllText((Join-Path $bin 'codegraph.cmd'),'@echo off',[Text.Encoding]::ASCII);[IO.File]::WriteAllText((Join-Path $src 'payload.txt'),'immutable',[Text.Encoding]::UTF8);Compress-Archive -Path $src -DestinationPath $zip; $sha=(Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant();$a=Open-CodeGraphVerifiedArchive -Path $zip -ExpectedSha256 $sha -Architecture 'x64'
+          try{$blocked=$false;try{Move-Item -LiteralPath $zip -Destination (Join-Path $r 'swap.zip') -ErrorAction Stop}catch{$blocked=$true};if(-not$blocked){throw 'Verified archive authority allowed pathname replacement.'};Expand-Archive $zip -DestinationPath $x; $inner=Join-Path $x 'codegraph-win32-x64';$tree=Get-CodeGraphBundleTreeSha256 -Path $inner;if($tree-cne[string]$a.ExpectedTreeSha256){throw 'Archive-derived tree did not match extracted immutable tree.'}}finally{$a.Stream.Dispose();Remove-Item $r -Recurse -Force -ErrorAction SilentlyContinue}
+
+          # Model Settings direct production self-test exercises the guarded read/write resolver path.
+          & $modelShim -SelfTest
+          Write-Host 'PASS: V9 fresh-review exact-object stage/CodeGraph/archive/Model-Settings boundaries qualified.'
