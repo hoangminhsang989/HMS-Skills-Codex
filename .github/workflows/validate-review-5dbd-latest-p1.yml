@@ -93,17 +93,41 @@ jobs:
           }
           if($repairs.Count -lt 1){throw 'The exact try enclosing current-to-backup transition has no catch invoking Repair-CodeGraphRollbackState.'}
 
-          # Persisted or renamed previous bundles must never be executed. The only version execution inside Sync
-          # is the freshly downloaded exact-SHA-qualified candidate command.
+          # V9 trust contract: no persisted, renamed, or freshly extracted CodeGraph launcher may execute
+          # before publication. Locked release bytes plus the archive-derived logical tree authenticate
+          # the candidate, and exact directory handles carry that identity across activation.
           foreach($name in @('Assert-CodeGraphBundleAgainstManifest','Move-CodeGraphCurrentToRollbackBackup','Assert-CodeGraphTransactionBundle')){
             $fn=Get-OneFunctionAst -Ast $deliveryAst -Name $name
             $bad=@($fn.Body.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Assert-CodeGraphVersion'},$true))
             if($bad.Count -ne 0){throw "Previous-bundle trust function '$name' executes CodeGraph version bytes."}
           }
           $versionCalls=@($sync.Body.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Assert-CodeGraphVersion'},$true))
-          if($versionCalls.Count -ne 1 -or $versionCalls[0].Extent.Text -notmatch '\$candidateCommand'){
-            throw 'Sync-CodeGraphBundle must execute exactly one Assert-CodeGraphVersion call and it must target $candidateCommand.'
-          }
+          if($versionCalls.Count -ne 0){throw 'Sync-CodeGraphBundle executes extracted CodeGraph bytes before trusted publication.'}
+
+          $archiveFn=Get-OneFunctionAst -Ast $deliveryAst -Name 'Open-CodeGraphVerifiedArchive'
+          $archiveText=$archiveFn.Extent.Text
+          foreach($literal in @(
+            'New-Object IO.FileStream($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)',
+            'Get-FileHash -LiteralPath $Path -Algorithm SHA256',
+            '$tree = Get-CodeGraphArchiveLogicalTreeSha256 -ArchivePath $Path -Architecture $Architecture',
+            'return [pscustomobject]@{ Stream=$stream; ExpectedTreeSha256=$tree; AssetSha256=$actual }'
+          )){if($archiveText -notmatch [regex]::Escape($literal)){throw "Verified CodeGraph archive contract is missing: $literal"}}
+
+          $candidateMove=Get-OneFunctionAst -Ast $deliveryAst -Name 'Move-CodeGraphCandidateToCurrent'
+          $candidateMoveText=$candidateMove.Extent.Text
+          foreach($literal in @(
+            'Open-HmsDeliveryDirectoryGuard -Path $CandidatePath -Label ''CodeGraph candidate activation''',
+            'Move-HmsDeliveryDirectoryGuard -Guard $guard -Destination $CurrentPath -Label ''CodeGraph candidate activation''',
+            'Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $Identity'
+          )){if($candidateMoveText -notmatch [regex]::Escape($literal)){throw "Exact CodeGraph candidate activation contract is missing: $literal"}}
+
+          $syncText=$sync.Extent.Text
+          foreach($literal in @(
+            '$archiveAuthority = Open-CodeGraphVerifiedArchive -Path $zip -ExpectedSha256 $expectedSha -Architecture $arch',
+            '$actualCandidateTree = Get-CodeGraphBundleTreeSha256 -Path $candidate',
+            '$candidateTreeSha = [string]$archiveAuthority.ExpectedTreeSha256',
+            '$candidateActivationGuard = Move-CodeGraphCandidateToCurrent -CandidatePath $candidate -CurrentPath $current -Identity $candidateIdentity'
+          )){if($syncText -notmatch [regex]::Escape($literal)){throw "V9 CodeGraph immutable-candidate contract is missing: $literal"}}
 
           $compositeAst=Parse-CheckedAst -Path $composite
           $compositeText=[IO.File]::ReadAllText($composite)

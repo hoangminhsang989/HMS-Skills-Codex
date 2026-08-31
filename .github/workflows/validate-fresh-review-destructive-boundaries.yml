@@ -84,7 +84,10 @@ jobs:
           # Regression 1: exercise the actual rollback deletion primitive. A non-cooperating
           # actor may populate the original pathname after the owned directory is quarantined;
           # that foreign replacement must never become the recursive deletion target.
-          $implDefs = Get-FunctionText -Path $implPath -Names @('Assert-OwnedCompositeRoot','Add-OwnedCompositeTreeRecords','Get-OwnedCompositeTreeSha256','Assert-OwnedCompositeIdentity','Remove-OwnedCompositeIdentityQuarantine')
+          $v10CompositeDefinitionStart=$implText.IndexOf('$CompositeName = ')
+          $v10CompositeDefinitionEnd=$implText.IndexOf('$stageId = $null')
+          if($v10CompositeDefinitionStart -lt 0 -or $v10CompositeDefinitionEnd -le $v10CompositeDefinitionStart){throw 'Could not isolate composite pre-main production definitions for destructive-boundary regression.'}
+          $v10CompositeDefs=$implText.Substring($v10CompositeDefinitionStart,$v10CompositeDefinitionEnd-$v10CompositeDefinitionStart)
           $rollbackHarnessPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-rollback-quarantine-' + [guid]::NewGuid().ToString('N') + '.ps1')
           $rollbackRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-rollback-root-' + [guid]::NewGuid().ToString('N'))
           $rollbackHarness = @"
@@ -93,7 +96,10 @@ jobs:
           `$ErrorActionPreference='Stop'
           `$ManagedBy='HMS-Skills-Codex'
           `$Artifact='hms-superpowers-composite'
-          $implDefs
+          `$InstallRoot=`$TestRoot
+          `$OutputRoot=`$TestRoot
+          `$SkillsRoot=`$TestRoot
+          $v10CompositeDefs
           New-Item -ItemType Directory -Force -Path `$TestRoot | Out-Null
           `$manifest=[ordered]@{schema_version=1;managed_by=`$ManagedBy;artifact=`$Artifact}
           `$manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path `$TestRoot 'manifest.json') -Encoding UTF8

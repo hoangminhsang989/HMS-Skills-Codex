@@ -139,7 +139,10 @@ jobs:
           }
           if ($implText -match [regex]::Escape('Remove-Item -LiteralPath $stage -Recurse -Force')) { throw 'Failed-stage cleanup still deletes the stage pathname directly.' }
 
-          $stageDefs=Get-FunctionText -Path $builderImpl -Names @('Restore-Quarantine','Assert-OwnedCompositeStage','Remove-OwnedCompositeStageQuarantine')
+          $v10StageDefinitionStart=$implText.IndexOf('$CompositeName = ')
+          $v10StageDefinitionEnd=$implText.IndexOf('$stageId = $null')
+          if($v10StageDefinitionStart -lt 0 -or $v10StageDefinitionEnd -le $v10StageDefinitionStart){throw 'Could not isolate composite pre-main production definitions for stage regression.'}
+          $v10StageDefs=$implText.Substring($v10StageDefinitionStart,$v10StageDefinitionEnd-$v10StageDefinitionStart)
           $stageHarness=Join-Path $env:RUNNER_TEMP ('hms-stage-boundary-' + [guid]::NewGuid().ToString('N') + '.ps1')
           $stageRoot=Join-Path $env:RUNNER_TEMP ('hms-stage-root-' + [guid]::NewGuid().ToString('N'))
           $stageId=[guid]::NewGuid().ToString('N')
@@ -147,7 +150,10 @@ jobs:
           param([string]`$Root,[string]`$Id)
           Set-StrictMode -Version Latest
           `$ErrorActionPreference='Stop'; `$ManagedBy='HMS-Skills-Codex'; `$StageArtifact='hms-superpowers-composite-stage'
-          $stageDefs
+          `$InstallRoot=`$Root
+          `$OutputRoot=`$Root
+          `$SkillsRoot=`$Root
+          $v10StageDefs
           New-Item -ItemType Directory -Force -Path `$Root | Out-Null
           [ordered]@{schema_version=1;managed_by=`$ManagedBy;artifact=`$StageArtifact;stage_id=`$Id}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path `$Root '.hms-stage-owner.json') -Encoding UTF8
           `$sentinel=Join-Path `$Root 'FOREIGN.txt'
