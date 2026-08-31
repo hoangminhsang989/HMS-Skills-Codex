@@ -33,6 +33,9 @@ public static class HmsDeliveryExactFsNative
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr sa,uint creation,uint flags,IntPtr template);
     [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] public static extern bool GetFileInformationByHandle(SafeFileHandle h,out BY_HANDLE_FILE_INFORMATION info);
     [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool SetFileInformationByHandle(SafeFileHandle h,int infoClass,IntPtr info,uint size);
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool ReplaceFileW(string replacedFileName,string replacementFileName,string backupFileName,uint flags,IntPtr exclude,IntPtr reserved);
+    public static bool ReplaceFileWithoutBackup(string replacedFileName,string replacementFileName,out int error)
+    { bool ok=ReplaceFileW(replacedFileName,replacementFileName,null,0,IntPtr.Zero,IntPtr.Zero);error=ok?0:Marshal.GetLastWin32Error();return ok; }
     public static bool RenameByHandle(SafeFileHandle handle,string destination,out int error)
     {
         byte[] nameBytes=Encoding.Unicode.GetBytes(destination);int rootOffset=IntPtr.Size==8?8:4;int lengthOffset=IntPtr.Size==8?16:8;int nameOffset=IntPtr.Size==8?20:12;int minimum=IntPtr.Size==8?24:16;int size=Math.Max(minimum,nameOffset+nameBytes.Length+2);IntPtr buffer=Marshal.AllocHGlobal(size);
@@ -362,7 +365,10 @@ function Write-CodeGraphBundleMarker {
     else {
         # ReplaceFile semantics keep the previous canonical marker intact if publication fails.
         # On failure the random temp file is intentionally retained rather than pathname-deleted.
-        [IO.File]::Replace($publishTemp,$markerPath,$null,$true)
+        $replaceCode = 0
+        if (-not [HmsDeliveryExactFsNative]::ReplaceFileWithoutBackup($markerPath,$publishTemp,[ref]$replaceCode)) {
+            throw "CodeGraph marker atomic replacement failed (Win32=$replaceCode): $markerPath"
+        }
     }
 }
 
