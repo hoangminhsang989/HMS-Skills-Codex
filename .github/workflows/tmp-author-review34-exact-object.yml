@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   author:
-    if: github.event.head_commit.message == 'Retry review34 author with clone quarantine revalidation'
+    if: github.event.head_commit.message == 'Retry review34 author with rollback handoff harness'
     runs-on: windows-latest
     steps:
       - name: Checkout author head
@@ -60,6 +60,13 @@ jobs:
           python -m py_compile scripts/.tmp_fix_review34_clone_quarantine.py
           python scripts/.tmp_fix_review34_clone_quarantine.py
 
+      - name: Adapt rollback handoff regression to factored exact guards
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m py_compile scripts/.tmp_fix_review34_rollback_handoff_harness.py
+          python scripts/.tmp_fix_review34_rollback_handoff_harness.py
+
       - name: Normalize generated exact-object helper syntax
         shell: pwsh
         run: |
@@ -99,7 +106,8 @@ jobs:
             'scripts\Build-HmsCompositeSkill.impl.ps1',
             'scripts\Sync-DeliveryTools.ps1',
             'uninstall.ps1',
-            'scripts\Test-HmsLateTrustBoundaries.ps1'
+            'scripts\Test-HmsLateTrustBoundaries.ps1',
+            'scripts\Test-HmsRollbackIdentityHandoff.ps1'
           )) {
             $path = Join-Path $env:GITHUB_WORKSPACE $relative
             $tokens=$null; $errors=$null
@@ -113,17 +121,18 @@ jobs:
           $ErrorActionPreference = 'Stop'
           pwsh -NoProfile -File ./scripts/Test-HmsSkills.ps1
 
-      - name: Commit only qualified five-P1 remediation
+      - name: Commit only qualified review34 remediation
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          git restore --worktree -- scripts/.tmp_patch_exact_object_review34.py scripts/.tmp_fix_review34_late_probe.py scripts/.tmp_fix_review34_clone_quarantine.py
+          git restore --worktree -- scripts/.tmp_patch_exact_object_review34.py scripts/.tmp_fix_review34_late_probe.py scripts/.tmp_fix_review34_clone_quarantine.py scripts/.tmp_fix_review34_rollback_handoff_harness.py
           $allowed = @(
             'scripts/Resolve-HmsModelRoute.ps1',
             'scripts/Build-HmsCompositeSkill.impl.ps1',
             'scripts/Sync-DeliveryTools.ps1',
             'uninstall.ps1',
-            'scripts/Test-HmsLateTrustBoundaries.ps1'
+            'scripts/Test-HmsLateTrustBoundaries.ps1',
+            'scripts/Test-HmsRollbackIdentityHandoff.ps1'
           )
           $changed = @(git status --porcelain=v1 | ForEach-Object { $_.Substring(3).Replace('\','/') })
           $unexpected = @($changed | Where-Object { $_ -notin $allowed })
