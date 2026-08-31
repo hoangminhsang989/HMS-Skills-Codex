@@ -47,7 +47,7 @@ foreach ($relative in @('scripts\Build-HmsCompositeSkill.ps1','scripts\Copy-HmsC
 $builderPath = Join-Path $RepoRoot 'scripts\Build-HmsCompositeSkill.ps1'
 $source = [IO.File]::ReadAllText($builderPath)
 $start = $source.IndexOf("if (-not ('HmsOwnedTempNative' -as [type])) {")
-$endMarker = "`n`n`n`$repoRoot = Split-Path -Parent `$PSScriptRoot"
+$endMarker = "`n`n`n`$selfRelative = 'scripts/Build-HmsCompositeSkill.ps1'"
 $end = $source.IndexOf($endMarker,$start)
 if ($start -lt 0 -or $end -lt 0) { throw 'Could not isolate production owned-temp helper prelude.' }
 $helperPath = Join-Path $env:TEMP ('hms-owned-temp-helper-' + [guid]::NewGuid().ToString('N') + '.ps1')
@@ -84,7 +84,7 @@ finally {
 }
 Write-Host 'PASS: active owned-temp root denies hostile rename/replacement and is deleted through its exact handle.'
 
-$removeFunction = [regex]::Match($source,'(?s)function Remove-HmsOwnedTempDirectory \{.*?\n\}\n\n\n\$repoRoot').Value
+$removeFunction = [regex]::Match($source,'(?s)function Remove-HmsOwnedTempDirectory \{.*?\n\}\n\n\n\$selfRelative').Value
 if ([string]::IsNullOrWhiteSpace($removeFunction)) { throw 'Could not isolate owned-temp removal function for destructive-order proof.' }
 $deletePos = $removeFunction.IndexOf('DeleteHmsOwnedDirectoryByHandle')
 $disposePos = $removeFunction.IndexOf('$Owned.Guard.Dispose()')

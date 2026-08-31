@@ -422,7 +422,7 @@ $allOffButton.Add_Click({
 
 $validateButton.Add_Click({
     try {
-        & (Join-Path $RepoRoot 'scripts\Test-HmsSkills.ps1')
+        # Developer/CI test harnesses are intentionally not executable from the trusted production Manager.
         $state = Get-CurrentModuleState
         Invoke-CompositeBuild -State $state
         Assert-OneSkillBundle -Root $OutputRoot -DiscoveryRoot $SkillsRoot -ExpectedState $state

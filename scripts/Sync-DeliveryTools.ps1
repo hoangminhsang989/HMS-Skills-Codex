@@ -338,7 +338,32 @@ function Write-CodeGraphBundleMarker {
     }
     if ($treeHash -notmatch '^[0-9a-f]{64}$') { throw "CodeGraph transaction identity has invalid bundle tree SHA-256: $treeHash" }
     $markerPath = Join-Path $Path $CodeGraphBundleMarkerName
-    $Identity | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $markerPath -Encoding UTF8
+    $markerItem = Get-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
+    if ($null -ne $markerItem -and ([bool]$markerItem.PSIsContainer -or [bool]($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
+        throw "CodeGraph transaction marker must be a regular non-reparse file before publication: $markerPath"
+    }
+    $publishParent = Split-Path -Parent $Path
+    $publishTemp = Join-Path $publishParent ('.hms-codegraph-marker-publish-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $json = $Identity | ConvertTo-Json -Depth 4
+    $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($json + "`n")
+    $stream = $null
+    try {
+        $stream = New-Object IO.FileStream($publishTemp,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $stream.Write($bytes,0,$bytes.Length)
+        $stream.Flush($true)
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+    if ($null -eq $markerItem) {
+        # Same-volume File.Move publishes a new marker without exposing a partial canonical file.
+        [IO.File]::Move($publishTemp,$markerPath)
+    }
+    else {
+        # ReplaceFile semantics keep the previous canonical marker intact if publication fails.
+        # On failure the random temp file is intentionally retained rather than pathname-deleted.
+        [IO.File]::Replace($publishTemp,$markerPath,$null,$true)
+    }
 }
 
 function Assert-CodeGraphTransactionBundle {

@@ -34,7 +34,10 @@ jobs:
           $builderPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.ps1'
           $implPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.impl.ps1'
           $uninstallPath = Join-Path $env:GITHUB_WORKSPACE 'uninstall.ps1'
-          foreach ($path in @($builderPath,$implPath,$uninstallPath)) {
+          $managerShimPath = Join-Path $env:GITHUB_WORKSPACE 'manager\HmsSuperpowersManager.ps1'
+          $managerImplPath = Join-Path $env:GITHUB_WORKSPACE 'manager\HmsSuperpowersManager.utf8.ps1'
+          $deliveryPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Sync-DeliveryTools.ps1'
+          foreach ($path in @($builderPath,$implPath,$uninstallPath,$managerShimPath,$managerImplPath,$deliveryPath)) {
             $tokens = $null; $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors) | Out-Null
             if (@($errors).Count -ne 0) { throw "PowerShell parser rejected $path : $((@($errors) | ForEach-Object Message) -join ' | ')" }
@@ -43,6 +46,9 @@ jobs:
           $builderText = [IO.File]::ReadAllText($builderPath)
           $implText = [IO.File]::ReadAllText($implPath)
           $uninstallText = [IO.File]::ReadAllText($uninstallPath)
+          $managerShimText = [IO.File]::ReadAllText($managerShimPath)
+          $managerImplText = [IO.File]::ReadAllText($managerImplPath)
+          $deliveryText = [IO.File]::ReadAllText($deliveryPath)
           foreach ($literal in @(
             'hash-object --no-filters -- $resolvedCandidate',
             'hash-object --no-filters -- $PSCommandPath'
@@ -76,6 +82,16 @@ jobs:
           if ($uninstallText -match [regex]::Escape("Remove-VerifiedDirectory -Path `$compositeRoot")) {
             throw 'Uninstaller still recursively deletes the composite through the preflight pathname.'
           }
+          foreach ($literal in @('Composite builder public shim','$__HmsVerifiedBuilderScriptBlock_v1','$__HmsVerifiedBuilderBlob_v1','-TrustedBootstrapBlob $__HmsVerifiedBuilderBlob_v1')) {
+    if ($managerShimText -notmatch [regex]::Escape($literal)) { throw "Manager is missing authenticated builder snapshot contract: $literal" }
+}
+if ($managerImplText -match [regex]::Escape("scripts\Test-HmsSkills.ps1")) { throw 'Production Manager still executes the developer validation suite.' }
+foreach ($literal in @('[IO.File]::Replace($publishTemp,$markerPath,$null,$true)','intentionally retained rather than pathname-deleted')) {
+    if ($deliveryText -notmatch [regex]::Escape($literal)) { throw "Delivery tools are missing atomic marker publication contract: $literal" }
+}
+if ($deliveryText -match [regex]::Escape('$Identity | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $markerPath')) { throw 'CodeGraph marker publication regressed to direct canonical-path Set-Content.' }
+Write-Host 'PASS: Manager builder execution and production Validate are authenticated/non-developer, and CodeGraph marker publication is atomic.'
+
           Write-Host 'PASS: committed source contains literal bootstrap hashing and explicit composite quarantine/revalidation boundaries.'
 
           # P1 regression 1: prove the historical Git-clean-filter forgery premise, then prove the
@@ -231,4 +247,60 @@ jobs:
           }
           Write-Host 'PASS: uninstall composite deletion quarantines/revalidates the exact owned root and preserves a foreign replacement pathname.'
 
-          Write-Host 'PASS: all three remediated P1 trust boundaries are qualified on exact candidate HEAD.'
+          # P1 regression 4: modified builder bytes must be rejected before injected pre-auth code can execute.
+$managerSentinel = Join-Path ([IO.Path]::GetTempPath()) ('hms-manager-builder-sentinel-' + [guid]::NewGuid().ToString('N') + '.txt')
+$originalBuilderBytes = [IO.File]::ReadAllBytes($builderPath)
+try {
+    $sentinelLiteral = $managerSentinel.Replace("'", "''")
+    $originalBuilderText = (New-Object Text.UTF8Encoding($false,$true)).GetString($originalBuilderBytes)
+    $mutatedBuilder = "[IO.File]::WriteAllText('$sentinelLiteral','UNREVIEWED_BUILDER_EXECUTED')`n" + $originalBuilderText
+    [IO.File]::WriteAllText($builderPath,$mutatedBuilder,(New-Object Text.UTF8Encoding($false)))
+    $blocked = $false
+    try { & $managerShimPath -SelfTest }
+    catch {
+        if ($_.Exception.Message -match 'Composite builder public shim literal bytes do not match HMS HEAD') { $blocked = $true }
+        else { throw }
+    }
+    if (-not $blocked) { throw 'Manager accepted modified composite builder bytes.' }
+    if (Test-Path -LiteralPath $managerSentinel) { throw 'Modified builder executed pre-auth code before Manager rejection.' }
+}
+finally {
+    [IO.File]::WriteAllBytes($builderPath,$originalBuilderBytes)
+    Remove-Item -LiteralPath $managerSentinel -Force -ErrorAction SilentlyContinue
+}
+Write-Host 'PASS: Manager rejects altered builder bytes before injected pre-auth code can execute.'
+
+# P1 regression 5: failed publication of an existing CodeGraph marker must preserve old bytes exactly.
+$markerProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-codegraph-marker-atomic-' + [guid]::NewGuid().ToString('N'))
+try {
+    & {
+        param($DeliveryPath,$ProbeRoot)
+        . $DeliveryPath -SkipCodeGraph -SkipThreeLevelDelivery
+        $bundle = Join-Path $ProbeRoot 'current'
+        New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+        [IO.File]::WriteAllText((Join-Path $bundle 'payload.txt'),'owned payload',(New-Object Text.UTF8Encoding($false)))
+        $tree = Get-CodeGraphBundleTreeSha256 -Path $bundle
+        $sha = ('a' * 64) -join ''
+        $oldIdentity = New-CodeGraphBundleIdentity -TransactionId ('1' * 32 -join '') -Role 'candidate' -Version '1.0.0' -Tag 'v1.0.0' -Commit ('b' * 40 -join '') -Asset 'codegraph.zip' -Sha256 $sha -BundleTreeSha256 $tree
+        Write-CodeGraphBundleMarker -Path $bundle -Identity $oldIdentity
+        Assert-CodeGraphTransactionBundle -Path $bundle -Identity $oldIdentity
+        $marker = Join-Path $bundle $CodeGraphBundleMarkerName
+        $before = [Convert]::ToBase64String([IO.File]::ReadAllBytes($marker))
+        $newIdentity = New-CodeGraphBundleIdentity -TransactionId ('2' * 32 -join '') -Role 'backup' -Version '1.0.0' -Tag 'v1.0.0' -Commit ('b' * 40 -join '') -Asset 'codegraph.zip' -Sha256 $sha -BundleTreeSha256 $tree
+        $guard = [IO.File]::Open($marker,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        $failed = $false
+        try { Write-CodeGraphBundleMarker -Path $bundle -Identity $newIdentity }
+        catch { $failed = $true }
+        finally { $guard.Dispose() }
+        if (-not $failed) { throw 'Atomic marker regression did not force a publication failure.' }
+        $after = [Convert]::ToBase64String([IO.File]::ReadAllBytes($marker))
+        if ($after -cne $before) { throw 'Failed atomic marker publication changed the previous canonical marker bytes.' }
+        Assert-CodeGraphTransactionBundle -Path $bundle -Identity $oldIdentity
+    } $deliveryPath $markerProbeRoot
+}
+finally {
+    Remove-Item -LiteralPath $markerProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+Write-Host 'PASS: failed existing-marker publication preserves the exact previous CodeGraph marker and identity.'
+
+          Write-Host 'PASS: all five remediated P1 trust boundaries are qualified on exact candidate HEAD.'

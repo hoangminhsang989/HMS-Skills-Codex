@@ -119,12 +119,15 @@ $strictReaderPath = Join-Path $repoRoot 'scripts\Read-HmsCompositeModuleState.ps
 $strictReaderRecord = Read-ExactHeadFileBytes -Path $strictReaderPath -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Label 'Strict composite manifest reader'
 $modelSettingsShimPath = Join-Path $repoRoot 'manager\HmsModelSettings.ps1'
 $modelSettingsShimRecord = Read-ExactHeadFileBytes -Path $modelSettingsShimPath -RelativePath 'manager/HmsModelSettings.ps1' -Label 'Model settings public shim'
+$builderPath = Join-Path $repoRoot 'scripts\Build-HmsCompositeSkill.ps1'
+$builderRecord = Read-ExactHeadFileBytes -Path $builderPath -RelativePath 'scripts/Build-HmsCompositeSkill.ps1' -Label 'Composite builder public shim'
 
 $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
 try {
     $source = $utf8Strict.GetString([byte[]]$implementationRecord.Bytes)
     $strictReaderSource = $utf8Strict.GetString([byte[]]$strictReaderRecord.Bytes)
     $modelSettingsShimSource = $utf8Strict.GetString([byte[]]$modelSettingsShimRecord.Bytes)
+    $builderSource = $utf8Strict.GetString([byte[]]$builderRecord.Bytes)
 }
 catch {
     throw "Manager executable dependency is not valid UTF-8: $($_.Exception.Message)"
@@ -133,6 +136,7 @@ catch {
 try {
     $__HmsVerifiedStrictReaderScriptBlock_v1 = [ScriptBlock]::Create($strictReaderSource)
     $__HmsVerifiedModelSettingsShimScriptBlock_v1 = [ScriptBlock]::Create($modelSettingsShimSource)
+    $__HmsVerifiedBuilderScriptBlock_v1 = [ScriptBlock]::Create($builderSource)
 }
 catch {
     throw "Manager verified dependency failed to parse from its byte snapshot: $($_.Exception.Message)"
@@ -140,6 +144,7 @@ catch {
 $__HmsTrustedRepoRoot_v1 = $repoRoot
 $__HmsTrustedHead_v1 = $head
 $__HmsVerifiedModelSettingsShimBlob_v1 = [string]$modelSettingsShimRecord.ExpectedBlob
+$__HmsVerifiedBuilderBlob_v1 = [string]$builderRecord.ExpectedBlob
 
 # ScriptBlock.Create has no file-backed PSScriptRoot. Replace the implementation's
 # single repo-root bootstrap line with the captured repository root.
@@ -151,6 +156,14 @@ if ($occurrences -ne 1) {
 $escapedRepoRoot = $repoRoot.Replace("'", "''")
 $replacement = '$RepoRoot = ''' + $escapedRepoRoot + ''''
 $source = $source.Replace($needle, $replacement)
+
+# Replace the live builder invocation with the exact builder bytes snapshotted above.
+# The trusted context binds that snapshot to this Manager-captured repository HEAD.
+$builderInvokeNeedle = '    & $BuilderPath `'
+$builderInvokeReplacement = '    & $__HmsVerifiedBuilderScriptBlock_v1 -TrustedRepoRoot $__HmsTrustedRepoRoot_v1 -TrustedHead $__HmsTrustedHead_v1 -TrustedBootstrapBlob $__HmsVerifiedBuilderBlob_v1 `'
+$builderInvokeCount = [regex]::Matches($source, [regex]::Escape($builderInvokeNeedle)).Count
+if ($builderInvokeCount -ne 1) { throw "Manager builder launch contract mismatch: expected one live builder invocation, found $builderInvokeCount." }
+$source = $source.Replace($builderInvokeNeedle, $builderInvokeReplacement)
 
 # Replace the legacy manifest parser with the strict reader loaded from verified bytes.
 $stateNeedle = 'function Get-CurrentModuleState {'

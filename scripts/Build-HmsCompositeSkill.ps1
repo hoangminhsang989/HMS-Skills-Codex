@@ -6,7 +6,10 @@ param(
     [bool]$Hms = $true,
     [bool]$Superpowers = $true,
     [bool]$Taste = $true,
-    [bool]$Impeccable = $true
+    [bool]$Impeccable = $true,
+    [string]$TrustedRepoRoot,
+    [string]$TrustedHead,
+    [string]$TrustedBootstrapBlob
 )
 
 Set-StrictMode -Version Latest
@@ -257,15 +260,37 @@ function Remove-HmsOwnedTempDirectory {
 }
 
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
 $selfRelative = 'scripts/Build-HmsCompositeSkill.ps1'
 $implementationRelative = 'scripts/Build-HmsCompositeSkill.impl.ps1'
 $helperRelative = 'scripts/Copy-HmsCommittedGitPath.ps1'
 $superLockRelative = 'superpowers.lock.json'
 $uiLockRelative = 'ui-skills.lock.json'
-$head = ((& git -C $repoRoot rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
-if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') {
-    throw 'Composite support materialization could not resolve a canonical repository HEAD.'
+$trustedValues = @($TrustedRepoRoot,$TrustedHead,$TrustedBootstrapBlob)
+$trustedCount = @($trustedValues | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
+if ($trustedCount -notin @(0,3)) { throw 'Composite builder trusted snapshot context is incomplete.' }
+$trustedBootstrap = $trustedCount -eq 3
+$trustedBlob = $null
+if ($trustedBootstrap) {
+    try { $repoRoot = (Resolve-Path -LiteralPath $TrustedRepoRoot -ErrorAction Stop).Path.TrimEnd('\') }
+    catch { throw "Composite builder trusted repository root is invalid: $TrustedRepoRoot" }
+    $head = $TrustedHead.Trim().ToLowerInvariant()
+    if ($head -notmatch '^[0-9a-f]{40}$') { throw "Composite builder trusted HEAD is invalid: $TrustedHead" }
+    $trustedBlob = $TrustedBootstrapBlob.Trim().ToLowerInvariant()
+    if ($trustedBlob -notmatch '^[0-9a-f]{40}$') { throw "Composite builder trusted bootstrap blob is invalid: $TrustedBootstrapBlob" }
+    $expectedTrustedSelf = ((& git -C $repoRoot rev-parse "$head`:$selfRelative" 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $expectedTrustedSelf -notmatch '^[0-9a-f]{40}$' -or $expectedTrustedSelf -cne $trustedBlob) {
+        throw 'Composite builder trusted snapshot context does not match the captured committed builder.'
+    }
+    $trustedType = ((& git -C $repoRoot cat-file -t $expectedTrustedSelf 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $trustedType -cne 'blob') { throw 'Composite builder trusted bootstrap object is not a committed blob.' }
+}
+else {
+    if ([string]::IsNullOrWhiteSpace([string]$PSScriptRoot)) { throw 'Composite builder direct bootstrap has no file-backed repository root.' }
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $head = ((& git -C $repoRoot rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') {
+        throw 'Composite support materialization could not resolve a canonical repository HEAD.'
+    }
 }
 
 function Get-ExpectedSupportBlob {
@@ -450,9 +475,15 @@ function Test-ExactHeadLifecycleCaller {
 }
 
 $expectedSelf = Get-ExpectedSupportBlob -RelativePath $selfRelative -Label 'Public composite bootstrap'
-$actualSelf = ((& git -C $repoRoot hash-object --no-filters -- $PSCommandPath 2>$null) -join '').Trim().ToLowerInvariant()
-if ($LASTEXITCODE -ne 0 -or $actualSelf -notmatch '^[0-9a-f]{40}$') {
-    throw 'Public composite bootstrap literal worktree bytes could not be hashed.'
+if ($trustedBootstrap) {
+    $actualSelf = $trustedBlob
+}
+else {
+    if ([string]::IsNullOrWhiteSpace([string]$PSCommandPath)) { throw 'Public composite bootstrap has no file-backed path to authenticate.' }
+    $actualSelf = ((& git -C $repoRoot hash-object --no-filters -- $PSCommandPath 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $actualSelf -notmatch '^[0-9a-f]{40}$') {
+        throw 'Public composite bootstrap literal worktree bytes could not be hashed.'
+    }
 }
 if ($actualSelf -cne $expectedSelf) {
     throw "Public composite bootstrap bytes do not match HMS HEAD $head; refusing hidden worktree drift. Expected $expectedSelf, found $actualSelf."
