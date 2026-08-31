@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   author:
-    if: github.event.head_commit.message == 'Retry review34 author with portable quarantine cleanup'
+    if: github.event.head_commit.message == 'Retry review34 author after bytecode cleanup'
     runs-on: windows-latest
     steps:
       - name: Checkout author head
@@ -133,6 +133,19 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           git restore --worktree -- scripts/.tmp_patch_exact_object_review34.py scripts/.tmp_fix_review34_late_probe.py scripts/.tmp_fix_review34_clone_quarantine.py scripts/.tmp_fix_review34_nonwindows_cleanup.py scripts/.tmp_fix_review34_rollback_handoff_harness.py
+
+          $pycache = Join-Path $env:GITHUB_WORKSPACE 'scripts\__pycache__'
+          if (Test-Path -LiteralPath $pycache) {
+            $trackedCache = @(git ls-files -- 'scripts/__pycache__')
+            if ($trackedCache.Count -ne 0) { throw "Refusing to clean tracked Python bytecode cache paths: $($trackedCache -join ', ')" }
+            $nestedDirs = @(Get-ChildItem -LiteralPath $pycache -Directory -Recurse -Force -ErrorAction Stop)
+            if ($nestedDirs.Count -ne 0) { throw "Unexpected nested directory under generated Python bytecode cache: $($nestedDirs.FullName -join ', ')" }
+            $cacheFiles = @(Get-ChildItem -LiteralPath $pycache -File -Force -ErrorAction Stop)
+            $unexpectedCache = @($cacheFiles | Where-Object { $_.Extension -cne '.pyc' })
+            if ($unexpectedCache.Count -ne 0) { throw "Unexpected non-bytecode file under generated Python cache: $($unexpectedCache.FullName -join ', ')" }
+            Remove-Item -LiteralPath $pycache -Recurse -Force -ErrorAction Stop
+          }
+
           $allowed = @(
             'scripts/Resolve-HmsModelRoute.ps1',
             'scripts/Build-HmsCompositeSkill.impl.ps1',
