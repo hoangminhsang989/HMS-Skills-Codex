@@ -51,35 +51,47 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference='Stop'
-          function Get-FunctionText([string]$Path,[string]$Name){
+          function Get-ParsedAst([string]$Path){
             $tokens=$null;$errors=$null
             $ast=[System.Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$errors)
-            if(@($errors).Count -ne 0){ throw "Parser rejected $Path" }
-            $nodes=@($ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $Name},$true))
-            if($nodes.Count -ne 1){ throw "Expected one $Name in $Path, found $($nodes.Count)." }
-            $nodes[0].Extent.Text
+            if(@($errors).Count -ne 0){ throw "Parser rejected $Path : $((@($errors)|ForEach-Object Message)-join ' | ')" }
+            return $ast
+          }
+          function Get-FunctionText([System.Management.Automation.Language.ScriptBlockAst]$Ast,[string]$Name){
+            $nodes=@($Ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $Name},$true))
+            if($nodes.Count -ne 1){ throw "Expected one $Name, found $($nodes.Count)." }
+            return $nodes[0].Extent.Text
+          }
+          function Import-NativeTypeBlock([System.Management.Automation.Language.ScriptBlockAst]$Ast,[string]$TypeName){
+            $matches=@($Ast.EndBlock.Statements | Where-Object {
+              $_ -is [System.Management.Automation.Language.IfStatementAst] -and
+              $_.Extent.Text.Contains($TypeName,[StringComparison]::Ordinal) -and
+              $_.Extent.Text.Contains('Add-Type',[StringComparison]::Ordinal)
+            })
+            if($matches.Count -ne 1){ throw "Expected one top-level native Add-Type block for $TypeName, found $($matches.Count)." }
+            Invoke-Expression $matches[0].Extent.Text
+            if(-not ($TypeName -as [type])){ throw "Production native type $TypeName was not loaded." }
           }
           $delivery=Join-Path $env:GITHUB_WORKSPACE 'scripts/Sync-DeliveryTools.ps1'
           $uninstall=Join-Path $env:GITHUB_WORKSPACE 'uninstall.ps1'
-          $deliveryText=[IO.File]::ReadAllText($delivery)
-          $uninstallText=[IO.File]::ReadAllText($uninstall)
           foreach($spec in @(
-            @{Text=$deliveryText; Prefix='HmsDeliveryExactFsNative'; Get='Get-HmsDeliveryDirectoryIdentityFromHandle'; Open='Open-HmsDeliveryDirectoryGuard'},
-            @{Text=$uninstallText; Prefix='HmsUninstallExactFsNative'; Get='Get-HmsUninstallDirectoryIdentityFromHandle'; Open='Open-HmsUninstallDirectoryGuard'}
+            @{Path=$delivery; Type='HmsDeliveryExactFsNative'; Get='Get-HmsDeliveryDirectoryIdentityFromHandle'; Open='Open-HmsDeliveryDirectoryGuard'},
+            @{Path=$uninstall; Type='HmsUninstallExactFsNative'; Get='Get-HmsUninstallDirectoryIdentityFromHandle'; Open='Open-HmsUninstallDirectoryGuard'}
           )){
-            $match=[regex]::Match($spec.Text,"(?s)if \(\$env:OS -ceq 'Windows_NT'.*?^}\r?\n\r?\nfunction $([regex]::Escape($spec.Get))",[Text.RegularExpressions.RegexOptions]::Multiline)
-            if(-not $match.Success){ throw "Could not isolate native prelude for $($spec.Open)." }
-            $prelude=$match.Value.Substring(0,$match.Value.LastIndexOf("function $($spec.Get)",[StringComparison]::Ordinal))
-            Invoke-Expression $prelude
-            Invoke-Expression (Get-FunctionText -Path $(if($spec.Open -like '*Delivery*'){$delivery}else{$uninstall}) -Name $spec.Get)
-            Invoke-Expression (Get-FunctionText -Path $(if($spec.Open -like '*Delivery*'){$delivery}else{$uninstall}) -Name $spec.Open)
+            $ast=Get-ParsedAst -Path $spec.Path
+            Import-NativeTypeBlock -Ast $ast -TypeName $spec.Type
+            Invoke-Expression (Get-FunctionText -Ast $ast -Name $spec.Get)
+            Invoke-Expression (Get-FunctionText -Ast $ast -Name $spec.Open)
             $root=Join-Path ([IO.Path]::GetTempPath()) ('hms-return-token-'+[guid]::NewGuid().ToString('N'))
             New-Item -ItemType Directory -Path $root | Out-Null
+            $guard=$null
             try{
               $guard=& $spec.Open -Path $root -Label 'return-token runtime probe'
               if($null -eq $guard -or $null -eq $guard.Handle -or [string]::IsNullOrWhiteSpace([string]$guard.Identity)){ throw "$($spec.Open) did not return a populated guard object." }
-              $guard.Handle.Dispose()
-            } finally { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+            } finally {
+              if($null -ne $guard -and $null -ne $guard.Handle){ $guard.Handle.Dispose() }
+              Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            }
           }
           Write-Host 'PASS: both exact-directory guard constructors execute and return populated PSCustomObjects.'
 
