@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   author:
-    if: github.event.head_commit.message == 'Retry review34 author with self-contained late probe'
+    if: github.event.head_commit.message == 'Retry review34 author with clone quarantine revalidation'
     runs-on: windows-latest
     steps:
       - name: Checkout author head
@@ -52,6 +52,13 @@ jobs:
           $ErrorActionPreference = 'Stop'
           python -m py_compile scripts/.tmp_fix_review34_late_probe.py
           python scripts/.tmp_fix_review34_late_probe.py
+
+      - name: Preserve clone quarantine revalidation under exact root authority
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m py_compile scripts/.tmp_fix_review34_clone_quarantine.py
+          python scripts/.tmp_fix_review34_clone_quarantine.py
 
       - name: Normalize generated exact-object helper syntax
         shell: pwsh
@@ -110,7 +117,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          git restore --worktree -- scripts/.tmp_patch_exact_object_review34.py scripts/.tmp_fix_review34_late_probe.py
+          git restore --worktree -- scripts/.tmp_patch_exact_object_review34.py scripts/.tmp_fix_review34_late_probe.py scripts/.tmp_fix_review34_clone_quarantine.py
           $allowed = @(
             'scripts/Resolve-HmsModelRoute.ps1',
             'scripts/Build-HmsCompositeSkill.impl.ps1',
