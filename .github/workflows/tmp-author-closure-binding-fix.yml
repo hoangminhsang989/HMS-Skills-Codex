@@ -24,16 +24,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Bind immutable production baseline
+      - name: Bind immutable committed production baseline
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           & git merge-base --is-ancestor $env:BASELINE_HEAD HEAD
           if ($LASTEXITCODE -ne 0) { throw "Baseline HEAD is not an ancestor: $env:BASELINE_HEAD" }
-          $sync = ((& git hash-object --no-filters -- 'scripts/Sync-DeliveryTools.ps1') -join '').Trim().ToLowerInvariant()
-          $uninstall = ((& git hash-object --no-filters -- 'uninstall.ps1') -join '').Trim().ToLowerInvariant()
-          if ($sync -cne $env:SYNC_BLOB) { throw "Sync-DeliveryTools baseline blob mismatch: $sync" }
-          if ($uninstall -cne $env:UNINSTALL_BLOB) { throw "uninstall baseline blob mismatch: $uninstall" }
+          $sync = ((& git rev-parse 'HEAD:scripts/Sync-DeliveryTools.ps1') -join '').Trim().ToLowerInvariant()
+          $uninstall = ((& git rev-parse 'HEAD:uninstall.ps1') -join '').Trim().ToLowerInvariant()
+          if ($sync -cne $env:SYNC_BLOB) { throw "Committed Sync-DeliveryTools blob mismatch: $sync" }
+          if ($uninstall -cne $env:UNINSTALL_BLOB) { throw "Committed uninstall blob mismatch: $uninstall" }
+          & git diff --exit-code -- 'scripts/Sync-DeliveryTools.ps1' 'uninstall.ps1'
+          if ($LASTEXITCODE -ne 0) { throw 'Production worktree differs from committed baseline before authoring.' }
           $syncText = [IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'scripts\Sync-DeliveryTools.ps1'))
           $uninstallText = [IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'uninstall.ps1'))
           if ([regex]::Matches($syncText,'\.GetNewClosure\(\)').Count -ne 2) { throw 'Expected exactly two delivery GetNewClosure callsites.' }
@@ -44,64 +46,47 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $utf8 = New-Object System.Text.UTF8Encoding($false)
-          $nl = "`n"
-          function Lines { param([string[]]$Value) return ([string]::Join($nl,$Value) + $nl) }
-          function Replace-ExactOnce {
-            param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Old,[Parameter(Mandatory)][string]$New)
-            $text = [IO.File]::ReadAllText($Path).Replace("`r`n","`n")
-            $count = [regex]::Matches($text,[regex]::Escape($Old)).Count
-            if ($count -ne 1) { throw "Expected exactly one replacement anchor in $Path, found $count.`n$Old" }
-            [IO.File]::WriteAllText($Path,$text.Replace($Old,$New),$utf8)
+          function Edit-File {
+            param([string]$Path,[scriptblock]$Edit)
+            $text = [IO.File]::ReadAllText($Path)
+            $newText = & $Edit $text
+            if ($newText -ceq $text) { throw "Patch made no change: $Path" }
+            [IO.File]::WriteAllText($Path,$newText,$utf8)
+          }
+          function Replace-Once {
+            param([string]$Text,[string]$Old,[string]$New,[string]$Label)
+            $count = [regex]::Matches($Text,[regex]::Escape($Old)).Count
+            if ($count -ne 1) { throw "Expected exactly one '$Label' anchor, found $count." }
+            return $Text.Replace($Old,$New)
           }
 
           $sync = Join-Path $env:GITHUB_WORKSPACE 'scripts\Sync-DeliveryTools.ps1'
-          $old = Lines @('    $validator={param($p) Assert-CodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()')
-          $new = Lines @('    $assertCodeGraphTransactionBundle = ${function:Assert-CodeGraphTransactionBundle}','    $validator={param($p) & $assertCodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()')
-          Replace-ExactOnce -Path $sync -Old $old -New $new
-          $old = Lines @('    $validator={param($p) Assert-CodeGraphTempRoot -Path $p -TransactionId $TransactionId}.GetNewClosure()')
-          $new = Lines @('    $assertCodeGraphTempRoot = ${function:Assert-CodeGraphTempRoot}','    $validator={param($p) & $assertCodeGraphTempRoot -Path $p -TransactionId $TransactionId}.GetNewClosure()')
-          Replace-ExactOnce -Path $sync -Old $old -New $new
+          Edit-File $sync {
+            param($text)
+            $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+            $text = Replace-Once $text '    $validator={param($p) Assert-CodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()' ('    $assertCodeGraphTransactionBundle = ${function:Assert-CodeGraphTransactionBundle}' + $nl + '    $validator={param($p) & $assertCodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()') 'transaction validator'
+            $text = Replace-Once $text '    $validator={param($p) Assert-CodeGraphTempRoot -Path $p -TransactionId $TransactionId}.GetNewClosure()' ('    $assertCodeGraphTempRoot = ${function:Assert-CodeGraphTempRoot}' + $nl + '    $validator={param($p) & $assertCodeGraphTempRoot -Path $p -TransactionId $TransactionId}.GetNewClosure()') 'temp-root validator'
+            return $text
+          }
 
           $uninstall = Join-Path $env:GITHUB_WORKSPACE 'uninstall.ps1'
-          $old = Lines @(
-            '    $validator = {',
-            '        param($p)',
-            '        Assert-CloneIdentity -Path $p -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath',
-            '    }.GetNewClosure()',
-            '    $quarantineValidator = {',
-            '        param($quarantine)',
-            '        Assert-CloneIdentity -Path $quarantine -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath',
-            '    }.GetNewClosure()'
-          )
-          $new = Lines @(
-            '    $assertCloneIdentity = ${function:Assert-CloneIdentity}',
-            '    $validator = {',
-            '        param($p)',
-            '        & $assertCloneIdentity -Path $p -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath',
-            '    }.GetNewClosure()',
-            '    $quarantineValidator = {',
-            '        param($quarantine)',
-            '        & $assertCloneIdentity -Path $quarantine -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath',
-            '    }.GetNewClosure()'
-          )
-          Replace-ExactOnce -Path $uninstall -Old $old -New $new
-          $old = Lines @('    $validator={param($p) Assert-OwnedCompositeRoot -Path $p}.GetNewClosure()')
-          $new = Lines @('    $assertOwnedCompositeRoot = ${function:Assert-OwnedCompositeRoot}','    $validator={param($p) & $assertOwnedCompositeRoot -Path $p}.GetNewClosure()')
-          Replace-ExactOnce -Path $uninstall -Old $old -New $new
-          $old = Lines @('    $validator={param($p) Assert-ManagedCodeGraphRoot -Path $p}.GetNewClosure()')
-          $new = Lines @('    $assertManagedCodeGraphRoot = ${function:Assert-ManagedCodeGraphRoot}','    $validator={param($p) & $assertManagedCodeGraphRoot -Path $p}.GetNewClosure()')
-          Replace-ExactOnce -Path $uninstall -Old $old -New $new
+          Edit-File $uninstall {
+            param($text)
+            $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+            $text = Replace-Once $text '    $validator = {' ('    $assertCloneIdentity = ${function:Assert-CloneIdentity}' + $nl + '    $validator = {') 'clone validator capture'
+            $text = Replace-Once $text '        Assert-CloneIdentity -Path $p -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath' '        & $assertCloneIdentity -Path $p -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath' 'clone validator invocation'
+            $text = Replace-Once $text '        Assert-CloneIdentity -Path $quarantine -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath' '        & $assertCloneIdentity -Path $quarantine -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath' 'clone quarantine invocation'
+            $text = Replace-Once $text '    $validator={param($p) Assert-OwnedCompositeRoot -Path $p}.GetNewClosure()' ('    $assertOwnedCompositeRoot = ${function:Assert-OwnedCompositeRoot}' + $nl + '    $validator={param($p) & $assertOwnedCompositeRoot -Path $p}.GetNewClosure()') 'composite validator'
+            $text = Replace-Once $text '    $validator={param($p) Assert-ManagedCodeGraphRoot -Path $p}.GetNewClosure()' ('    $assertManagedCodeGraphRoot = ${function:Assert-ManagedCodeGraphRoot}' + $nl + '    $validator={param($p) & $assertManagedCodeGraphRoot -Path $p}.GetNewClosure()') 'CodeGraph validator'
+            return $text
+          }
 
           $syncText = [IO.File]::ReadAllText($sync)
           $uninstallText = [IO.File]::ReadAllText($uninstall)
           if ([regex]::Matches($syncText,'\.GetNewClosure\(\)').Count -ne 2) { throw 'Delivery closure count changed unexpectedly.' }
           if ([regex]::Matches($uninstallText,'\.GetNewClosure\(\)').Count -ne 4) { throw 'Uninstall closure count changed unexpectedly.' }
-          foreach ($literal in @('$assertCodeGraphTransactionBundle = ${function:Assert-CodeGraphTransactionBundle}','$assertCodeGraphTempRoot = ${function:Assert-CodeGraphTempRoot}')) {
-            if (-not $syncText.Contains($literal)) { throw "Missing captured delivery function binding: $literal" }
-          }
-          foreach ($literal in @('$assertCloneIdentity = ${function:Assert-CloneIdentity}','$assertOwnedCompositeRoot = ${function:Assert-OwnedCompositeRoot}','$assertManagedCodeGraphRoot = ${function:Assert-ManagedCodeGraphRoot}')) {
-            if (-not $uninstallText.Contains($literal)) { throw "Missing captured uninstall function binding: $literal" }
-          }
+          foreach ($literal in @('$assertCodeGraphTransactionBundle = ${function:Assert-CodeGraphTransactionBundle}','$assertCodeGraphTempRoot = ${function:Assert-CodeGraphTempRoot}')) { if (-not $syncText.Contains($literal)) { throw "Missing delivery function capture: $literal" } }
+          foreach ($literal in @('$assertCloneIdentity = ${function:Assert-CloneIdentity}','$assertOwnedCompositeRoot = ${function:Assert-OwnedCompositeRoot}','$assertManagedCodeGraphRoot = ${function:Assert-ManagedCodeGraphRoot}')) { if (-not $uninstallText.Contains($literal)) { throw "Missing uninstall function capture: $literal" } }
 
       - name: Parse production PowerShell
         shell: pwsh
@@ -124,8 +109,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $delivery = Join-Path $env:GITHUB_WORKSPACE 'scripts\Sync-DeliveryTools.ps1'
-          . $delivery -SkipCodeGraph -SkipThreeLevelDelivery
+          . (Join-Path $env:GITHUB_WORKSPACE 'scripts\Sync-DeliveryTools.ps1') -SkipCodeGraph -SkipThreeLevelDelivery
           $root = Join-Path ([IO.Path]::GetTempPath()) ('hms-closure-delivery-' + [guid]::NewGuid().ToString('N'))
           try {
             $tempRoot = Join-Path $root 'temp'
@@ -134,7 +118,7 @@ jobs:
             Write-CodeGraphTempMarker -Path $tempRoot -TransactionId $tx
             Assert-CodeGraphTempRoot -Path $tempRoot -TransactionId $tx
             Remove-CodeGraphTempRoot -Path $tempRoot -TransactionId $tx
-            if (Test-Path -LiteralPath $tempRoot) { throw 'CodeGraph temp closure runtime probe left the root behind.' }
+            if (Test-Path -LiteralPath $tempRoot) { throw 'CodeGraph temp closure probe left root behind.' }
 
             $bundle = Join-Path $root 'bundle'
             New-Item -ItemType Directory -Force -Path $bundle | Out-Null
@@ -144,10 +128,10 @@ jobs:
             Write-CodeGraphBundleMarker -Path $bundle -Identity $identity
             Assert-CodeGraphTransactionBundle -Path $bundle -Identity $identity
             Remove-CodeGraphTransactionBundle -Path $bundle -Identity $identity
-            if (Test-Path -LiteralPath $bundle) { throw 'CodeGraph transaction closure runtime probe left the root behind.' }
+            if (Test-Path -LiteralPath $bundle) { throw 'CodeGraph transaction closure probe left root behind.' }
           }
           finally { if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force } }
-          Write-Host 'PASS: delivery validator closures invoke captured production function ScriptBlocks at runtime.'
+          Write-Host 'PASS: delivery closures invoke captured production functions.'
 
       - name: Exercise uninstall clone closure at runtime
         shell: pwsh
@@ -171,15 +155,13 @@ jobs:
               & (Join-Path $env:GITHUB_WORKSPACE 'uninstall.ps1') -InstallRoot $fakeClone -RemoveClones
             }
             finally { $env:USERPROFILE=$savedProfile; $env:HOME=$savedHome }
-            if (Test-Path -LiteralPath $fakeClone) { throw 'Uninstall clone closure runtime probe did not remove the managed fake clone.' }
+            if (Test-Path -LiteralPath $fakeClone) { throw 'Uninstall clone closure probe did not remove managed fake clone.' }
           }
           finally { if (Test-Path -LiteralPath $testHome) { Remove-Item -LiteralPath $testHome -Recurse -Force } }
-          Write-Host 'PASS: uninstall clone validator/quarantine closures invoke the captured Assert-CloneIdentity ScriptBlock.'
+          Write-Host 'PASS: uninstall clone closures invoke captured Assert-CloneIdentity.'
 
       - name: Commit exact two-file production remediation
         shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
           $allowed = @('scripts/Sync-DeliveryTools.ps1','uninstall.ps1')
