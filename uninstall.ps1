@@ -32,6 +32,124 @@ $impeccableClone = Join-Path $env:USERPROFILE '.codex\impeccable'
 $codeGraphRoot = Join-Path $env:USERPROFILE '.codex\codegraph'
 $threeLevelClone = Join-Path $env:USERPROFILE '.codex\three-level-delivery'
 
+if ($env:OS -ceq 'Windows_NT' -and -not ('HmsUninstallExactFsNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class HmsUninstallExactFsNative
+{
+    [StructLayout(LayoutKind.Sequential)] public struct FILETIME_PARTS { public uint Low; public uint High; }
+    [StructLayout(LayoutKind.Sequential)] public struct BY_HANDLE_FILE_INFORMATION
+    { public uint FileAttributes; public FILETIME_PARTS CreationTime; public FILETIME_PARTS LastAccessTime; public FILETIME_PARTS LastWriteTime; public uint VolumeSerialNumber; public uint FileSizeHigh; public uint FileSizeLow; public uint NumberOfLinks; public uint FileIndexHigh; public uint FileIndexLow; }
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr sa,uint creation,uint flags,IntPtr template);
+    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] public static extern bool GetFileInformationByHandle(SafeFileHandle h,out BY_HANDLE_FILE_INFORMATION info);
+    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool SetFileInformationByHandle(SafeFileHandle h,int infoClass,IntPtr info,uint size);
+    public static bool RenameByHandle(SafeFileHandle handle,string destination,out int error)
+    {
+        byte[] nameBytes=Encoding.Unicode.GetBytes(destination);int rootOffset=IntPtr.Size==8?8:4;int lengthOffset=IntPtr.Size==8?16:8;int nameOffset=IntPtr.Size==8?20:12;int minimum=IntPtr.Size==8?24:16;int size=Math.Max(minimum,nameOffset+nameBytes.Length+2);IntPtr buffer=Marshal.AllocHGlobal(size);
+        try{for(int i=0;i<size;i++)Marshal.WriteByte(buffer,i,0);Marshal.WriteByte(buffer,0,0);Marshal.WriteIntPtr(buffer,rootOffset,IntPtr.Zero);Marshal.WriteInt32(buffer,lengthOffset,nameBytes.Length);Marshal.Copy(nameBytes,0,IntPtr.Add(buffer,nameOffset),nameBytes.Length);bool ok=SetFileInformationByHandle(handle,3,buffer,(uint)size);error=ok?0:Marshal.GetLastWin32Error();return ok;}finally{Marshal.FreeHGlobal(buffer);}
+    }
+    public static bool DeleteByHandle(SafeFileHandle handle,out int error)
+    { IntPtr buffer=Marshal.AllocHGlobal(4);try{Marshal.WriteInt32(buffer,1);bool ok=SetFileInformationByHandle(handle,4,buffer,4);error=ok?0:Marshal.GetLastWin32Error();return ok;}finally{Marshal.FreeHGlobal(buffer);} }
+}
+'@
+}
+
+function Get-HmsUninstallDirectoryIdentityFromHandle { param([Parameter(Mandatory)]$Handle,[Parameter(Mandatory)][string]$Label) $info=New-Object 'HmsUninstallExactFsNative+BY_HANDLE_FILE_INFORMATION';if(-not[HmsUninstallExactFsNative]::GetFileInformationByHandle($Handle,[ref]$info)){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();throw "$Label could not read exact directory identity (Win32=$code)."};if(($info.FileAttributes-band[uint32]0x10)-eq 0-or($info.FileAttributes-band[uint32]0x400)-ne 0){throw "$Label must be a regular non-reparse directory."};return([string]$info.VolumeSerialNumber+':'+[string]$info.FileIndexHigh+':'+[string]$info.FileIndexLow) }
+function Open-HmsUninstallDirectoryGuard { param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label) if ($env:OS -cne 'Windows_NT'){return $null};$h=[HmsUninstallExactFsNative]::CreateFileW($Path,[uint32]0x00010000,[uint32]3,[IntPtr]::Zero,[uint32]3,[uint32]0x02200000,[IntPtr]::Zero);if ($null -eq $h -or $h.IsInvalid){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();if ($null -ne $h){$h.Dispose()};throw "$Label could not open exact DELETE-capable directory handle (Win32=$code): $Path"};try{$id=Get-HmsUninstallDirectoryIdentityFromHandle -Handle $h -Label $Label;return[pscustomobject]@{Handle=$h;Identity=$id;Path=$Path}}catch{$h.Dispose();throw} }
+function Move-HmsUninstallDirectoryGuard { param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Destination,[Parameter(Mandatory)][string]$Label) $before=Get-HmsUninstallDirectoryIdentityFromHandle -Handle $Guard.Handle -Label $Label;if ($before -cne [string]$Guard.Identity){throw "$Label exact directory identity changed before rename."};if(Test-Path -LiteralPath $Destination){throw "$Label destination is occupied: $Destination"};$code=0;if(-not[HmsUninstallExactFsNative]::RenameByHandle($Guard.Handle,$Destination,[ref]$code)){throw "$Label exact handle rename failed (Win32=$code): $Destination"};$after=Get-HmsUninstallDirectoryIdentityFromHandle -Handle $Guard.Handle -Label "$Label post-rename";if ($after -cne [string]$Guard.Identity){throw "$Label exact directory identity changed across rename."};$Guard.Path=$Destination }
+function Get-HmsUninstallPortableDirectoryIdentity {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "$Label portable identity requires a regular non-reparse directory: $Path"
+    }
+
+    $kernel = [string](& uname -s 2>$null)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($kernel)) {
+        throw "$Label could not identify the non-Windows kernel for filesystem identity."
+    }
+    if ($kernel.Trim() -ceq 'Linux') {
+        $values = @(& stat -Lc '%d:%i' -- $Path 2>$null)
+    }
+    elseif ($kernel.Trim() -ceq 'Darwin') {
+        $values = @(& stat -f '%d:%i' $Path 2>$null)
+    }
+    else {
+        throw "$Label does not support portable filesystem identity on kernel '$($kernel.Trim())'."
+    }
+    if ($LASTEXITCODE -ne 0 -or $values.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$values[0])) {
+        throw "$Label could not capture portable device/inode identity: $Path"
+    }
+    return ([string]$values[0]).Trim()
+}
+
+function Invoke-HmsUninstallExactDirectoryRemoval {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Prefix,
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][scriptblock]$Validate,
+        [scriptblock]$OnQuarantined = $null
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    if ($env:OS -cne 'Windows_NT') {
+        $ownedIdentity = Get-HmsUninstallPortableDirectoryIdentity -Path $Path -Label $Label
+        &$Validate $Path
+        $q = Join-Path (Split-Path -Parent $Path) ($Prefix + [guid]::NewGuid().ToString('N'))
+        if (Test-Path -LiteralPath $q) { throw "$Label portable quarantine destination is occupied: $q" }
+        Rename-Item -LiteralPath $Path -NewName (Split-Path -Leaf $q) -ErrorAction Stop
+        if ((Get-HmsUninstallPortableDirectoryIdentity -Path $q -Label "$Label post-rename") -cne $ownedIdentity) { throw "$Label portable directory identity changed across quarantine rename: $q" }
+        &$Validate $q
+        if ($null -ne $OnQuarantined) { &$OnQuarantined $q }
+
+        foreach ($child in @(Get-ChildItem -LiteralPath $q -Force -ErrorAction Stop)) {
+            if ((Get-HmsUninstallPortableDirectoryIdentity -Path $q -Label "$Label pre-child-delete") -cne $ownedIdentity) { throw "$Label portable quarantine root identity changed before child deletion: $q" }
+            Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop
+        }
+        if ((Get-HmsUninstallPortableDirectoryIdentity -Path $q -Label "$Label pre-root-delete") -cne $ownedIdentity) { throw "$Label portable quarantine root identity changed before empty-root deletion: $q" }
+        if (@(Get-ChildItem -LiteralPath $q -Force -ErrorAction Stop).Count -ne 0) { throw "$Label portable quarantine root is not empty after child deletion: $q" }
+        Remove-Item -LiteralPath $q -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $q) { throw "$Label portable quarantine root remained after empty-root deletion: $q" }
+        return
+    }
+
+    $guard = Open-HmsUninstallDirectoryGuard -Path $Path -Label $Label
+    $renamed = $false
+    $deleteStarted = $false
+    $q = Join-Path (Split-Path -Parent $Path) ($Prefix + [guid]::NewGuid().ToString('N'))
+    try {
+        &$Validate $Path
+        Move-HmsUninstallDirectoryGuard -Guard $guard -Destination $q -Label $Label
+        $renamed = $true
+        &$Validate $q
+        if ($null -ne $OnQuarantined) { &$OnQuarantined $q }
+        $deleteStarted = $true
+        foreach ($child in @(Get-ChildItem -LiteralPath $q -Force -ErrorAction Stop)) { Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop }
+        $code = 0
+        if (-not [HmsUninstallExactFsNative]::DeleteByHandle($guard.Handle,[ref]$code)) { throw "$Label exact root delete-pending transition failed (Win32=$code): $q" }
+        $guard.Handle.Dispose()
+        $guard.Handle = $null
+        if (Test-Path -LiteralPath $q) { throw "$Label exact quarantine remained after handle deletion: $q" }
+    }
+    catch {
+        $e = $_
+        if (-not $deleteStarted -and $renamed -and $null -ne $guard.Handle -and -not $guard.Handle.IsClosed -and -not (Test-Path -LiteralPath $Path)) {
+            try { Move-HmsUninstallDirectoryGuard -Guard $guard -Destination $Path -Label "$Label pre-delete rollback" } catch {}
+        }
+        elseif ($deleteStarted -and (Test-Path -LiteralPath $q)) {
+            throw "$Label deletion failed after destructive child removal started; exact quarantined remainder was not restored: $q. Original: $($e.Exception.Message)"
+        }
+        throw $e
+    }
+    finally { if ($null -ne $guard -and $null -ne $guard.Handle) { $guard.Handle.Dispose() } }
+}
+
+
+
 function ConvertTo-NormalizedRemote {
     param([Parameter(Mandatory)][string]$Remote)
     $value = $Remote.Trim().TrimEnd('/')
@@ -134,105 +252,50 @@ function Remove-VerifiedJunction {
 }
 
 function Remove-VerifiedClone {
-    param(
-        [string]$Path,
-        [string]$ExpectedRemote,
-        [string]$MarkerRelativePath,
-        [string]$Action
-    )
+    param([string]$Path,[string]$ExpectedRemote,[string]$MarkerRelativePath,[string]$Action)
     if (-not (Test-Path -LiteralPath $Path)) { return }
     Assert-CloneIdentity -Path $Path -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
     if (-not $PSCmdlet.ShouldProcess($Path, $Action)) { return }
 
-    $parent = Split-Path -Parent $Path
-    $leaf = '.hms-clone-removing-' + [guid]::NewGuid().ToString('N')
-    $quarantine = Join-Path $parent $leaf
-    $deleteStarted = $false
-    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
-    try {
-        # Destructive-boundary identity check: only the exact quarantined Git clone
-        # with the reviewed origin and marker may cross into recursive deletion.
+    $validator = {
+        param($p)
+        Assert-CloneIdentity -Path $p -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
+    }.GetNewClosure()
+    $quarantineValidator = {
+        param($quarantine)
         Assert-CloneIdentity -Path $quarantine -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
-        $deleteStarted = $true
-        Remove-Item -LiteralPath $quarantine -Recurse -Force
-        if (Test-Path -LiteralPath $quarantine) { throw "Clone removal did not complete: $quarantine" }
-    }
-    catch {
-        $e = $_
-        if (-not $deleteStarted) {
-            try { Restore-Quarantine -Original $Path -Quarantine $quarantine }
-            catch { throw "Clone removal preflight failed and rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)" }
-        }
-        elseif (Test-Path -LiteralPath $quarantine) {
-            throw "Clone deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
-        }
-        throw $e
-    }
+    }.GetNewClosure()
+
+    Invoke-HmsUninstallExactDirectoryRemoval `
+        -Path $Path `
+        -Prefix '.hms-clone-removing-' `
+        -Label 'Verified clone uninstall cleanup' `
+        -Validate $validator `
+        -OnQuarantined $quarantineValidator
 }
+
+
 
 function Remove-VerifiedCompositeRoot {
     param([string]$Path,[string]$Action)
     if (-not (Test-Path -LiteralPath $Path)) { return }
     Assert-OwnedCompositeRoot -Path $Path
     if (-not $PSCmdlet.ShouldProcess($Path, $Action)) { return }
-
-    $parent = Split-Path -Parent $Path
-    $leaf = '.hms-composite-removing-' + [guid]::NewGuid().ToString('N')
-    $quarantine = Join-Path $parent $leaf
-    $deleteStarted = $false
-    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
-    try {
-        # The exact random quarantine, not the earlier pathname, is the destructive authority.
-        # This preserves any non-cooperating foreign replacement that appears at the original path.
-        Assert-OwnedCompositeRoot -Path $quarantine
-        $deleteStarted = $true
-        Remove-Item -LiteralPath $quarantine -Recurse -Force
-        if (Test-Path -LiteralPath $quarantine) { throw "Composite removal did not complete: $quarantine" }
-    }
-    catch {
-        $e = $_
-        if (-not $deleteStarted) {
-            try { Restore-Quarantine -Original $Path -Quarantine $quarantine }
-            catch { throw "Composite removal preflight failed and rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)" }
-        }
-        elseif (Test-Path -LiteralPath $quarantine) {
-            throw "Composite deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
-        }
-        throw $e
-    }
+    $validator={param($p) Assert-OwnedCompositeRoot -Path $p}.GetNewClosure()
+    Invoke-HmsUninstallExactDirectoryRemoval -Path $Path -Prefix '.hms-composite-removing-' -Label 'Verified composite uninstall cleanup' -Validate $validator
 }
+
+
 
 function Remove-VerifiedCodeGraphRoot {
     param([string]$Path,[string]$Action)
     if (-not (Test-Path -LiteralPath $Path)) { return }
     Assert-ManagedCodeGraphRoot -Path $Path
     if (-not $PSCmdlet.ShouldProcess($Path, $Action)) { return }
-
-    $parent = Split-Path -Parent $Path
-    $leaf = '.hms-codegraph-removing-' + [guid]::NewGuid().ToString('N')
-    $quarantine = Join-Path $parent $leaf
-    $deleteStarted = $false
-    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
-    try {
-        # Only a freshly quarantined regular HMS-owned CodeGraph root can cross the destructive boundary.
-        # A foreign replacement at the original pathname is never the recursive deletion target.
-        Assert-ManagedCodeGraphRoot -Path $quarantine
-        $deleteStarted = $true
-        Remove-Item -LiteralPath $quarantine -Recurse -Force
-        if (Test-Path -LiteralPath $quarantine) { throw "CodeGraph removal did not complete: $quarantine" }
-    }
-    catch {
-        $e = $_
-        if (-not $deleteStarted) {
-            try { Restore-Quarantine -Original $Path -Quarantine $quarantine }
-            catch { throw "CodeGraph removal preflight failed and rollback was incomplete. Original: $($e.Exception.Message). Rollback: $($_.Exception.Message)" }
-        }
-        elseif (Test-Path -LiteralPath $quarantine) {
-            throw "CodeGraph deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
-        }
-        throw $e
-    }
+    $validator={param($p) Assert-ManagedCodeGraphRoot -Path $p}.GetNewClosure()
+    Invoke-HmsUninstallExactDirectoryRemoval -Path $Path -Prefix '.hms-codegraph-removing-' -Label 'Verified CodeGraph uninstall cleanup' -Validate $validator
 }
+
 
 function Remove-VerifiedDirectory {
     param([string]$Path,[string]$Action)

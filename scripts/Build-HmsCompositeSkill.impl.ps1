@@ -30,6 +30,55 @@ $ModelSettingsPath = Join-Path $OutputRoot 'model-settings.json'
 $BuildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
 $CanonicalHmsRemote = 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
 
+if ($env:OS -ceq 'Windows_NT' -and -not ('HmsCompositeExactFsNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class HmsCompositeExactFsNative
+{
+    [StructLayout(LayoutKind.Sequential)] public struct FILETIME_PARTS { public uint Low; public uint High; }
+    [StructLayout(LayoutKind.Sequential)] public struct BY_HANDLE_FILE_INFORMATION
+    { public uint FileAttributes; public FILETIME_PARTS CreationTime; public FILETIME_PARTS LastAccessTime; public FILETIME_PARTS LastWriteTime; public uint VolumeSerialNumber; public uint FileSizeHigh; public uint FileSizeLow; public uint NumberOfLinks; public uint FileIndexHigh; public uint FileIndexLow; }
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr sa,uint creation,uint flags,IntPtr template);
+    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] public static extern bool GetFileInformationByHandle(SafeFileHandle h,out BY_HANDLE_FILE_INFORMATION info);
+    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool SetFileInformationByHandle(SafeFileHandle h,int infoClass,IntPtr info,uint size);
+    public static bool RenameByHandle(SafeFileHandle handle,string destination,out int error)
+    {
+        byte[] nameBytes=Encoding.Unicode.GetBytes(destination);int rootOffset=IntPtr.Size==8?8:4;int lengthOffset=IntPtr.Size==8?16:8;int nameOffset=IntPtr.Size==8?20:12;int minimum=IntPtr.Size==8?24:16;int size=Math.Max(minimum,nameOffset+nameBytes.Length+2);IntPtr buffer=Marshal.AllocHGlobal(size);
+        try{for(int i=0;i<size;i++)Marshal.WriteByte(buffer,i,0);Marshal.WriteByte(buffer,0,0);Marshal.WriteIntPtr(buffer,rootOffset,IntPtr.Zero);Marshal.WriteInt32(buffer,lengthOffset,nameBytes.Length);Marshal.Copy(nameBytes,0,IntPtr.Add(buffer,nameOffset),nameBytes.Length);bool ok=SetFileInformationByHandle(handle,3,buffer,(uint)size);error=ok?0:Marshal.GetLastWin32Error();return ok;}finally{Marshal.FreeHGlobal(buffer);}
+    }
+    public static bool DeleteByHandle(SafeFileHandle handle,out int error)
+    { IntPtr buffer=Marshal.AllocHGlobal(4);try{Marshal.WriteInt32(buffer,1);bool ok=SetFileInformationByHandle(handle,4,buffer,4);error=ok?0:Marshal.GetLastWin32Error();return ok;}finally{Marshal.FreeHGlobal(buffer);} }
+}
+'@
+}
+
+function Get-HmsCompositeDirectoryIdentityFromHandle {
+    param([Parameter(Mandatory)]$Handle,[Parameter(Mandatory)][string]$Label)
+    $info=New-Object 'HmsCompositeExactFsNative+BY_HANDLE_FILE_INFORMATION'
+    if(-not [HmsCompositeExactFsNative]::GetFileInformationByHandle($Handle,[ref]$info)){ $code=[Runtime.InteropServices.Marshal]::GetLastWin32Error(); throw "$Label could not read exact directory identity (Win32=$code)." }
+    if(($info.FileAttributes-band[uint32]0x10)-eq 0 -or ($info.FileAttributes-band[uint32]0x400)-ne 0){throw "$Label must be a regular non-reparse directory."}
+    return ([string]$info.VolumeSerialNumber+':'+[string]$info.FileIndexHigh+':'+[string]$info.FileIndexLow)
+}
+function Open-HmsCompositeDirectoryGuard {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label)
+    if($env:OS -cne 'Windows_NT'){return $null}
+    $h=[HmsCompositeExactFsNative]::CreateFileW($Path,[uint32]0x00010000,[uint32]3,[IntPtr]::Zero,[uint32]3,[uint32]0x02200000,[IntPtr]::Zero)
+    if($null-eq$h -or $h.IsInvalid){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();if ($null -ne $h){$h.Dispose()};throw "$Label could not open exact DELETE-capable directory handle (Win32=$code): $Path"}
+    try{$id=Get-HmsCompositeDirectoryIdentityFromHandle -Handle $h -Label $Label;return [pscustomobject]@{Handle=$h;Identity=$id;Path=$Path}}catch{$h.Dispose();throw}
+}
+function Move-HmsCompositeDirectoryGuard {
+    param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Destination,[Parameter(Mandatory)][string]$Label)
+    if($env:OS -cne 'Windows_NT'){Rename-Item -LiteralPath $Guard.Path -NewName (Split-Path -Leaf $Destination) -ErrorAction Stop;$Guard.Path=$Destination;return}
+    $before=Get-HmsCompositeDirectoryIdentityFromHandle -Handle $Guard.Handle -Label $Label
+    if ($before -cne [string]$Guard.Identity){throw "$Label exact directory identity changed before rename."}
+    if(Test-Path -LiteralPath $Destination){throw "$Label destination is occupied: $Destination"}
+    $code=0;if(-not[HmsCompositeExactFsNative]::RenameByHandle($Guard.Handle,$Destination,[ref]$code)){throw "$Label exact handle rename failed (Win32=$code): $Destination"}
+    $after=Get-HmsCompositeDirectoryIdentityFromHandle -Handle $Guard.Handle -Label "$Label post-rename";if ($after -cne [string]$Guard.Identity){throw "$Label exact directory identity changed across rename."};$Guard.Path=$Destination
+}
+
 function Get-CanonicalPath {
     param([Parameter(Mandatory)][string]$Path)
     return (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path.TrimEnd('\')
@@ -288,48 +337,57 @@ function Assert-OwnedCompositeIdentity {
 }
 
 function Reserve-OwnedCompositeRollbackBackup {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$ExpectedTreeSha256,
-        [ref]$ReservedPathRef
-    )
-    Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
-    $parent = Split-Path -Parent $Path
-    $leaf = '.hms-composite-rollback-reserved-' + [guid]::NewGuid().ToString('N')
-    $reserved = Join-Path $parent $leaf
-    if (Test-Path -LiteralPath $reserved) { throw "Composite rollback reservation path already exists: $reserved" }
-    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
-    if ($null -ne $ReservedPathRef) { $ReservedPathRef.Value = $reserved }
-    Assert-OwnedCompositeIdentity -Path $reserved -ExpectedTreeSha256 $ExpectedTreeSha256
-    return $reserved
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$ExpectedTreeSha256,[ref]$ReservedPathRef)
+    $parent=Split-Path -Parent $Path;$reserved=Join-Path $parent ('.hms-composite-rollback-reserved-'+[guid]::NewGuid().ToString('N'))
+    if(Test-Path -LiteralPath $reserved){throw "Composite rollback reservation path already exists: $reserved"}
+    if($env:OS -cne 'Windows_NT'){
+        Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
+        Rename-Item -LiteralPath $Path -NewName (Split-Path -Leaf $reserved) -ErrorAction Stop
+        if($null-ne$ReservedPathRef){$ReservedPathRef.Value=$reserved}
+        Assert-OwnedCompositeIdentity -Path $reserved -ExpectedTreeSha256 $ExpectedTreeSha256
+        return $reserved
+    }
+    $guard=Open-HmsCompositeDirectoryGuard -Path $Path -Label 'Composite rollback reservation'
+    try{
+        Assert-OwnedCompositeIdentity -Path $Path -ExpectedTreeSha256 $ExpectedTreeSha256
+        Move-HmsCompositeDirectoryGuard -Guard $guard -Destination $reserved -Label 'Composite rollback reservation'
+        if($null-ne$ReservedPathRef){$ReservedPathRef.Value=$reserved}
+        Assert-OwnedCompositeIdentity -Path $reserved -ExpectedTreeSha256 $ExpectedTreeSha256
+        return $reserved
+    } finally {if($null-ne$guard.Handle){$guard.Handle.Dispose()}}
 }
+
 
 function Restore-OwnedCompositeRollbackBackup {
-    param(
-        [string]$BackupPath,
-        [string]$ReservedPath,
-        [Parameter(Mandatory)][string]$FinalPath,
-        [Parameter(Mandatory)][string]$ExpectedTreeSha256
-    )
-    $source = $null
-    if (-not [string]::IsNullOrWhiteSpace($ReservedPath) -and (Test-Path -LiteralPath $ReservedPath)) {
-        Assert-OwnedCompositeIdentity -Path $ReservedPath -ExpectedTreeSha256 $ExpectedTreeSha256
-        $source = $ReservedPath
+    param([string]$BackupPath,[string]$ReservedPath,[Parameter(Mandatory)][string]$FinalPath,[Parameter(Mandatory)][string]$ExpectedTreeSha256)
+    $source=$null
+    if(-not[string]::IsNullOrWhiteSpace($ReservedPath)-and(Test-Path -LiteralPath $ReservedPath)){$source=$ReservedPath}
+    elseif(-not[string]::IsNullOrWhiteSpace($BackupPath)-and(Test-Path -LiteralPath $BackupPath)){$source=Reserve-OwnedCompositeRollbackBackup -Path $BackupPath -ExpectedTreeSha256 $ExpectedTreeSha256}
+    else{throw 'Previous composite backup disappeared before rollback restoration.'}
+    if($env:OS -cne 'Windows_NT'){
+        Assert-OwnedCompositeIdentity -Path $source -ExpectedTreeSha256 $ExpectedTreeSha256
+        if(Test-Path -LiteralPath $FinalPath){throw "Cannot restore previous composite because FinalRoot is occupied: $FinalPath"}
+        Rename-Item -LiteralPath $source -NewName (Split-Path -Leaf $FinalPath) -ErrorAction Stop
+        Assert-OwnedCompositeIdentity -Path $FinalPath -ExpectedTreeSha256 $ExpectedTreeSha256
+        return
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($BackupPath) -and (Test-Path -LiteralPath $BackupPath)) {
-        Assert-OwnedCompositeIdentity -Path $BackupPath -ExpectedTreeSha256 $ExpectedTreeSha256
-        $source = Reserve-OwnedCompositeRollbackBackup -Path $BackupPath -ExpectedTreeSha256 $ExpectedTreeSha256
-    }
-    else {
-        throw 'Previous composite backup disappeared before rollback restoration.'
-    }
-
-    if (Test-Path -LiteralPath $FinalPath) {
-        throw "Cannot restore previous composite because FinalRoot is occupied: $FinalPath"
-    }
-    Rename-Item -LiteralPath $source -NewName (Split-Path -Leaf $FinalPath) -ErrorAction Stop
-    Assert-OwnedCompositeIdentity -Path $FinalPath -ExpectedTreeSha256 $ExpectedTreeSha256
+    $guard=Open-HmsCompositeDirectoryGuard -Path $source -Label 'Composite rollback activation'
+    $moved=$false
+    try{
+        Assert-OwnedCompositeIdentity -Path $source -ExpectedTreeSha256 $ExpectedTreeSha256
+        if(Test-Path -LiteralPath $FinalPath){throw "Cannot restore previous composite because FinalRoot is occupied: $FinalPath"}
+        Move-HmsCompositeDirectoryGuard -Guard $guard -Destination $FinalPath -Label 'Composite rollback activation';$moved=$true
+        try{Assert-OwnedCompositeIdentity -Path $FinalPath -ExpectedTreeSha256 $ExpectedTreeSha256}
+        catch{
+            $verifyError=$_
+            if (-not (Test-Path -LiteralPath $source)){
+                try{Move-HmsCompositeDirectoryGuard -Guard $guard -Destination $source -Label 'Composite rollback activation verification rollback'}catch{throw "Composite rollback activation validation failed and exact-object return also failed. Validation: $($verifyError.Exception.Message). Return: $($_.Exception.Message)"}
+            }
+            throw $verifyError
+        }
+    } finally {if($null-ne$guard.Handle){$guard.Handle.Dispose()}}
 }
+
 
 function Remove-OwnedCompositeIdentityQuarantine {
     param(

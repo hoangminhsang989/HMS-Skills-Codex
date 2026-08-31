@@ -150,6 +150,29 @@ $restoreFunctionText=Get-FunctionText -Path $compositePath -Name 'Restore-OwnedC
 Invoke-Expression $reserveFunctionText
 Invoke-Expression $restoreFunctionText
 
+# This regression isolates caller-visible reservation handoff semantics. The
+# exact Win32 directory-handle primitive is independently exercised by the
+# destructive/late-trust regressions. Mock only the two newly factored helper
+# dependencies while executing the production Reserve/Restore functions byte-for-byte.
+function Open-HmsCompositeDirectoryGuard {
+    param([string]$Path,[string]$Label)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        throw "Injected composite exact guard source is missing: $Path"
+    }
+    return [pscustomobject]@{
+        Path = $Path
+        Handle = [IO.MemoryStream]::new()
+    }
+}
+function Move-HmsCompositeDirectoryGuard {
+    param($Guard,[string]$Destination,[string]$Label)
+    if (Test-Path -LiteralPath $Destination) {
+        throw "Injected composite exact guard destination is occupied: $Destination"
+    }
+    Rename-Item -LiteralPath $Guard.Path -NewName (Split-Path -Leaf $Destination) -ErrorAction Stop
+    $Guard.Path = $Destination
+}
+
 $caseB=Join-Path ([IO.Path]::GetTempPath()) ('hms-composite-reservation-handoff-'+[guid]::NewGuid().ToString('N'))
 $backupB=Join-Path $caseB 'backup'
 $finalB=Join-Path $caseB 'hms-superpowers'
@@ -193,6 +216,8 @@ try {
 finally {
     Remove-Item -LiteralPath $caseB -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath Function:\Assert-OwnedCompositeIdentity -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Function:\Open-HmsCompositeDirectoryGuard -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Function:\Move-HmsCompositeDirectoryGuard -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host 'PASS: CodeGraph previous-identity handoff and composite rollback reservation survive post-mutation transition failures.'

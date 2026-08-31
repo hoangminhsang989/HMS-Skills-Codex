@@ -19,6 +19,115 @@ $ManagedBy = 'HMS-Skills-Codex'
 $CodeGraphBundleMarkerName = '.hms-codegraph-bundle.json'
 $CodeGraphTempMarkerName = '.hms-codegraph-temp.json'
 
+if ($env:OS -ceq 'Windows_NT' -and -not ('HmsDeliveryExactFsNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class HmsDeliveryExactFsNative
+{
+    [StructLayout(LayoutKind.Sequential)] public struct FILETIME_PARTS { public uint Low; public uint High; }
+    [StructLayout(LayoutKind.Sequential)] public struct BY_HANDLE_FILE_INFORMATION
+    { public uint FileAttributes; public FILETIME_PARTS CreationTime; public FILETIME_PARTS LastAccessTime; public FILETIME_PARTS LastWriteTime; public uint VolumeSerialNumber; public uint FileSizeHigh; public uint FileSizeLow; public uint NumberOfLinks; public uint FileIndexHigh; public uint FileIndexLow; }
+    [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr sa,uint creation,uint flags,IntPtr template);
+    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] public static extern bool GetFileInformationByHandle(SafeFileHandle h,out BY_HANDLE_FILE_INFORMATION info);
+    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool SetFileInformationByHandle(SafeFileHandle h,int infoClass,IntPtr info,uint size);
+    public static bool RenameByHandle(SafeFileHandle handle,string destination,out int error)
+    {
+        byte[] nameBytes=Encoding.Unicode.GetBytes(destination);int rootOffset=IntPtr.Size==8?8:4;int lengthOffset=IntPtr.Size==8?16:8;int nameOffset=IntPtr.Size==8?20:12;int minimum=IntPtr.Size==8?24:16;int size=Math.Max(minimum,nameOffset+nameBytes.Length+2);IntPtr buffer=Marshal.AllocHGlobal(size);
+        try{for(int i=0;i<size;i++)Marshal.WriteByte(buffer,i,0);Marshal.WriteByte(buffer,0,0);Marshal.WriteIntPtr(buffer,rootOffset,IntPtr.Zero);Marshal.WriteInt32(buffer,lengthOffset,nameBytes.Length);Marshal.Copy(nameBytes,0,IntPtr.Add(buffer,nameOffset),nameBytes.Length);bool ok=SetFileInformationByHandle(handle,3,buffer,(uint)size);error=ok?0:Marshal.GetLastWin32Error();return ok;}finally{Marshal.FreeHGlobal(buffer);}
+    }
+    public static bool DeleteByHandle(SafeFileHandle handle,out int error)
+    { IntPtr buffer=Marshal.AllocHGlobal(4);try{Marshal.WriteInt32(buffer,1);bool ok=SetFileInformationByHandle(handle,4,buffer,4);error=ok?0:Marshal.GetLastWin32Error();return ok;}finally{Marshal.FreeHGlobal(buffer);} }
+}
+'@
+}
+
+function Get-HmsDeliveryDirectoryIdentityFromHandle { param([Parameter(Mandatory)]$Handle,[Parameter(Mandatory)][string]$Label) $info=New-Object 'HmsDeliveryExactFsNative+BY_HANDLE_FILE_INFORMATION';if(-not[HmsDeliveryExactFsNative]::GetFileInformationByHandle($Handle,[ref]$info)){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();throw "$Label could not read exact directory identity (Win32=$code)."};if(($info.FileAttributes-band[uint32]0x10)-eq 0 -or ($info.FileAttributes-band[uint32]0x400)-ne 0){throw "$Label must be a regular non-reparse directory."};return([string]$info.VolumeSerialNumber+':'+[string]$info.FileIndexHigh+':'+[string]$info.FileIndexLow) }
+function Open-HmsDeliveryDirectoryGuard { param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label) if ($env:OS -cne 'Windows_NT'){return $null};$h=[HmsDeliveryExactFsNative]::CreateFileW($Path,[uint32]0x00010000,[uint32]3,[IntPtr]::Zero,[uint32]3,[uint32]0x02200000,[IntPtr]::Zero);if ($null -eq $h -or $h.IsInvalid){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();if ($null -ne $h){$h.Dispose()};throw "$Label could not open exact DELETE-capable directory handle (Win32=$code): $Path"};try{$id=Get-HmsDeliveryDirectoryIdentityFromHandle -Handle $h -Label $Label;return[pscustomobject]@{Handle=$h;Identity=$id;Path=$Path}}catch{$h.Dispose();throw} }
+function Move-HmsDeliveryDirectoryGuard { param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Destination,[Parameter(Mandatory)][string]$Label) $before=Get-HmsDeliveryDirectoryIdentityFromHandle -Handle $Guard.Handle -Label $Label;if ($before -cne [string]$Guard.Identity){throw "$Label exact directory identity changed before rename."};if(Test-Path -LiteralPath $Destination){throw "$Label destination is occupied: $Destination"};$code=0;if(-not[HmsDeliveryExactFsNative]::RenameByHandle($Guard.Handle,$Destination,[ref]$code)){throw "$Label exact handle rename failed (Win32=$code): $Destination"};$after=Get-HmsDeliveryDirectoryIdentityFromHandle -Handle $Guard.Handle -Label "$Label post-rename";if ($after -cne [string]$Guard.Identity){throw "$Label exact directory identity changed across rename."};$Guard.Path=$Destination }
+function Get-HmsDeliveryPortableDirectoryIdentity {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "$Label portable identity requires a regular non-reparse directory: $Path"
+    }
+
+    $kernel = [string](& uname -s 2>$null)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($kernel)) {
+        throw "$Label could not identify the non-Windows kernel for filesystem identity."
+    }
+    if ($kernel.Trim() -ceq 'Linux') {
+        $values = @(& stat -Lc '%d:%i' -- $Path 2>$null)
+    }
+    elseif ($kernel.Trim() -ceq 'Darwin') {
+        $values = @(& stat -f '%d:%i' $Path 2>$null)
+    }
+    else {
+        throw "$Label does not support portable filesystem identity on kernel '$($kernel.Trim())'."
+    }
+    if ($LASTEXITCODE -ne 0 -or $values.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$values[0])) {
+        throw "$Label could not capture portable device/inode identity: $Path"
+    }
+    return ([string]$values[0]).Trim()
+}
+
+function Invoke-HmsDeliveryExactDirectoryRemoval {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$QuarantinePrefix,[Parameter(Mandatory)][string]$Label,[Parameter(Mandatory)][scriptblock]$Validate)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    if ($env:OS -cne 'Windows_NT') {
+        $ownedIdentity = Get-HmsDeliveryPortableDirectoryIdentity -Path $Path -Label $Label
+        &$Validate $Path
+        $q = Join-Path (Split-Path -Parent $Path) ($QuarantinePrefix + [guid]::NewGuid().ToString('N'))
+        if (Test-Path -LiteralPath $q) { throw "$Label portable quarantine destination is occupied: $q" }
+        Rename-Item -LiteralPath $Path -NewName (Split-Path -Leaf $q) -ErrorAction Stop
+        if ((Get-HmsDeliveryPortableDirectoryIdentity -Path $q -Label "$Label post-rename") -cne $ownedIdentity) { throw "$Label portable directory identity changed across quarantine rename: $q" }
+        &$Validate $q
+
+        foreach ($child in @(Get-ChildItem -LiteralPath $q -Force -ErrorAction Stop)) {
+            if ((Get-HmsDeliveryPortableDirectoryIdentity -Path $q -Label "$Label pre-child-delete") -cne $ownedIdentity) { throw "$Label portable quarantine root identity changed before child deletion: $q" }
+            Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop
+        }
+        if ((Get-HmsDeliveryPortableDirectoryIdentity -Path $q -Label "$Label pre-root-delete") -cne $ownedIdentity) { throw "$Label portable quarantine root identity changed before empty-root deletion: $q" }
+        if (@(Get-ChildItem -LiteralPath $q -Force -ErrorAction Stop).Count -ne 0) { throw "$Label portable quarantine root is not empty after child deletion: $q" }
+        Remove-Item -LiteralPath $q -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $q) { throw "$Label portable quarantine root remained after empty-root deletion: $q" }
+        return
+    }
+
+    $guard = Open-HmsDeliveryDirectoryGuard -Path $Path -Label $Label
+    $renamed = $false
+    $deleteStarted = $false
+    $q = Join-Path (Split-Path -Parent $Path) ($QuarantinePrefix + [guid]::NewGuid().ToString('N'))
+    try {
+        &$Validate $Path
+        Move-HmsDeliveryDirectoryGuard -Guard $guard -Destination $q -Label $Label
+        $renamed = $true
+        &$Validate $q
+        $deleteStarted = $true
+        foreach ($child in @(Get-ChildItem -LiteralPath $q -Force -ErrorAction Stop)) { Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop }
+        $code = 0
+        if (-not [HmsDeliveryExactFsNative]::DeleteByHandle($guard.Handle,[ref]$code)) { throw "$Label exact root delete-pending transition failed (Win32=$code): $q" }
+        $guard.Handle.Dispose()
+        $guard.Handle = $null
+        if (Test-Path -LiteralPath $q) { throw "$Label exact quarantine remained after handle deletion: $q" }
+    }
+    catch {
+        $e = $_
+        if (-not $deleteStarted -and $renamed -and $null -ne $guard.Handle -and -not $guard.Handle.IsClosed -and -not (Test-Path -LiteralPath $Path)) {
+            try { Move-HmsDeliveryDirectoryGuard -Guard $guard -Destination $Path -Label "$Label pre-delete rollback" } catch {}
+        }
+        elseif ($deleteStarted -and (Test-Path -LiteralPath $q)) {
+            throw "$Label deletion failed after destructive child removal started; exact quarantined remainder was not restored: $q. Original: $($e.Exception.Message)"
+        }
+        throw $e
+    }
+    finally { if ($null -ne $guard -and $null -ne $guard.Handle) { $guard.Handle.Dispose() } }
+}
+
+
 function ConvertTo-NormalizedRemote {
     param([Parameter(Mandatory)][string]$Remote)
     $value = $Remote.Trim().TrimEnd('/')
@@ -256,30 +365,10 @@ function Assert-CodeGraphTransactionBundle {
 
 function Remove-CodeGraphTransactionBundle {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Identity)
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    Assert-CodeGraphTransactionBundle -Path $Path -Identity $Identity
-    $parent = Split-Path -Parent $Path
-    $leaf = '.hms-codegraph-deleting-' + [guid]::NewGuid().ToString('N')
-    $quarantine = Join-Path $parent $leaf
-    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
-    $deleteStarted = $false
-    try {
-        Assert-CodeGraphTransactionBundle -Path $quarantine -Identity $Identity
-        $deleteStarted = $true
-        Remove-Item -LiteralPath $quarantine -Recurse -Force
-        if (Test-Path -LiteralPath $quarantine) { throw "CodeGraph transaction quarantine removal did not complete: $quarantine" }
-    }
-    catch {
-        $e = $_
-        if (-not $deleteStarted -and (Test-Path -LiteralPath $quarantine) -and -not (Test-Path -LiteralPath $Path)) {
-            try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
-        }
-        elseif ($deleteStarted -and (Test-Path -LiteralPath $quarantine)) {
-            throw "CodeGraph transaction deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
-        }
-        throw $e
-    }
+    $validator={param($p) Assert-CodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()
+    Invoke-HmsDeliveryExactDirectoryRemoval -Path $Path -QuarantinePrefix '.hms-codegraph-deleting-' -Label 'CodeGraph transaction bundle cleanup' -Validate $validator
 }
+
 
 function Write-CodeGraphTempMarker {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$TransactionId)
@@ -305,30 +394,10 @@ function Assert-CodeGraphTempRoot {
 
 function Remove-CodeGraphTempRoot {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$TransactionId)
-    if (-not (Test-Path -LiteralPath $Path)) { return }
-    Assert-CodeGraphTempRoot -Path $Path -TransactionId $TransactionId
-    $parent = Split-Path -Parent $Path
-    $leaf = '.hms-codegraph-temp-removing-' + [guid]::NewGuid().ToString('N')
-    $quarantine = Join-Path $parent $leaf
-    Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
-    $deleteStarted = $false
-    try {
-        Assert-CodeGraphTempRoot -Path $quarantine -TransactionId $TransactionId
-        $deleteStarted = $true
-        Remove-Item -LiteralPath $quarantine -Recurse -Force
-        if (Test-Path -LiteralPath $quarantine) { throw "CodeGraph temporary quarantine removal did not complete: $quarantine" }
-    }
-    catch {
-        $e = $_
-        if (-not $deleteStarted -and (Test-Path -LiteralPath $quarantine) -and -not (Test-Path -LiteralPath $Path)) {
-            try { Rename-Item -LiteralPath $quarantine -NewName (Split-Path -Leaf $Path) -ErrorAction Stop } catch { }
-        }
-        elseif ($deleteStarted -and (Test-Path -LiteralPath $quarantine)) {
-            throw "CodeGraph temporary deletion failed after destructive removal started; quarantined remainder was not restored: $quarantine. Original: $($e.Exception.Message)"
-        }
-        throw $e
-    }
+    $validator={param($p) Assert-CodeGraphTempRoot -Path $p -TransactionId $TransactionId}.GetNewClosure()
+    Invoke-HmsDeliveryExactDirectoryRemoval -Path $Path -QuarantinePrefix '.hms-codegraph-temp-removing-' -Label 'CodeGraph temporary-root cleanup' -Validate $validator
 }
+
 
 function Restore-CodeGraphManifestAfterFailure {
     param(
@@ -386,28 +455,28 @@ function Repair-CodeGraphRollbackState {
     $currentBundleState = 'absent'
     $canRestorePrevious = $false
     $reservedBackupPath = $null
+    $reservedBackupGuard = $null
 
     if ($HadPrevious -and $null -ne $BackupIdentity -and -not [string]::IsNullOrWhiteSpace($BackupPath) -and (Test-Path -LiteralPath $BackupPath)) {
+        $reservationGuard = $null
         try {
+            $reservationGuard = Open-HmsDeliveryDirectoryGuard -Path $BackupPath -Label 'CodeGraph rollback reservation'
             Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity
             $reserveLeaf = '.hms-codegraph-rollback-reserved-' + [guid]::NewGuid().ToString('N')
             $reservedBackupPath = Join-Path (Split-Path -Parent $BackupPath) $reserveLeaf
-            Rename-Item -LiteralPath $BackupPath -NewName $reserveLeaf -ErrorAction Stop
+            Move-HmsDeliveryDirectoryGuard -Guard $reservationGuard -Destination $reservedBackupPath -Label 'CodeGraph rollback reservation'
             Assert-CodeGraphTransactionBundle -Path $reservedBackupPath -Identity $BackupIdentity
+            $reservedBackupGuard = $reservationGuard
+            $reservationGuard = $null
             $canRestorePrevious = $true
         }
         catch {
             $rollbackErrors += "CodeGraph backup reservation failed before candidate removal: $($_.Exception.Message)"
-            if ($null -ne $reservedBackupPath -and (Test-Path -LiteralPath $reservedBackupPath) -and -not (Test-Path -LiteralPath $BackupPath)) {
+            if ($null -ne $reservationGuard -and $null -ne $reservationGuard.Handle -and -not $reservationGuard.Handle.IsClosed) {
                 try {
-                    Assert-CodeGraphTransactionBundle -Path $reservedBackupPath -Identity $BackupIdentity
-                    Rename-Item -LiteralPath $reservedBackupPath -NewName (Split-Path -Leaf $BackupPath) -ErrorAction Stop
-                    Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity
-                    $reservedBackupPath = $null
-                }
-                catch {
-                    $rollbackErrors += "CodeGraph backup reservation rollback failed: $($_.Exception.Message)"
-                }
+                    if ([string]$reservationGuard.Path -cne $BackupPath -and -not (Test-Path -LiteralPath $BackupPath)) { Move-HmsDeliveryDirectoryGuard -Guard $reservationGuard -Destination $BackupPath -Label 'CodeGraph backup reservation rollback' }
+                } catch { $rollbackErrors += "CodeGraph backup reservation rollback failed: $($_.Exception.Message)" }
+                $reservationGuard.Handle.Dispose()
             }
         }
     }
@@ -430,31 +499,31 @@ function Repair-CodeGraphRollbackState {
         }
     }
 
-    if ($canRestorePrevious -and -not $candidateRemovalCompleted -and $null -ne $reservedBackupPath -and (Test-Path -LiteralPath $reservedBackupPath)) {
+    if ($canRestorePrevious -and -not $candidateRemovalCompleted -and $null -ne $reservedBackupGuard) {
         try {
             Assert-CodeGraphTransactionBundle -Path $reservedBackupPath -Identity $BackupIdentity
             if (Test-Path -LiteralPath $BackupPath) { throw "Cannot return reserved CodeGraph backup because the original backup pathname became occupied: $BackupPath" }
-            Rename-Item -LiteralPath $reservedBackupPath -NewName (Split-Path -Leaf $BackupPath) -ErrorAction Stop
+            Move-HmsDeliveryDirectoryGuard -Guard $reservedBackupGuard -Destination $BackupPath -Label 'CodeGraph reserved backup return after candidate preservation'
             Assert-CodeGraphTransactionBundle -Path $BackupPath -Identity $BackupIdentity
             $reservedBackupPath = $null
+            $reservedBackupGuard.Handle.Dispose(); $reservedBackupGuard = $null
         }
         catch { $rollbackErrors += "CodeGraph reserved backup could not be returned after candidate preservation: $($_.Exception.Message)" }
     }
 
     if ($canRestorePrevious -and $candidateRemovalCompleted) {
         try {
-            if ($null -eq $reservedBackupPath -or -not (Test-Path -LiteralPath $reservedBackupPath)) { throw 'CodeGraph reserved backup disappeared before rollback activation.' }
+            if ($null -eq $reservedBackupGuard -or $reservedBackupGuard.Handle.IsClosed) { throw 'CodeGraph exact reserved-backup handle disappeared before rollback activation.' }
             Assert-CodeGraphTransactionBundle -Path $reservedBackupPath -Identity $BackupIdentity
             if ($null -eq $PreviousIdentity) { throw 'CodeGraph previous candidate identity is unavailable before rollback activation.' }
             if (Test-Path -LiteralPath $CurrentPath) { throw "Cannot restore CodeGraph backup because current became occupied: $CurrentPath" }
-            Move-Item -LiteralPath $reservedBackupPath -Destination $CurrentPath
+            Move-HmsDeliveryDirectoryGuard -Guard $reservedBackupGuard -Destination $CurrentPath -Label 'CodeGraph rollback activation'
             Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
-            # Restore the original candidate-role marker before restoring the previous root manifest.
-            # This keeps the active bundle and manifest on the same transaction identity after rollback.
             Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $PreviousIdentity
             Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $PreviousIdentity
             $backupActivated = $true
             $reservedBackupPath = $null
+            $reservedBackupGuard.Handle.Dispose(); $reservedBackupGuard = $null
         }
         catch { $rollbackErrors += $_.Exception.Message }
     }
@@ -498,6 +567,8 @@ function Repair-CodeGraphRollbackState {
         }
         catch { $rollbackErrors += $_.Exception.Message }
     }
+
+    if ($null -ne $reservedBackupGuard -and $null -ne $reservedBackupGuard.Handle) { $reservedBackupGuard.Handle.Dispose(); $reservedBackupGuard = $null }
 
     return [pscustomobject]@{
         RollbackErrors = @($rollbackErrors)
