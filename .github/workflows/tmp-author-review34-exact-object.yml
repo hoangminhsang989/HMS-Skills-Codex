@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   author:
-    if: github.event.head_commit.message == 'Retry review34 author with rollback handoff harness'
+    if: github.event.head_commit.message == 'Retry review34 author with portable quarantine cleanup'
     runs-on: windows-latest
     steps:
       - name: Checkout author head
@@ -59,6 +59,13 @@ jobs:
           $ErrorActionPreference = 'Stop'
           python -m py_compile scripts/.tmp_fix_review34_clone_quarantine.py
           python scripts/.tmp_fix_review34_clone_quarantine.py
+
+      - name: Harden portable quarantine root cleanup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m py_compile scripts/.tmp_fix_review34_nonwindows_cleanup.py
+          python scripts/.tmp_fix_review34_nonwindows_cleanup.py
 
       - name: Adapt rollback handoff regression to factored exact guards
         shell: pwsh
@@ -125,7 +132,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          git restore --worktree -- scripts/.tmp_patch_exact_object_review34.py scripts/.tmp_fix_review34_late_probe.py scripts/.tmp_fix_review34_clone_quarantine.py scripts/.tmp_fix_review34_rollback_handoff_harness.py
+          git restore --worktree -- scripts/.tmp_patch_exact_object_review34.py scripts/.tmp_fix_review34_late_probe.py scripts/.tmp_fix_review34_clone_quarantine.py scripts/.tmp_fix_review34_nonwindows_cleanup.py scripts/.tmp_fix_review34_rollback_handoff_harness.py
           $allowed = @(
             'scripts/Resolve-HmsModelRoute.ps1',
             'scripts/Build-HmsCompositeSkill.impl.ps1',
