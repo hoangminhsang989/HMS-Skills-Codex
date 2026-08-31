@@ -10,7 +10,7 @@ end = text.find(end_marker, start)
 if start < 0 or end < 0:
     raise RuntimeError('review34 runtime probe markers not found after main patcher')
 end += len(end_marker)
-replacement = r'''# Permanent destructive primitive proof: a DELETE-capable directory handle opened without
+replacement = r"""# Permanent destructive primitive proof: a DELETE-capable directory handle opened without
 # FILE_SHARE_DELETE must keep the exact validated root non-renamable by a foreign process.
 if (-not ('HmsLateExactRootProbeNative' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -60,7 +60,7 @@ finally {
     $probeHandle.Dispose()
     Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
-Write-Host 'PASS: exact DELETE-capable directory guards deny hostile root rename through destructive transitions.' '''
-text = text[:start] + replacement + text[end:]
+Write-Host 'PASS: exact DELETE-capable directory guards deny hostile root rename through destructive transitions.'"""
+text = (text[:start] + replacement + text[end:]).rstrip() + '\n'
 path.write_text(text, encoding='utf-8', newline='\n')
-print('PASS: replaced cross-script helper injection with self-contained exact-root probe.')
+print('PASS: replaced cross-script helper injection with self-contained exact-root probe and normalized EOF whitespace.')
