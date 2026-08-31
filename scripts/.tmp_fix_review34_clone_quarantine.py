@@ -24,10 +24,11 @@ required_helper_literals = (
 for literal in required_helper_literals:
     if helper.count(literal) != 1:
         raise RuntimeError(f"generated uninstall helper contract mismatch for: {literal}")
-# This is the exact missing contract being added. If it already exists, the
-# baseline shape changed and this fixer must not silently double-apply it.
-if helper.count("&$Validate $q") != 0:
-    raise RuntimeError("generated uninstall helper unexpectedly already revalidates quarantine")
+# The generic exact-object helper already performs one quarantine revalidation
+# on the Windows branch. Preserve that contract and add a clone-specific
+# callback so the permanent validator can see the concrete clone authority.
+if helper.count("&$Validate $q") != 1:
+    raise RuntimeError("generated uninstall helper quarantine revalidation shape changed")
 
 new_helper = r'''function Invoke-HmsUninstallExactDirectoryRemoval {
     param(
