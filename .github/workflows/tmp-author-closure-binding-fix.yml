@@ -44,61 +44,53 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $utf8 = New-Object System.Text.UTF8Encoding($false)
+          $nl = "`n"
+          function Lines { param([string[]]$Value) return ([string]::Join($nl,$Value) + $nl) }
           function Replace-ExactOnce {
             param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Old,[Parameter(Mandatory)][string]$New)
-            $text = [IO.File]::ReadAllText($Path)
+            $text = [IO.File]::ReadAllText($Path).Replace("`r`n","`n")
             $count = [regex]::Matches($text,[regex]::Escape($Old)).Count
             if ($count -ne 1) { throw "Expected exactly one replacement anchor in $Path, found $count.`n$Old" }
             [IO.File]::WriteAllText($Path,$text.Replace($Old,$New),$utf8)
           }
 
           $sync = Join-Path $env:GITHUB_WORKSPACE 'scripts\Sync-DeliveryTools.ps1'
-          Replace-ExactOnce $sync @'
-    $validator={param($p) Assert-CodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()
-'@ @'
-    $assertCodeGraphTransactionBundle = ${function:Assert-CodeGraphTransactionBundle}
-    $validator={param($p) & $assertCodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()
-'@
-          Replace-ExactOnce $sync @'
-    $validator={param($p) Assert-CodeGraphTempRoot -Path $p -TransactionId $TransactionId}.GetNewClosure()
-'@ @'
-    $assertCodeGraphTempRoot = ${function:Assert-CodeGraphTempRoot}
-    $validator={param($p) & $assertCodeGraphTempRoot -Path $p -TransactionId $TransactionId}.GetNewClosure()
-'@
+          $old = Lines @('    $validator={param($p) Assert-CodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()')
+          $new = Lines @('    $assertCodeGraphTransactionBundle = ${function:Assert-CodeGraphTransactionBundle}','    $validator={param($p) & $assertCodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()')
+          Replace-ExactOnce -Path $sync -Old $old -New $new
+          $old = Lines @('    $validator={param($p) Assert-CodeGraphTempRoot -Path $p -TransactionId $TransactionId}.GetNewClosure()')
+          $new = Lines @('    $assertCodeGraphTempRoot = ${function:Assert-CodeGraphTempRoot}','    $validator={param($p) & $assertCodeGraphTempRoot -Path $p -TransactionId $TransactionId}.GetNewClosure()')
+          Replace-ExactOnce -Path $sync -Old $old -New $new
 
           $uninstall = Join-Path $env:GITHUB_WORKSPACE 'uninstall.ps1'
-          Replace-ExactOnce $uninstall @'
-    $validator = {
-        param($p)
-        Assert-CloneIdentity -Path $p -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
-    }.GetNewClosure()
-    $quarantineValidator = {
-        param($quarantine)
-        Assert-CloneIdentity -Path $quarantine -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
-    }.GetNewClosure()
-'@ @'
-    $assertCloneIdentity = ${function:Assert-CloneIdentity}
-    $validator = {
-        param($p)
-        & $assertCloneIdentity -Path $p -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
-    }.GetNewClosure()
-    $quarantineValidator = {
-        param($quarantine)
-        & $assertCloneIdentity -Path $quarantine -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath
-    }.GetNewClosure()
-'@
-          Replace-ExactOnce $uninstall @'
-    $validator={param($p) Assert-OwnedCompositeRoot -Path $p}.GetNewClosure()
-'@ @'
-    $assertOwnedCompositeRoot = ${function:Assert-OwnedCompositeRoot}
-    $validator={param($p) & $assertOwnedCompositeRoot -Path $p}.GetNewClosure()
-'@
-          Replace-ExactOnce $uninstall @'
-    $validator={param($p) Assert-ManagedCodeGraphRoot -Path $p}.GetNewClosure()
-'@ @'
-    $assertManagedCodeGraphRoot = ${function:Assert-ManagedCodeGraphRoot}
-    $validator={param($p) & $assertManagedCodeGraphRoot -Path $p}.GetNewClosure()
-'@
+          $old = Lines @(
+            '    $validator = {',
+            '        param($p)',
+            '        Assert-CloneIdentity -Path $p -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath',
+            '    }.GetNewClosure()',
+            '    $quarantineValidator = {',
+            '        param($quarantine)',
+            '        Assert-CloneIdentity -Path $quarantine -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath',
+            '    }.GetNewClosure()'
+          )
+          $new = Lines @(
+            '    $assertCloneIdentity = ${function:Assert-CloneIdentity}',
+            '    $validator = {',
+            '        param($p)',
+            '        & $assertCloneIdentity -Path $p -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath',
+            '    }.GetNewClosure()',
+            '    $quarantineValidator = {',
+            '        param($quarantine)',
+            '        & $assertCloneIdentity -Path $quarantine -ExpectedRemote $ExpectedRemote -MarkerRelativePath $MarkerRelativePath',
+            '    }.GetNewClosure()'
+          )
+          Replace-ExactOnce -Path $uninstall -Old $old -New $new
+          $old = Lines @('    $validator={param($p) Assert-OwnedCompositeRoot -Path $p}.GetNewClosure()')
+          $new = Lines @('    $assertOwnedCompositeRoot = ${function:Assert-OwnedCompositeRoot}','    $validator={param($p) & $assertOwnedCompositeRoot -Path $p}.GetNewClosure()')
+          Replace-ExactOnce -Path $uninstall -Old $old -New $new
+          $old = Lines @('    $validator={param($p) Assert-ManagedCodeGraphRoot -Path $p}.GetNewClosure()')
+          $new = Lines @('    $assertManagedCodeGraphRoot = ${function:Assert-ManagedCodeGraphRoot}','    $validator={param($p) & $assertManagedCodeGraphRoot -Path $p}.GetNewClosure()')
+          Replace-ExactOnce -Path $uninstall -Old $old -New $new
 
           $syncText = [IO.File]::ReadAllText($sync)
           $uninstallText = [IO.File]::ReadAllText($uninstall)
