@@ -183,6 +183,8 @@ jobs:
           $definitionEnd=$uninstallText.IndexOf('$buildMutex = New-Object System.Threading.Mutex')
           if($definitionStart -lt 0 -or $definitionEnd -le $definitionStart){throw 'Could not isolate uninstall pre-main production definitions.'}
           $definitionText=$uninstallText.Substring($definitionStart,$definitionEnd-$definitionStart)
+          $harnessPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-uninstall-harness-' + [guid]::NewGuid().ToString('N') + '.ps1')
+          $harnessRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-uninstall-root-' + [guid]::NewGuid().ToString('N'))
           $harness = @"
           [CmdletBinding(SupportsShouldProcess)]
           param([Parameter(Mandatory)][string]`$TestHome)
