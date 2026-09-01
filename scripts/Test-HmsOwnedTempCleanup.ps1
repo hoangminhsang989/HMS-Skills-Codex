@@ -24,7 +24,11 @@ foreach ($relative in @('scripts\Build-HmsCompositeSkill.ps1','scripts\Copy-HmsC
         'RenameHmsOwnedDirectoryByHandle',
         'DeleteHmsOwnedDirectoryByHandle',
         'Open-HmsOwnedDirectoryIdentityHandle -Path $path -ShareMode ([uint32]3)',
-        '[uint32]0x00010000',
+        '[uint32]0x00010001',
+        'GetFileInformationByHandleEx',
+        'EnumerateChildrenByHandle',
+        'Remove-HmsOwnedExactChildren',
+        'child identity changed between enumeration and exact-handle open',
         'minimumStructSize = IntPtr.Size == 8 ? 24 : 16',
         'nameOffset + nameBytes.Length + 2',
         "'.hms-owned-temp-quarantine-'",
@@ -120,3 +124,39 @@ finally {
 }
 Write-Host 'PASS: exact-handle loss fails closed without pathname deletion fallback.'
 Write-Host 'PASS: permanent owned-temp cleanup regression qualified exact-object deletion, foreign replacement preservation, and fail-closed handle loss.'
+
+# Case C: enumerate an owned child, swap that pathname from another process, and require exact-ID rejection.
+$ownedC=New-HmsOwnedTempDirectory -Prefix 'hms-owned-temp-child-swap-' -Label 'child-swap regression'
+$victimC=Join-Path $ownedC.Path 'victim.txt'
+[IO.File]::WriteAllText($victimC,'owned-original',(New-Object Text.UTF8Encoding($false)))
+$probeC=Join-Path $env:TEMP ('hms-owned-child-probe-'+[guid]::NewGuid().ToString('N')+'.txt')
+$jobC=$null;$quarantineC=$null
+try{
+    $env:HMS_TEST_EXACT_CHILD_ENUM_READY=$probeC
+    $jobC=Start-Job -ScriptBlock {
+        param($Probe)
+        $ErrorActionPreference='Stop'
+        $limit=(Get-Date).AddSeconds(20)
+        while(-not(Test-Path -LiteralPath $Probe)){if((Get-Date)-gt$limit){throw 'Timed out waiting for exact-child enumeration probe.'};Start-Sleep -Milliseconds 40}
+        $path=[IO.File]::ReadAllText($Probe)
+        $moved=Join-Path (Split-Path -Parent $path) 'owned-original-moved.txt'
+        Rename-Item -LiteralPath $path -NewName (Split-Path -Leaf $moved) -ErrorAction Stop
+        [IO.File]::WriteAllText($path,'FOREIGN-REPLACEMENT-MUST-SURVIVE',(New-Object Text.UTF8Encoding($false)))
+    } -ArgumentList $probeC
+    $rejected=$false
+    try{Remove-HmsOwnedTempDirectory -Owned $ownedC -Label 'child-swap regression'}catch{if($_.Exception.Message -match 'child identity changed between enumeration and exact-handle open'){$rejected=$true}else{throw}}
+    $null=Wait-Job -Job $jobC -Timeout 20
+    if($jobC.State -ne 'Completed'){throw "Child-swap attacker job did not complete. State=$($jobC.State)"}
+    Receive-Job -Job $jobC -ErrorAction Stop | Out-Null
+    if(-not$rejected){throw 'Exact-child cleanup did not reject the swapped child pathname.'}
+    $probed=[IO.File]::ReadAllText($probeC);$quarantineC=Split-Path -Parent $probed
+    if([IO.File]::ReadAllText((Join-Path $quarantineC 'victim.txt')) -cne 'FOREIGN-REPLACEMENT-MUST-SURVIVE'){throw 'Exact-child cleanup modified/deleted the foreign replacement.'}
+    if([IO.File]::ReadAllText((Join-Path $quarantineC 'owned-original-moved.txt')) -cne 'owned-original'){throw 'Exact-child cleanup lost the enumerated original after hostile swap.'}
+}
+finally{
+    $env:HMS_TEST_EXACT_CHILD_ENUM_READY=$null
+    if($null -ne $jobC){Remove-Job -Job $jobC -Force -ErrorAction SilentlyContinue}
+    if($null -ne $ownedC.Guard){$ownedC.Guard.Dispose();$ownedC.Guard=$null}
+    foreach($x in @($probeC,$ownedC.Path,$quarantineC)){if(-not[string]::IsNullOrWhiteSpace([string]$x)-and(Test-Path -LiteralPath $x)){Remove-Item -LiteralPath $x -Recurse -Force -ErrorAction SilentlyContinue}}
+}
+Write-Host 'PASS: exact child file-ID binding rejects hostile pathname substitution without deleting the replacement.'

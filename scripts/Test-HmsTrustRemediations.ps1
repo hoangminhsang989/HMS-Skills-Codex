@@ -63,6 +63,9 @@ foreach ($entry in @(
     foreach ($literal in @('Assert-NoHiddenIndexState','skip-worktree/assume-unchanged index flags')) {
         if ($entry.Text -notmatch [regex]::Escape($literal)) { throw "$($entry.Name) is missing hidden-index trust gate literal: $literal" }
     }
+    foreach ($forbidden in @('scripts\\Test-HmsSkills.ps1','scripts\\Test-DeliveryTools.ps1')) {
+        if ($entry.Text -match [regex]::Escape($forbidden)) { throw "$($entry.Name) production lifecycle still executes developer/CI validator: $forbidden" }
+    }
 }
 if ($builderText -match [regex]::Escape("'$badAuthority'")) {
     throw 'Builder trust wrapper retained the superseded generated authority rule.'

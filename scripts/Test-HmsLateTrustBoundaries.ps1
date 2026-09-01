@@ -37,10 +37,11 @@ if ($resolverText -match [regex]::Escape('Get-Content -LiteralPath $Path')) { th
 $builderImplText=[IO.File]::ReadAllText($builderImplPath)
 foreach($literal in @('HmsCompositeExactFsNative','Open-HmsCompositeDirectoryGuard','Move-HmsCompositeDirectoryGuard -Guard $guard -Destination $FinalPath')){if($builderImplText-notmatch[regex]::Escape($literal)){throw "Composite rollback is missing exact-object activation contract: $literal"}}
 $deliveryText=[IO.File]::ReadAllText($deliveryPath)
-foreach($literal in @('HmsDeliveryExactFsNative','Invoke-HmsDeliveryExactDirectoryRemoval','reservedBackupGuard','Move-HmsDeliveryDirectoryGuard -Guard $reservedBackupGuard -Destination $CurrentPath')){if($deliveryText-notmatch[regex]::Escape($literal)){throw "Delivery tools are missing exact-object contract: $literal"}}
+foreach($literal in @('HmsDeliveryExactFsNative','Invoke-HmsDeliveryExactDirectoryRemoval','reservedBackupGuard','Move-HmsDeliveryDirectoryGuard -Guard $reservedBackupGuard -Destination $CurrentPath','GetFileInformationByHandleEx','EnumerateChildrenByHandle','Remove-HmsDeliveryExactChildren','Open-HmsDeliveryFileGuard','Move-HmsDeliveryFileGuard','Publish-CodeGraphInstallManifest','ExpectedPreviousIdentity')){if($deliveryText-notmatch[regex]::Escape($literal)){throw "Delivery tools are missing exact-object contract: $literal"}}
 $uninstallText=[IO.File]::ReadAllText($uninstallPath)
-foreach($literal in @('HmsUninstallExactFsNative','Invoke-HmsUninstallExactDirectoryRemoval','DeleteByHandle')){if($uninstallText-notmatch[regex]::Escape($literal)){throw "Uninstall is missing exact-object cleanup contract: $literal"}}
+foreach($literal in @('HmsUninstallExactFsNative','Invoke-HmsUninstallExactDirectoryRemoval','DeleteByHandle','GetFileInformationByHandleEx','EnumerateChildrenByHandle','Remove-HmsUninstallExactChildren')){if($uninstallText-notmatch[regex]::Escape($literal)){throw "Uninstall is missing exact-object cleanup contract: $literal"}}
 foreach($bad in @('Remove-Item -LiteralPath $quarantine -Recurse -Force','Remove-Item -LiteralPath $q -Recurse -Force')){if($deliveryText-match[regex]::Escape($bad)){throw "Delivery exact cleanup reverted to root-path recursive deletion: $bad"}}
+foreach($entry in @([pscustomobject]@{Name='delivery';Text=$deliveryText;Forbidden='foreach ($child in @(Get-ChildItem -LiteralPath $q -Force -ErrorAction Stop)) { Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop }'},[pscustomobject]@{Name='uninstall';Text=$uninstallText;Forbidden='foreach ($child in @(Get-ChildItem -LiteralPath $q -Force -ErrorAction Stop)) { Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop }'},[pscustomobject]@{Name='builder';Text=$builderText;Forbidden='Remove-Item -LiteralPath $child.FullName -Recurse'})){if($entry.Text-match[regex]::Escape([string]$entry.Forbidden)){throw "$($entry.Name) exact Windows cleanup still recursively deletes mutable child pathnames."}}
 
 if ($env:OS -cne 'Windows_NT') {
     Write-Host 'SKIP: late-P1 exact settings-handle runtime regression is Windows-specific.'
@@ -175,3 +176,44 @@ finally {
 }
 Write-Host 'PASS: exact DELETE-capable directory guards deny hostile root rename through destructive transitions.'
 Write-Host 'PASS: review34 exact-object resolver, rollback activation, delivery cleanup, and uninstall boundaries are permanently qualified.'
+
+# Fresh-review regression: hostile occupancy during marker/manifest canonical gaps must be preserved, never overwritten.
+. $deliveryPath -SkipCodeGraph -SkipThreeLevelDelivery
+$raceRoot=Join-Path $env:TEMP ('hms-codegraph-exact-file-race-'+[guid]::NewGuid().ToString('N'))
+$markerBundle=Join-Path $raceRoot 'bundle';$markerProbe=Join-Path $raceRoot 'marker-probe.txt';$manifestProbe=Join-Path $raceRoot 'manifest-probe.txt'
+$markerJob=$null;$manifestJob=$null;$manifestState=$null
+try{
+    New-Item -ItemType Directory -Force -Path $markerBundle | Out-Null
+    [IO.File]::WriteAllText((Join-Path $markerBundle 'payload.txt'),'payload',(New-Object Text.UTF8Encoding($false)))
+    $tree=Get-CodeGraphBundleTreeSha256 -Path $markerBundle
+    $old=New-CodeGraphBundleIdentity -TransactionId ('1'*32) -Role 'candidate' -Version 'old' -Tag 'v-old' -Commit 'old' -Asset 'old.zip' -Sha256 ('a'*64) -BundleTreeSha256 $tree
+    $new=New-CodeGraphBundleIdentity -TransactionId ('2'*32) -Role 'backup' -Version 'old' -Tag 'v-old' -Commit 'old' -Asset 'old.zip' -Sha256 ('a'*64) -BundleTreeSha256 $tree
+    Write-CodeGraphBundleMarker -Path $markerBundle -Identity $old
+    $env:HMS_TEST_CODEGRAPH_MARKER_RESERVED_READY=$markerProbe
+    $markerJob=Start-Job -ScriptBlock {param($Probe)while(-not(Test-Path -LiteralPath $Probe)){Start-Sleep -Milliseconds 40};$p=[IO.File]::ReadAllText($Probe);[IO.File]::WriteAllText($p,'FOREIGN-MARKER-MUST-SURVIVE',(New-Object Text.UTF8Encoding($false)))} -ArgumentList $markerProbe
+    $markerRejected=$false
+    try{Write-CodeGraphBundleMarker -Path $markerBundle -Identity $new -ExpectedPreviousIdentity $old}catch{if($_.Exception.Message -match 'destination is occupied|rollback was incomplete'){$markerRejected=$true}else{throw}}
+    $null=Wait-Job -Job $markerJob -Timeout 20;Receive-Job -Job $markerJob -ErrorAction Stop|Out-Null
+    if(-not$markerRejected){throw 'Marker publication did not fail closed when canonical pathname was occupied during exact reservation.'}
+    if([IO.File]::ReadAllText((Join-Path $markerBundle $CodeGraphBundleMarkerName)) -cne 'FOREIGN-MARKER-MUST-SURVIVE'){throw 'Marker publication overwrote/deleted hostile canonical replacement.'}
+
+    $CodeGraphRoot=Join-Path $raceRoot 'codegraph';New-Item -ItemType Directory -Force -Path $CodeGraphRoot|Out-Null;$CodeGraphManifest=Join-Path $CodeGraphRoot 'hms-codegraph-install.json'
+    $previous=[ordered]@{managed_by=$ManagedBy;version='old';tag='v-old';commit='old';asset='old.zip';sha256=('b'*64);bundle_transaction_id=('3'*32);bundle_tree_sha256=('c'*64)}
+    [IO.File]::WriteAllText($CodeGraphManifest,(($previous|ConvertTo-Json)+"`n"),(New-Object Text.UTF8Encoding($false)))
+    $manifestState=Open-ManagedCodeGraphManifestState
+    $candidate=[ordered]@{managed_by=$ManagedBy;version='new';tag='v-new';commit='new';asset='new.zip';sha256=('d'*64);bundle_transaction_id=('4'*32);bundle_tree_sha256=('e'*64)}
+    $env:HMS_TEST_CODEGRAPH_MANIFEST_RESERVED_READY=$manifestProbe
+    $manifestJob=Start-Job -ScriptBlock {param($Probe)while(-not(Test-Path -LiteralPath $Probe)){Start-Sleep -Milliseconds 40};$p=[IO.File]::ReadAllText($Probe);[IO.File]::WriteAllText($p,'FOREIGN-MANIFEST-MUST-SURVIVE',(New-Object Text.UTF8Encoding($false)))} -ArgumentList $manifestProbe
+    $manifestRejected=$false
+    try{$g=Publish-CodeGraphInstallManifest -Manifest $candidate -ExistingState $manifestState;if($null-ne$g){$g.Handle.Dispose()}}catch{if($_.Exception.Message -match 'destination is occupied|rollback was incomplete'){$manifestRejected=$true}else{throw}}
+    $null=Wait-Job -Job $manifestJob -Timeout 20;Receive-Job -Job $manifestJob -ErrorAction Stop|Out-Null
+    if(-not$manifestRejected){throw 'Manifest publication did not fail closed when canonical pathname was occupied during exact reservation.'}
+    if([IO.File]::ReadAllText($CodeGraphManifest) -cne 'FOREIGN-MANIFEST-MUST-SURVIVE'){throw 'Manifest publication overwrote/deleted hostile canonical replacement.'}
+}
+finally{
+    foreach($n in @('HMS_TEST_CODEGRAPH_MARKER_RESERVED_READY','HMS_TEST_CODEGRAPH_MANIFEST_RESERVED_READY')){Remove-Item -LiteralPath "Env:\$n" -ErrorAction SilentlyContinue}
+    foreach($j in @($markerJob,$manifestJob)){if($null-ne$j){Remove-Job -Job $j -Force -ErrorAction SilentlyContinue}}
+    if($null-ne$manifestState -and $null-ne$manifestState.Guard -and $null-ne$manifestState.Guard.Handle){$manifestState.Guard.Handle.Dispose()}
+    if(Test-Path -LiteralPath $raceRoot){Remove-Item -LiteralPath $raceRoot -Recurse -Force -ErrorAction SilentlyContinue}
+}
+Write-Host 'PASS: exact marker/manifest publication preserves hostile canonical replacements and fails closed.'

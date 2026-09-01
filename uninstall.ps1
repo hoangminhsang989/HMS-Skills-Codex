@@ -46,6 +46,53 @@ public static class HmsUninstallExactFsNative
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern SafeFileHandle CreateFileW(string path,uint access,uint share,IntPtr sa,uint creation,uint flags,IntPtr template);
     [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] public static extern bool GetFileInformationByHandle(SafeFileHandle h,out BY_HANDLE_FILE_INFORMATION info);
     [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool SetFileInformationByHandle(SafeFileHandle h,int infoClass,IntPtr info,uint size);
+    public sealed class HmsChildEntry
+    {
+        public string Name;
+        public ulong FileId;
+        public uint Attributes;
+        public HmsChildEntry(string name, ulong fileId, uint attributes) { Name=name; FileId=fileId; Attributes=attributes; }
+    }
+    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle,int infoClass,IntPtr info,uint size);
+    public static HmsChildEntry[] EnumerateChildrenByHandle(SafeFileHandle handle,out int error)
+    {
+        var result=new System.Collections.Generic.List<HmsChildEntry>();
+        const int bufferSize=65536;
+        IntPtr buffer=Marshal.AllocHGlobal(bufferSize);
+        try
+        {
+            bool restart=true;
+            while(true)
+            {
+                bool ok=GetFileInformationByHandleEx(handle,restart?11:10,buffer,(uint)bufferSize);
+                restart=false;
+                if(!ok)
+                {
+                    int code=Marshal.GetLastWin32Error();
+                    if(code==18){error=0;break;}
+                    error=code;return null;
+                }
+                int offset=0;
+                while(true)
+                {
+                    IntPtr entry=IntPtr.Add(buffer,offset);
+                    uint next=unchecked((uint)Marshal.ReadInt32(entry,0));
+                    uint attrs=unchecked((uint)Marshal.ReadInt32(entry,56));
+                    uint nameBytes=unchecked((uint)Marshal.ReadInt32(entry,60));
+                    ulong fileId=unchecked((ulong)Marshal.ReadInt64(entry,96));
+                    if(nameBytes>32768 || (nameBytes&1)!=0){error=13;return null;}
+                    string name=Marshal.PtrToStringUni(IntPtr.Add(entry,104),(int)(nameBytes/2));
+                    if(name!="." && name!="..") result.Add(new HmsChildEntry(name,fileId,attrs));
+                    if(next==0)break;
+                    if(next<104 || offset+(long)next>=bufferSize){error=13;return null;}
+                    offset+=(int)next;
+                }
+            }
+            error=0;return result.ToArray();
+        }
+        finally{Marshal.FreeHGlobal(buffer);}
+    }
     public static bool RenameByHandle(SafeFileHandle handle,string destination,out int error)
     {
         byte[] nameBytes=Encoding.Unicode.GetBytes(destination);int rootOffset=IntPtr.Size==8?8:4;int lengthOffset=IntPtr.Size==8?16:8;int nameOffset=IntPtr.Size==8?20:12;int minimum=IntPtr.Size==8?24:16;int size=Math.Max(minimum,nameOffset+nameBytes.Length+2);IntPtr buffer=Marshal.AllocHGlobal(size);
@@ -57,8 +104,61 @@ public static class HmsUninstallExactFsNative
 '@
 }
 
+function Remove-HmsUninstallExactChildren {
+    param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Label)
+    if ($null -eq $Guard.Handle -or $Guard.Handle.IsClosed -or $Guard.Handle.IsInvalid) { throw "$Label exact parent handle is unavailable for child enumeration." }
+    $enumCode=0
+    $entries=@([HmsUninstallExactFsNative]::EnumerateChildrenByHandle($Guard.Handle,[ref]$enumCode))
+    if ($enumCode -ne 0) { throw "$Label exact child enumeration failed (Win32=$enumCode): $($Guard.Path)" }
+    $probe=[string]$env:HMS_TEST_EXACT_CHILD_ENUM_READY
+    if (-not [string]::IsNullOrWhiteSpace($probe) -and $entries.Count -gt 0) {
+        $env:HMS_TEST_EXACT_CHILD_ENUM_READY=''
+        [IO.File]::WriteAllText($probe,(Join-Path $Guard.Path ([string]$entries[0].Name)),(New-Object Text.UTF8Encoding($false)))
+        Start-Sleep -Milliseconds 1200
+    }
+    foreach ($entry in $entries) {
+        $name=[string]$entry.Name
+        if ([string]::IsNullOrWhiteSpace($name) -or $name -in @('.','..') -or $name.Contains('\') -or $name.Contains('/')) { throw "$Label exact child enumeration returned an unsafe name: $name" }
+        $childPath=Join-Path $Guard.Path $name
+        $expectedDirectory=(([uint32]$entry.Attributes -band [uint32]0x10) -ne 0)
+        $expectedReparse=(([uint32]$entry.Attributes -band [uint32]0x400) -ne 0)
+        $access=[uint32]0x00010080
+        if ($expectedDirectory -and -not $expectedReparse) { $access=[uint32]($access -bor [uint32]1) }
+        $child=[HmsUninstallExactFsNative]::CreateFileW($childPath,$access,[uint32]3,[IntPtr]::Zero,[uint32]3,[uint32]0x02200000,[IntPtr]::Zero)
+        if ($null -eq $child -or $child.IsInvalid) {
+            $code=[Runtime.InteropServices.Marshal]::GetLastWin32Error(); if($null -ne $child){$child.Dispose()}
+            throw "$Label exact child open failed after enumeration (Win32=$code): $childPath"
+        }
+        try {
+            $info=New-Object 'HmsUninstallExactFsNative+BY_HANDLE_FILE_INFORMATION'
+            if (-not [HmsUninstallExactFsNative]::GetFileInformationByHandle($child,[ref]$info)) { $code=[Runtime.InteropServices.Marshal]::GetLastWin32Error(); throw "$Label exact child identity read failed (Win32=$code): $childPath" }
+            $actualId=([uint64]$info.FileIndexHigh * [uint64]4294967296) + [uint64]$info.FileIndexLow
+            if ($actualId -ne [uint64]$entry.FileId) { throw "$Label child identity changed between enumeration and exact-handle open; refusing foreign replacement: $childPath" }
+            $actualDirectory=(($info.FileAttributes -band [uint32]0x10) -ne 0)
+            $actualReparse=(($info.FileAttributes -band [uint32]0x400) -ne 0)
+            if ($actualDirectory -ne $expectedDirectory -or $actualReparse -ne $expectedReparse) { throw "$Label child type changed between enumeration and exact-handle open: $childPath" }
+            if ($actualDirectory -and -not $actualReparse) {
+                Remove-HmsUninstallExactChildren -Guard ([pscustomobject]@{Handle=$child;Path=$childPath}) -Label "$Label child '$name'"
+            }
+            if (($info.FileAttributes -band [uint32]1) -ne 0) {
+                $attrs=[IO.File]::GetAttributes($childPath)
+                [IO.File]::SetAttributes($childPath,($attrs -band (-bnot [IO.FileAttributes]::ReadOnly)))
+            }
+            $deleteCode=0
+            if (-not [HmsUninstallExactFsNative]::DeleteByHandle($child,[ref]$deleteCode)) { throw "$Label exact child delete-pending transition failed (Win32=$deleteCode): $childPath" }
+            $child.Dispose(); $child=$null
+            if (Test-Path -LiteralPath $childPath) { throw "$Label child pathname became occupied after exact-object deletion; refusing further destructive work: $childPath" }
+        }
+        finally { if ($null -ne $child) { $child.Dispose() } }
+    }
+    $remainingCode=0
+    $remaining=@([HmsUninstallExactFsNative]::EnumerateChildrenByHandle($Guard.Handle,[ref]$remainingCode))
+    if ($remainingCode -ne 0) { throw "$Label exact post-delete enumeration failed (Win32=$remainingCode): $($Guard.Path)" }
+    if ($remaining.Count -ne 0) { throw "$Label exact parent gained or retained children during cleanup; refusing root deletion: $($Guard.Path)" }
+}
+
 function Get-HmsUninstallDirectoryIdentityFromHandle { param([Parameter(Mandatory)]$Handle,[Parameter(Mandatory)][string]$Label) $info=New-Object 'HmsUninstallExactFsNative+BY_HANDLE_FILE_INFORMATION';if(-not[HmsUninstallExactFsNative]::GetFileInformationByHandle($Handle,[ref]$info)){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();throw "$Label could not read exact directory identity (Win32=$code)."};if(($info.FileAttributes-band[uint32]0x10)-eq 0-or($info.FileAttributes-band[uint32]0x400)-ne 0){throw "$Label must be a regular non-reparse directory."};return([string]$info.VolumeSerialNumber+':'+[string]$info.FileIndexHigh+':'+[string]$info.FileIndexLow) }
-function Open-HmsUninstallDirectoryGuard { param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label) if ($env:OS -cne 'Windows_NT'){return $null};$h=[HmsUninstallExactFsNative]::CreateFileW($Path,[uint32]0x00010000,[uint32]3,[IntPtr]::Zero,[uint32]3,[uint32]0x02200000,[IntPtr]::Zero);if ($null -eq $h -or $h.IsInvalid){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();if ($null -ne $h){$h.Dispose()};throw "$Label could not open exact DELETE-capable directory handle (Win32=$code): $Path"};try{$id=Get-HmsUninstallDirectoryIdentityFromHandle -Handle $h -Label $Label;return [pscustomobject]@{Handle=$h;Identity=$id;Path=$Path}}catch{$h.Dispose();throw} }
+function Open-HmsUninstallDirectoryGuard { param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label) if ($env:OS -cne 'Windows_NT'){return $null};$h=[HmsUninstallExactFsNative]::CreateFileW($Path,[uint32]0x00010001,[uint32]3,[IntPtr]::Zero,[uint32]3,[uint32]0x02200000,[IntPtr]::Zero);if ($null -eq $h -or $h.IsInvalid){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();if ($null -ne $h){$h.Dispose()};throw "$Label could not open exact DELETE-capable directory handle (Win32=$code): $Path"};try{$id=Get-HmsUninstallDirectoryIdentityFromHandle -Handle $h -Label $Label;return [pscustomobject]@{Handle=$h;Identity=$id;Path=$Path}}catch{$h.Dispose();throw} }
 function Move-HmsUninstallDirectoryGuard { param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Destination,[Parameter(Mandatory)][string]$Label) $before=Get-HmsUninstallDirectoryIdentityFromHandle -Handle $Guard.Handle -Label $Label;if ($before -cne [string]$Guard.Identity){throw "$Label exact directory identity changed before rename."};if(Test-Path -LiteralPath $Destination){throw "$Label destination is occupied: $Destination"};$code=0;if(-not[HmsUninstallExactFsNative]::RenameByHandle($Guard.Handle,$Destination,[ref]$code)){throw "$Label exact handle rename failed (Win32=$code): $Destination"};$after=Get-HmsUninstallDirectoryIdentityFromHandle -Handle $Guard.Handle -Label "$Label post-rename";if ($after -cne [string]$Guard.Identity){throw "$Label exact directory identity changed across rename."};$Guard.Path=$Destination }
 function Get-HmsUninstallPortableDirectoryIdentity {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label)
@@ -128,7 +228,7 @@ function Invoke-HmsUninstallExactDirectoryRemoval {
         &$Validate $q
         if ($null -ne $OnQuarantined) { &$OnQuarantined $q }
         $deleteStarted = $true
-        foreach ($child in @(Get-ChildItem -LiteralPath $q -Force -ErrorAction Stop)) { Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop }
+        Remove-HmsUninstallExactChildren -Guard $guard -Label $Label
         $code = 0
         if (-not [HmsUninstallExactFsNative]::DeleteByHandle($guard.Handle,[ref]$code)) { throw "$Label exact root delete-pending transition failed (Win32=$code): $q" }
         $guard.Handle.Dispose()

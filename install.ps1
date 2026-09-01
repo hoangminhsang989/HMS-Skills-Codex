@@ -186,8 +186,8 @@ try {
     Assert-NoHiddenIndexState -Path $InstallRoot
     $state = Get-ModuleState
 
-    & (Join-Path $InstallRoot 'scripts\Test-HmsSkills.ps1')
-    & (Join-Path $InstallRoot 'scripts\Test-DeliveryTools.ps1')
+    # Developer/CI test harnesses are intentionally not executable from the trusted production lifecycle.
+    # Permanent CI qualifies those validators on exact committed release candidates.
 
     if (-not $SkipSuperpowers) {
         $superLock = Read-ValidatedSuperpowersLock

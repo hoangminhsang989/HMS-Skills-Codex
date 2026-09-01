@@ -36,6 +36,77 @@ public static class HmsDeliveryExactFsNative
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool ReplaceFileW(string replacedFileName,string replacementFileName,string backupFileName,uint flags,IntPtr exclude,IntPtr reserved);
     public static bool ReplaceFileWithoutBackup(string replacedFileName,string replacementFileName,out int error)
     { bool ok=ReplaceFileW(replacedFileName,replacementFileName,null,0,IntPtr.Zero,IntPtr.Zero);error=ok?0:Marshal.GetLastWin32Error();return ok; }
+    public sealed class HmsChildEntry
+    {
+        public string Name;
+        public ulong FileId;
+        public uint Attributes;
+        public HmsChildEntry(string name, ulong fileId, uint attributes) { Name=name; FileId=fileId; Attributes=attributes; }
+    }
+    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle,int infoClass,IntPtr info,uint size);
+    public static HmsChildEntry[] EnumerateChildrenByHandle(SafeFileHandle handle,out int error)
+    {
+        var result=new System.Collections.Generic.List<HmsChildEntry>();
+        const int bufferSize=65536;
+        IntPtr buffer=Marshal.AllocHGlobal(bufferSize);
+        try
+        {
+            bool restart=true;
+            while(true)
+            {
+                bool ok=GetFileInformationByHandleEx(handle,restart?11:10,buffer,(uint)bufferSize);
+                restart=false;
+                if(!ok)
+                {
+                    int code=Marshal.GetLastWin32Error();
+                    if(code==18){error=0;break;}
+                    error=code;return null;
+                }
+                int offset=0;
+                while(true)
+                {
+                    IntPtr entry=IntPtr.Add(buffer,offset);
+                    uint next=unchecked((uint)Marshal.ReadInt32(entry,0));
+                    uint attrs=unchecked((uint)Marshal.ReadInt32(entry,56));
+                    uint nameBytes=unchecked((uint)Marshal.ReadInt32(entry,60));
+                    ulong fileId=unchecked((ulong)Marshal.ReadInt64(entry,96));
+                    if(nameBytes>32768 || (nameBytes&1)!=0){error=13;return null;}
+                    string name=Marshal.PtrToStringUni(IntPtr.Add(entry,104),(int)(nameBytes/2));
+                    if(name!="." && name!="..") result.Add(new HmsChildEntry(name,fileId,attrs));
+                    if(next==0)break;
+                    if(next<104 || offset+(long)next>=bufferSize){error=13;return null;}
+                    offset+=(int)next;
+                }
+            }
+            error=0;return result.ToArray();
+        }
+        finally{Marshal.FreeHGlobal(buffer);}
+    }
+    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool GetFileSizeEx(SafeFileHandle h,out long size);
+    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool SetFilePointerEx(SafeFileHandle h,long distance,out long newPointer,uint moveMethod);
+    [DllImport("kernel32.dll",SetLastError=true)] [return:MarshalAs(UnmanagedType.Bool)] private static extern bool ReadFile(SafeFileHandle h,byte[] buffer,uint bytesToRead,out uint bytesRead,IntPtr overlapped);
+    public static byte[] ReadAllBytesByHandle(SafeFileHandle handle,out int error)
+    {
+        long size;
+        if(!GetFileSizeEx(handle,out size)){error=Marshal.GetLastWin32Error();return null;}
+        if(size<0 || size>Int32.MaxValue){error=223;return null;}
+        long position;
+        if(!SetFilePointerEx(handle,0,out position,0)){error=Marshal.GetLastWin32Error();return null;}
+        byte[] result=new byte[(int)size];
+        int offset=0;
+        while(offset<result.Length)
+        {
+            int count=Math.Min(1048576,result.Length-offset);
+            byte[] chunk=new byte[count];
+            uint read;
+            if(!ReadFile(handle,chunk,(uint)count,out read,IntPtr.Zero)){error=Marshal.GetLastWin32Error();return null;}
+            if(read==0){error=38;return null;}
+            Buffer.BlockCopy(chunk,0,result,offset,(int)read);
+            offset+=(int)read;
+        }
+        error=0;return result;
+    }
     public static bool RenameByHandle(SafeFileHandle handle,string destination,out int error)
     {
         byte[] nameBytes=Encoding.Unicode.GetBytes(destination);int rootOffset=IntPtr.Size==8?8:4;int lengthOffset=IntPtr.Size==8?16:8;int nameOffset=IntPtr.Size==8?20:12;int minimum=IntPtr.Size==8?24:16;int size=Math.Max(minimum,nameOffset+nameBytes.Length+2);IntPtr buffer=Marshal.AllocHGlobal(size);
@@ -48,8 +119,103 @@ public static class HmsDeliveryExactFsNative
 }
 
 function Get-HmsDeliveryDirectoryIdentityFromHandle { param([Parameter(Mandatory)]$Handle,[Parameter(Mandatory)][string]$Label) $info=New-Object 'HmsDeliveryExactFsNative+BY_HANDLE_FILE_INFORMATION';if(-not[HmsDeliveryExactFsNative]::GetFileInformationByHandle($Handle,[ref]$info)){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();throw "$Label could not read exact directory identity (Win32=$code)."};if(($info.FileAttributes-band[uint32]0x10)-eq 0 -or ($info.FileAttributes-band[uint32]0x400)-ne 0){throw "$Label must be a regular non-reparse directory."};return([string]$info.VolumeSerialNumber+':'+[string]$info.FileIndexHigh+':'+[string]$info.FileIndexLow) }
-function Open-HmsDeliveryDirectoryGuard { param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label) if ($env:OS -cne 'Windows_NT'){return $null};$h=[HmsDeliveryExactFsNative]::CreateFileW($Path,[uint32]0x00010000,[uint32]3,[IntPtr]::Zero,[uint32]3,[uint32]0x02200000,[IntPtr]::Zero);if ($null -eq $h -or $h.IsInvalid){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();if ($null -ne $h){$h.Dispose()};throw "$Label could not open exact DELETE-capable directory handle (Win32=$code): $Path"};try{$id=Get-HmsDeliveryDirectoryIdentityFromHandle -Handle $h -Label $Label;return [pscustomobject]@{Handle=$h;Identity=$id;Path=$Path}}catch{$h.Dispose();throw} }
+function Open-HmsDeliveryDirectoryGuard { param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label) if ($env:OS -cne 'Windows_NT'){return $null};$h=[HmsDeliveryExactFsNative]::CreateFileW($Path,[uint32]0x00010001,[uint32]3,[IntPtr]::Zero,[uint32]3,[uint32]0x02200000,[IntPtr]::Zero);if ($null -eq $h -or $h.IsInvalid){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();if ($null -ne $h){$h.Dispose()};throw "$Label could not open exact DELETE-capable directory handle (Win32=$code): $Path"};try{$id=Get-HmsDeliveryDirectoryIdentityFromHandle -Handle $h -Label $Label;return [pscustomobject]@{Handle=$h;Identity=$id;Path=$Path}}catch{$h.Dispose();throw} }
 function Move-HmsDeliveryDirectoryGuard { param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Destination,[Parameter(Mandatory)][string]$Label) $before=Get-HmsDeliveryDirectoryIdentityFromHandle -Handle $Guard.Handle -Label $Label;if ($before -cne [string]$Guard.Identity){throw "$Label exact directory identity changed before rename."};if(Test-Path -LiteralPath $Destination){throw "$Label destination is occupied: $Destination"};$code=0;if(-not[HmsDeliveryExactFsNative]::RenameByHandle($Guard.Handle,$Destination,[ref]$code)){throw "$Label exact handle rename failed (Win32=$code): $Destination"};$after=Get-HmsDeliveryDirectoryIdentityFromHandle -Handle $Guard.Handle -Label "$Label post-rename";if ($after -cne [string]$Guard.Identity){throw "$Label exact directory identity changed across rename."};$Guard.Path=$Destination }
+function Get-HmsDeliveryFileIdentityFromHandle {
+    param([Parameter(Mandatory)]$Handle,[Parameter(Mandatory)][string]$Label)
+    $info=New-Object 'HmsDeliveryExactFsNative+BY_HANDLE_FILE_INFORMATION'
+    if(-not[HmsDeliveryExactFsNative]::GetFileInformationByHandle($Handle,[ref]$info)){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();throw "$Label could not read exact file identity (Win32=$code)."}
+    if(($info.FileAttributes-band[uint32]0x10)-ne 0 -or ($info.FileAttributes-band[uint32]0x400)-ne 0){throw "$Label must be a regular non-reparse file."}
+    return([string]$info.VolumeSerialNumber+':'+[string]$info.FileIndexHigh+':'+[string]$info.FileIndexLow)
+}
+function Open-HmsDeliveryFileGuard {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label)
+    $h=[HmsDeliveryExactFsNative]::CreateFileW($Path,[uint32]2147549184,[uint32]1,[IntPtr]::Zero,[uint32]3,[uint32]0x00200000,[IntPtr]::Zero)
+    if($null -eq $h -or $h.IsInvalid){$code=[Runtime.InteropServices.Marshal]::GetLastWin32Error();if($null -ne $h){$h.Dispose()};throw "$Label could not open exact read+DELETE file handle (Win32=$code): $Path"}
+    try{$id=Get-HmsDeliveryFileIdentityFromHandle -Handle $h -Label $Label;return [pscustomobject]@{Handle=$h;Identity=$id;Path=$Path}}catch{$h.Dispose();throw}
+}
+function Read-HmsDeliveryFileBytesFromGuard {
+    param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Label)
+    if($null -eq $Guard.Handle -or $Guard.Handle.IsClosed -or $Guard.Handle.IsInvalid){throw "$Label exact file guard is unavailable for read."}
+    if((Get-HmsDeliveryFileIdentityFromHandle -Handle $Guard.Handle -Label $Label)-cne[string]$Guard.Identity){throw "$Label exact file identity changed before read."}
+    $readCode=0;$bytes=[HmsDeliveryExactFsNative]::ReadAllBytesByHandle($Guard.Handle,[ref]$readCode);if($readCode -ne 0 -or $null -eq $bytes){throw "$Label exact guarded-handle read failed (Win32=$readCode)."}
+    if((Get-HmsDeliveryFileIdentityFromHandle -Handle $Guard.Handle -Label "$Label post-read")-cne[string]$Guard.Identity){throw "$Label exact file identity changed across read."}
+    return [byte[]]$bytes
+}
+function Move-HmsDeliveryFileGuard {
+    param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Destination,[Parameter(Mandatory)][string]$Label)
+    if((Get-HmsDeliveryFileIdentityFromHandle -Handle $Guard.Handle -Label $Label)-cne[string]$Guard.Identity){throw "$Label exact file identity changed before rename."}
+    if(Test-Path -LiteralPath $Destination){throw "$Label destination is occupied: $Destination"}
+    $code=0;if(-not[HmsDeliveryExactFsNative]::RenameByHandle($Guard.Handle,$Destination,[ref]$code)){throw "$Label exact file handle rename failed (Win32=$code): $Destination"}
+    if((Get-HmsDeliveryFileIdentityFromHandle -Handle $Guard.Handle -Label "$Label post-rename")-cne[string]$Guard.Identity){throw "$Label exact file identity changed across rename."}
+    $Guard.Path=$Destination
+}
+function Remove-HmsDeliveryFileGuard {
+    param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Label)
+    if((Get-HmsDeliveryFileIdentityFromHandle -Handle $Guard.Handle -Label $Label)-cne[string]$Guard.Identity){throw "$Label exact file identity changed before deletion."}
+    $code=0;if(-not[HmsDeliveryExactFsNative]::DeleteByHandle($Guard.Handle,[ref]$code)){throw "$Label exact file delete-pending transition failed (Win32=$code): $($Guard.Path)"}
+    $Guard.Handle.Dispose();$Guard.Handle=$null
+}
+function Test-HmsExactBytesEqual {
+    param([byte[]]$Left,[byte[]]$Right)
+    if($null -eq $Left -or $null -eq $Right -or $Left.Length -ne $Right.Length){return $false}
+    for($i=0;$i -lt $Left.Length;$i++){if($Left[$i]-ne$Right[$i]){return $false}}
+    return $true
+}
+
+function Remove-HmsDeliveryExactChildren {
+    param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Label)
+    if ($null -eq $Guard.Handle -or $Guard.Handle.IsClosed -or $Guard.Handle.IsInvalid) { throw "$Label exact parent handle is unavailable for child enumeration." }
+    $enumCode=0
+    $entries=@([HmsDeliveryExactFsNative]::EnumerateChildrenByHandle($Guard.Handle,[ref]$enumCode))
+    if ($enumCode -ne 0) { throw "$Label exact child enumeration failed (Win32=$enumCode): $($Guard.Path)" }
+    $probe=[string]$env:HMS_TEST_EXACT_CHILD_ENUM_READY
+    if (-not [string]::IsNullOrWhiteSpace($probe) -and $entries.Count -gt 0) {
+        $env:HMS_TEST_EXACT_CHILD_ENUM_READY=''
+        [IO.File]::WriteAllText($probe,(Join-Path $Guard.Path ([string]$entries[0].Name)),(New-Object Text.UTF8Encoding($false)))
+        Start-Sleep -Milliseconds 1200
+    }
+    foreach ($entry in $entries) {
+        $name=[string]$entry.Name
+        if ([string]::IsNullOrWhiteSpace($name) -or $name -in @('.','..') -or $name.Contains('\') -or $name.Contains('/')) { throw "$Label exact child enumeration returned an unsafe name: $name" }
+        $childPath=Join-Path $Guard.Path $name
+        $expectedDirectory=(([uint32]$entry.Attributes -band [uint32]0x10) -ne 0)
+        $expectedReparse=(([uint32]$entry.Attributes -band [uint32]0x400) -ne 0)
+        $access=[uint32]0x00010080
+        if ($expectedDirectory -and -not $expectedReparse) { $access=[uint32]($access -bor [uint32]1) }
+        $child=[HmsDeliveryExactFsNative]::CreateFileW($childPath,$access,[uint32]3,[IntPtr]::Zero,[uint32]3,[uint32]0x02200000,[IntPtr]::Zero)
+        if ($null -eq $child -or $child.IsInvalid) {
+            $code=[Runtime.InteropServices.Marshal]::GetLastWin32Error(); if($null -ne $child){$child.Dispose()}
+            throw "$Label exact child open failed after enumeration (Win32=$code): $childPath"
+        }
+        try {
+            $info=New-Object 'HmsDeliveryExactFsNative+BY_HANDLE_FILE_INFORMATION'
+            if (-not [HmsDeliveryExactFsNative]::GetFileInformationByHandle($child,[ref]$info)) { $code=[Runtime.InteropServices.Marshal]::GetLastWin32Error(); throw "$Label exact child identity read failed (Win32=$code): $childPath" }
+            $actualId=([uint64]$info.FileIndexHigh * [uint64]4294967296) + [uint64]$info.FileIndexLow
+            if ($actualId -ne [uint64]$entry.FileId) { throw "$Label child identity changed between enumeration and exact-handle open; refusing foreign replacement: $childPath" }
+            $actualDirectory=(($info.FileAttributes -band [uint32]0x10) -ne 0)
+            $actualReparse=(($info.FileAttributes -band [uint32]0x400) -ne 0)
+            if ($actualDirectory -ne $expectedDirectory -or $actualReparse -ne $expectedReparse) { throw "$Label child type changed between enumeration and exact-handle open: $childPath" }
+            if ($actualDirectory -and -not $actualReparse) {
+                Remove-HmsDeliveryExactChildren -Guard ([pscustomobject]@{Handle=$child;Path=$childPath}) -Label "$Label child '$name'"
+            }
+            if (($info.FileAttributes -band [uint32]1) -ne 0) {
+                $attrs=[IO.File]::GetAttributes($childPath)
+                [IO.File]::SetAttributes($childPath,($attrs -band (-bnot [IO.FileAttributes]::ReadOnly)))
+            }
+            $deleteCode=0
+            if (-not [HmsDeliveryExactFsNative]::DeleteByHandle($child,[ref]$deleteCode)) { throw "$Label exact child delete-pending transition failed (Win32=$deleteCode): $childPath" }
+            $child.Dispose(); $child=$null
+            if (Test-Path -LiteralPath $childPath) { throw "$Label child pathname became occupied after exact-object deletion; refusing further destructive work: $childPath" }
+        }
+        finally { if ($null -ne $child) { $child.Dispose() } }
+    }
+    $remainingCode=0
+    $remaining=@([HmsDeliveryExactFsNative]::EnumerateChildrenByHandle($Guard.Handle,[ref]$remainingCode))
+    if ($remainingCode -ne 0) { throw "$Label exact post-delete enumeration failed (Win32=$remainingCode): $($Guard.Path)" }
+    if ($remaining.Count -ne 0) { throw "$Label exact parent gained or retained children during cleanup; refusing root deletion: $($Guard.Path)" }
+}
+
 function Get-HmsDeliveryPortableDirectoryIdentity {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Label)
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
@@ -110,7 +276,7 @@ function Invoke-HmsDeliveryExactDirectoryRemoval {
         $renamed = $true
         &$Validate $q
         $deleteStarted = $true
-        foreach ($child in @(Get-ChildItem -LiteralPath $q -Force -ErrorAction Stop)) { Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop }
+        Remove-HmsDeliveryExactChildren -Guard $guard -Label $Label
         $code = 0
         if (-not [HmsDeliveryExactFsNative]::DeleteByHandle($guard.Handle,[ref]$code)) { throw "$Label exact root delete-pending transition failed (Win32=$code): $q" }
         $guard.Handle.Dispose()
@@ -306,15 +472,20 @@ function Move-CodeGraphCandidateToCurrent {
     }
 }
 
+function Open-ManagedCodeGraphManifestState {
+    if(-not(Test-Path -LiteralPath $CodeGraphRoot)){return $null}
+    if(-not(Test-Path -LiteralPath $CodeGraphManifest)){throw "Refusing to overwrite existing CodeGraph path not owned by HMS Skills Codex: $CodeGraphRoot"}
+    $guard=Open-HmsDeliveryFileGuard -Path $CodeGraphManifest -Label 'Managed CodeGraph manifest'
+    try{
+        $record=Convert-CodeGraphJsonGuardToObject -Guard $guard -Label 'Managed CodeGraph manifest'
+        if([string]$record.Object.managed_by -cne $ManagedBy){throw "Unexpected CodeGraph installation owner at $CodeGraphRoot"}
+        return [pscustomobject]@{Manifest=$record.Object;Bytes=[byte[]]$record.Bytes;Guard=$guard}
+    }catch{$guard.Handle.Dispose();throw}
+}
 function Read-ManagedCodeGraphManifest {
-    if (-not (Test-Path -LiteralPath $CodeGraphRoot)) { return $null }
-    if (-not (Test-Path -LiteralPath $CodeGraphManifest)) {
-        throw "Refusing to overwrite existing CodeGraph path not owned by HMS Skills Codex: $CodeGraphRoot"
-    }
-    try { $manifest = Get-Content -LiteralPath $CodeGraphManifest -Raw | ConvertFrom-Json }
-    catch { throw "Managed CodeGraph manifest is invalid JSON: $($_.Exception.Message)" }
-    if ([string]$manifest.managed_by -cne $ManagedBy) { throw "Unexpected CodeGraph installation owner at $CodeGraphRoot" }
-    return $manifest
+    $state=Open-ManagedCodeGraphManifestState
+    if($null -eq $state){return $null}
+    try{return $state.Manifest}finally{if($null -ne $state.Guard -and $null -ne $state.Guard.Handle){$state.Guard.Handle.Dispose();$state.Guard.Handle=$null}}
 }
 
 function Assert-CodeGraphVersion {
@@ -400,45 +571,61 @@ function New-CodeGraphBundleIdentity {
     }
 }
 
+function Convert-CodeGraphJsonGuardToObject {
+    param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)][string]$Label)
+    $bytes=Read-HmsDeliveryFileBytesFromGuard -Guard $Guard -Label $Label
+    $strict=New-Object Text.UTF8Encoding($false,$true)
+    try{$text=$strict.GetString([byte[]]$bytes);$obj=$text|ConvertFrom-Json}catch{throw "$Label exact bytes are not valid UTF-8 JSON: $($_.Exception.Message)"}
+    return [pscustomobject]@{Bytes=[byte[]]$bytes;Object=$obj}
+}
+function Assert-CodeGraphMarkerGuardIdentity {
+    param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)]$Identity,[Parameter(Mandatory)][string]$Label)
+    $record=Convert-CodeGraphJsonGuardToObject -Guard $Guard -Label $Label
+    foreach($field in @('managed_by','artifact','transaction_id','role','version','tag','commit','asset','sha256','bundle_tree_sha256')){
+        if([string]$record.Object.$field -cne [string]$Identity[$field]){throw "$Label marker mismatch for '$field'."}
+    }
+    return $record
+}
 function Write-CodeGraphBundleMarker {
-    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Identity)
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Identity,$ExpectedPreviousIdentity=$null)
     Assert-RegularCodeGraphBundle -Path $Path -Label 'CodeGraph transaction bundle'
-    $treeHash = [string]$Identity['bundle_tree_sha256']
-    if ([string]::IsNullOrWhiteSpace($treeHash)) {
-        $treeHash = Get-CodeGraphBundleTreeSha256 -Path $Path
-        $Identity['bundle_tree_sha256'] = $treeHash
-    }
-    if ($treeHash -notmatch '^[0-9a-f]{64}$') { throw "CodeGraph transaction identity has invalid bundle tree SHA-256: $treeHash" }
-    $markerPath = Join-Path $Path $CodeGraphBundleMarkerName
-    $markerItem = Get-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
-    if ($null -ne $markerItem -and ([bool]$markerItem.PSIsContainer -or [bool]($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
-        throw "CodeGraph transaction marker must be a regular non-reparse file before publication: $markerPath"
-    }
-    $publishParent = Split-Path -Parent $Path
-    $publishTemp = Join-Path $publishParent ('.hms-codegraph-marker-publish-' + [guid]::NewGuid().ToString('N') + '.tmp')
-    $json = $Identity | ConvertTo-Json -Depth 4
-    $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($json + "`n")
-    $stream = $null
-    try {
-        $stream = New-Object IO.FileStream($publishTemp,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
-        $stream.Write($bytes,0,$bytes.Length)
-        $stream.Flush($true)
-    }
-    finally {
-        if ($null -ne $stream) { $stream.Dispose() }
-    }
-    if ($null -eq $markerItem) {
-        # Same-volume File.Move publishes a new marker without exposing a partial canonical file.
-        [IO.File]::Move($publishTemp,$markerPath)
-    }
-    else {
-        # ReplaceFile semantics keep the previous canonical marker intact if publication fails.
-        # On failure the random temp file is intentionally retained rather than pathname-deleted.
-        $replaceCode = 0
-        if (-not [HmsDeliveryExactFsNative]::ReplaceFileWithoutBackup($markerPath,$publishTemp,[ref]$replaceCode)) {
-            throw "CodeGraph marker atomic replacement failed (Win32=$replaceCode): $markerPath"
-        }
-    }
+    $treeHash=[string]$Identity['bundle_tree_sha256']
+    if([string]::IsNullOrWhiteSpace($treeHash)){$treeHash=Get-CodeGraphBundleTreeSha256 -Path $Path;$Identity['bundle_tree_sha256']=$treeHash}
+    if($treeHash -notmatch '^[0-9a-f]{64}$'){throw "CodeGraph transaction identity has invalid bundle tree SHA-256: $treeHash"}
+    $markerPath=Join-Path $Path $CodeGraphBundleMarkerName
+    $publishParent=Split-Path -Parent $Path
+    $publishTemp=Join-Path $publishParent ('.hms-codegraph-marker-publish-'+[guid]::NewGuid().ToString('N')+'.tmp')
+    $oldReserved=Join-Path $publishParent ('.hms-codegraph-marker-previous-'+[guid]::NewGuid().ToString('N')+'.tmp')
+    $discard=Join-Path $publishParent ('.hms-codegraph-marker-discard-'+[guid]::NewGuid().ToString('N')+'.tmp')
+    $json=$Identity|ConvertTo-Json -Depth 4
+    $expectedBytes=(New-Object Text.UTF8Encoding($false)).GetBytes($json+"`n")
+    $existingGuard=$null;$candidateGuard=$null;$oldMoved=$false;$candidatePublished=$false
+    try{
+        if(Test-Path -LiteralPath $markerPath){
+            if($null -eq $ExpectedPreviousIdentity){throw "CodeGraph transaction marker unexpectedly exists without previous-identity authority: $markerPath"}
+            $existingGuard=Open-HmsDeliveryFileGuard -Path $markerPath -Label 'Existing CodeGraph transaction marker'
+            $null=Assert-CodeGraphMarkerGuardIdentity -Guard $existingGuard -Identity $ExpectedPreviousIdentity -Label 'Existing CodeGraph transaction marker'
+            Move-HmsDeliveryFileGuard -Guard $existingGuard -Destination $oldReserved -Label 'Previous CodeGraph marker reservation'
+            $oldMoved=$true
+            $probe=[string]$env:HMS_TEST_CODEGRAPH_MARKER_RESERVED_READY
+            if(-not[string]::IsNullOrWhiteSpace($probe)){[IO.File]::WriteAllText($probe,$markerPath,(New-Object Text.UTF8Encoding($false)));Start-Sleep -Milliseconds 1200}
+        }elseif($null -ne $ExpectedPreviousIdentity){throw "Expected previous CodeGraph transaction marker disappeared before exact publication: $markerPath"}
+        [IO.File]::WriteAllBytes($publishTemp,$expectedBytes)
+        $candidateGuard=Open-HmsDeliveryFileGuard -Path $publishTemp -Label 'Candidate CodeGraph transaction marker'
+        $candidateBytes=Read-HmsDeliveryFileBytesFromGuard -Guard $candidateGuard -Label 'Candidate CodeGraph transaction marker'
+        if(-not(Test-HmsExactBytesEqual -Left $candidateBytes -Right $expectedBytes)){throw 'Candidate CodeGraph marker bytes changed before publication.'}
+        Move-HmsDeliveryFileGuard -Guard $candidateGuard -Destination $markerPath -Label 'Candidate CodeGraph marker publication'
+        $candidatePublished=$true
+        $null=Assert-CodeGraphMarkerGuardIdentity -Guard $candidateGuard -Identity $Identity -Label 'Published CodeGraph transaction marker'
+        if($null -ne $existingGuard){Remove-HmsDeliveryFileGuard -Guard $existingGuard -Label 'Previous CodeGraph marker disposal';$existingGuard=$null;$oldMoved=$false}
+        $candidateGuard.Handle.Dispose();$candidateGuard.Handle=$null;$candidateGuard=$null
+    }catch{
+        $writeError=$_;$rollbackErrors=@()
+        if($null -ne $candidateGuard){try{if($candidatePublished){Move-HmsDeliveryFileGuard -Guard $candidateGuard -Destination $discard -Label 'Candidate CodeGraph marker rollback reservation'};Remove-HmsDeliveryFileGuard -Guard $candidateGuard -Label 'Candidate CodeGraph marker rollback disposal';$candidateGuard=$null}catch{$rollbackErrors+="Candidate marker rollback failed: $($_.Exception.Message)"}}
+        if($null -ne $existingGuard -and $oldMoved){try{if(Test-Path -LiteralPath $markerPath){throw "Canonical CodeGraph marker pathname became occupied during rollback: $markerPath"};Move-HmsDeliveryFileGuard -Guard $existingGuard -Destination $markerPath -Label 'Previous CodeGraph marker restoration';$null=Assert-CodeGraphMarkerGuardIdentity -Guard $existingGuard -Identity $ExpectedPreviousIdentity -Label 'Restored previous CodeGraph marker';$existingGuard.Handle.Dispose();$existingGuard.Handle=$null;$existingGuard=$null;$oldMoved=$false}catch{$rollbackErrors+="Previous marker restoration failed: $($_.Exception.Message)"}}
+        if($rollbackErrors.Count){throw "CodeGraph marker publication failed and exact-object rollback was incomplete. Original: $($writeError.Exception.Message). Rollback: $($rollbackErrors -join ' | ')"}
+        throw $writeError
+    }finally{if($null -ne $candidateGuard -and $null -ne $candidateGuard.Handle){$candidateGuard.Handle.Dispose()};if($null -ne $existingGuard -and $null -ne $existingGuard.Handle){$existingGuard.Handle.Dispose()}}
 }
 
 function Assert-CodeGraphTransactionBundle {
@@ -501,39 +688,74 @@ function Remove-CodeGraphTempRoot {
 }
 
 
+function Assert-CodeGraphInstallManifestGuard {
+    param([Parameter(Mandatory)]$Guard,[Parameter(Mandatory)]$Manifest,[Parameter(Mandatory)][string]$Label)
+    $record=Convert-CodeGraphJsonGuardToObject -Guard $Guard -Label $Label
+    foreach($field in @('managed_by','version','tag','commit','asset','sha256','bundle_transaction_id','bundle_tree_sha256')){
+        $manifestValue=$null
+        if($Manifest -is [System.Collections.IDictionary]){
+            if(-not $Manifest.Contains($field)){throw "$Label expected manifest is missing '$field'."}
+            $manifestValue=$Manifest[$field]
+        }
+        else{
+            if($Manifest.PSObject.Properties.Name -cnotcontains $field){throw "$Label expected manifest is missing '$field'."}
+            $manifestValue=$Manifest.$field
+        }
+        if([string]$record.Object.$field -cne [string]$manifestValue){throw "$Label manifest mismatch for '$field'."}
+    }
+    return $record
+}
+function Publish-CodeGraphInstallManifest {
+    param([Parameter(Mandatory)]$Manifest,$ExistingState)
+    $parent=Split-Path -Parent $CodeGraphManifest
+    $temp=Join-Path $parent ('.hms-codegraph-manifest-candidate-'+[guid]::NewGuid().ToString('N')+'.tmp')
+    $previousReserved=Join-Path $parent ('.hms-codegraph-manifest-previous-'+[guid]::NewGuid().ToString('N')+'.tmp')
+    $discard=Join-Path $parent ('.hms-codegraph-manifest-discard-'+[guid]::NewGuid().ToString('N')+'.tmp')
+    $json=$Manifest|ConvertTo-Json
+    $expected=(New-Object Text.UTF8Encoding($false)).GetBytes($json+"`n")
+    $candidateGuard=$null;$oldMoved=$false;$candidatePublished=$false
+    try{
+        [IO.File]::WriteAllBytes($temp,$expected)
+        $candidateGuard=Open-HmsDeliveryFileGuard -Path $temp -Label 'Candidate CodeGraph install manifest'
+        if(-not(Test-HmsExactBytesEqual -Left (Read-HmsDeliveryFileBytesFromGuard -Guard $candidateGuard -Label 'Candidate CodeGraph install manifest') -Right $expected)){throw 'Candidate CodeGraph install manifest bytes changed before publication.'}
+        if($null -ne $ExistingState){
+            if($null -eq $ExistingState.Guard -or $ExistingState.Guard.Handle.IsClosed){throw 'Existing CodeGraph manifest exact guard is unavailable before publication.'}
+            $null=Assert-CodeGraphInstallManifestGuard -Guard $ExistingState.Guard -Manifest $ExistingState.Manifest -Label 'Existing CodeGraph install manifest'
+            Move-HmsDeliveryFileGuard -Guard $ExistingState.Guard -Destination $previousReserved -Label 'Previous CodeGraph install manifest reservation';$oldMoved=$true
+            $probe=[string]$env:HMS_TEST_CODEGRAPH_MANIFEST_RESERVED_READY
+            if(-not[string]::IsNullOrWhiteSpace($probe)){[IO.File]::WriteAllText($probe,$CodeGraphManifest,(New-Object Text.UTF8Encoding($false)));Start-Sleep -Milliseconds 1200}
+        }
+        Move-HmsDeliveryFileGuard -Guard $candidateGuard -Destination $CodeGraphManifest -Label 'Candidate CodeGraph install manifest publication';$candidatePublished=$true
+        $null=Assert-CodeGraphInstallManifestGuard -Guard $candidateGuard -Manifest $Manifest -Label 'Published CodeGraph install manifest'
+        if($null -ne $ExistingState){Remove-HmsDeliveryFileGuard -Guard $ExistingState.Guard -Label 'Previous CodeGraph install manifest disposal';$ExistingState.Guard=$null;$oldMoved=$false}
+        $result=$candidateGuard;$candidateGuard=$null;return $result
+    }catch{
+        $writeError=$_;$rollbackErrors=@()
+        if($null -ne $candidateGuard){try{if($candidatePublished){Move-HmsDeliveryFileGuard -Guard $candidateGuard -Destination $discard -Label 'Candidate CodeGraph install manifest rollback reservation'};Remove-HmsDeliveryFileGuard -Guard $candidateGuard -Label 'Candidate CodeGraph install manifest rollback disposal';$candidateGuard=$null}catch{$rollbackErrors+="Candidate manifest rollback failed: $($_.Exception.Message)"}}
+        if($null -ne $ExistingState -and $oldMoved -and $null -ne $ExistingState.Guard){try{if(Test-Path -LiteralPath $CodeGraphManifest){throw "Canonical CodeGraph manifest pathname became occupied during publication rollback: $CodeGraphManifest"};Move-HmsDeliveryFileGuard -Guard $ExistingState.Guard -Destination $CodeGraphManifest -Label 'Previous CodeGraph install manifest restoration';$null=Assert-CodeGraphInstallManifestGuard -Guard $ExistingState.Guard -Manifest $ExistingState.Manifest -Label 'Restored previous CodeGraph install manifest';$oldMoved=$false}catch{$rollbackErrors+="Previous manifest restoration failed: $($_.Exception.Message)"}}
+        if($rollbackErrors.Count){throw "CodeGraph manifest publication failed and exact-object rollback was incomplete. Original: $($writeError.Exception.Message). Rollback: $($rollbackErrors -join ' | ')"}
+        throw $writeError
+    }finally{if($null -ne $candidateGuard -and $null -ne $candidateGuard.Handle){$candidateGuard.Handle.Dispose()}}
+}
 function Restore-CodeGraphManifestAfterFailure {
-    param(
-        [Parameter(Mandatory)]$CandidateManifest,
-        [byte[]]$PreviousBytes,
-        [Parameter(Mandatory)][bool]$HadPrevious
-    )
-    $item = Get-Item -LiteralPath $CodeGraphManifest -Force -ErrorAction SilentlyContinue
-    if ($null -eq $item -or [bool]$item.PSIsContainer -or [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        throw 'CodeGraph candidate manifest is missing or not a regular file during rollback.'
+    param([Parameter(Mandatory)]$CandidateManifest,[Parameter(Mandatory)]$CandidateGuard,[byte[]]$PreviousBytes,[Parameter(Mandatory)][bool]$HadPrevious)
+    if($null -eq $CandidateGuard -or $null -eq $CandidateGuard.Handle -or $CandidateGuard.Handle.IsClosed){throw 'CodeGraph candidate manifest exact guard is unavailable during rollback.'}
+    $null=Assert-CodeGraphInstallManifestGuard -Guard $CandidateGuard -Manifest $CandidateManifest -Label 'CodeGraph candidate manifest rollback authority'
+    $parent=Split-Path -Parent $CodeGraphManifest
+    $discard=Join-Path $parent ('.hms-codegraph-manifest-rollback-discard-'+[guid]::NewGuid().ToString('N')+'.tmp')
+    Move-HmsDeliveryFileGuard -Guard $CandidateGuard -Destination $discard -Label 'CodeGraph candidate manifest rollback reservation'
+    if($HadPrevious){
+        if($null -eq $PreviousBytes){throw 'CodeGraph rollback is missing previous manifest bytes.'}
+        $temp=Join-Path $parent ('.hms-codegraph-manifest-restore-'+[guid]::NewGuid().ToString('N')+'.tmp')
+        [IO.File]::WriteAllBytes($temp,$PreviousBytes)
+        $previousGuard=Open-HmsDeliveryFileGuard -Path $temp -Label 'Previous CodeGraph manifest reconstruction'
+        try{
+            if(-not(Test-HmsExactBytesEqual -Left (Read-HmsDeliveryFileBytesFromGuard -Guard $previousGuard -Label 'Previous CodeGraph manifest reconstruction') -Right $PreviousBytes)){throw 'Previous CodeGraph manifest reconstruction changed before restoration.'}
+            Move-HmsDeliveryFileGuard -Guard $previousGuard -Destination $CodeGraphManifest -Label 'Previous CodeGraph manifest restoration'
+            if(-not(Test-HmsExactBytesEqual -Left (Read-HmsDeliveryFileBytesFromGuard -Guard $previousGuard -Label 'Restored previous CodeGraph manifest') -Right $PreviousBytes)){throw 'Restored previous CodeGraph manifest bytes do not match exact pre-transaction bytes.'}
+        }finally{if($null -ne $previousGuard -and $null -ne $previousGuard.Handle){$previousGuard.Handle.Dispose()}}
     }
-    try { $currentManifest = Get-Content -LiteralPath $CodeGraphManifest -Raw | ConvertFrom-Json }
-    catch { throw "CodeGraph candidate manifest is invalid during rollback: $($_.Exception.Message)" }
-    foreach ($field in @('managed_by','version','tag','commit','asset','sha256','bundle_transaction_id','bundle_tree_sha256')) {
-        if ([string]$currentManifest.$field -cne [string]$CandidateManifest[$field]) {
-            throw "CodeGraph candidate manifest changed before rollback for '$field'; refusing to overwrite it."
-        }
-    }
-    if ($HadPrevious) {
-        if ($null -eq $PreviousBytes) { throw 'CodeGraph rollback is missing previous manifest bytes.' }
-        $parent = Split-Path -Parent $CodeGraphManifest
-        $temp = Join-Path $parent ('.hms-codegraph-manifest-restore-' + [guid]::NewGuid().ToString('N') + '.tmp')
-        $discard = Join-Path $parent ('.hms-codegraph-manifest-discard-' + [guid]::NewGuid().ToString('N') + '.tmp')
-        try {
-            [IO.File]::WriteAllBytes($temp, $PreviousBytes)
-            [IO.File]::Replace($temp, $CodeGraphManifest, $discard, $true)
-        }
-        finally {
-            foreach ($cleanup in @($temp,$discard)) { if (Test-Path -LiteralPath $cleanup) { Remove-Item -LiteralPath $cleanup -Force -ErrorAction SilentlyContinue } }
-        }
-    }
-    else {
-        Remove-Item -LiteralPath $CodeGraphManifest -Force
-    }
+    Remove-HmsDeliveryFileGuard -Guard $CandidateGuard -Label 'Rolled-back candidate CodeGraph manifest disposal'
 }
 
 function Repair-CodeGraphRollbackState {
@@ -545,6 +767,7 @@ function Repair-CodeGraphRollbackState {
         $PreviousIdentity,
         [Parameter(Mandatory)][bool]$ManifestPublished,
         $PublishedManifest,
+        $CandidateManifestGuard,
         [byte[]]$PreviousManifestBytes,
         [Parameter(Mandatory)][bool]$HadPrevious,
         [scriptblock]$CandidateRemovalAction
@@ -621,7 +844,7 @@ function Repair-CodeGraphRollbackState {
             if (Test-Path -LiteralPath $CurrentPath) { throw "Cannot restore CodeGraph backup because current became occupied: $CurrentPath" }
             Move-HmsDeliveryDirectoryGuard -Guard $reservedBackupGuard -Destination $CurrentPath -Label 'CodeGraph rollback activation'
             Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
-            Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $PreviousIdentity
+            Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $PreviousIdentity -ExpectedPreviousIdentity $BackupIdentity
             Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $PreviousIdentity
             $backupActivated = $true
             $reservedBackupPath = $null
@@ -657,14 +880,16 @@ function Repair-CodeGraphRollbackState {
 
     if ($ManifestPublished) {
         try {
+            if ($null -eq $CandidateManifestGuard -or $null -eq $CandidateManifestGuard.Handle -or $CandidateManifestGuard.Handle.IsClosed) { throw 'CodeGraph candidate manifest exact guard disappeared before rollback adjudication.' }
             if ($currentBundleState -ceq 'previous') {
-                Restore-CodeGraphManifestAfterFailure -CandidateManifest $PublishedManifest -PreviousBytes $PreviousManifestBytes -HadPrevious $true
+                Restore-CodeGraphManifestAfterFailure -CandidateManifest $PublishedManifest -CandidateGuard $CandidateManifestGuard -PreviousBytes $PreviousManifestBytes -HadPrevious $true
             }
             elseif ($currentBundleState -ceq 'candidate') {
-                # Candidate remains the active verified bundle, so its already-published manifest remains authoritative.
+                $null=Assert-CodeGraphInstallManifestGuard -Guard $CandidateManifestGuard -Manifest $PublishedManifest -Label 'Preserved candidate CodeGraph install manifest'
+                $CandidateManifestGuard.Handle.Dispose();$CandidateManifestGuard.Handle=$null
             }
             else {
-                Restore-CodeGraphManifestAfterFailure -CandidateManifest $PublishedManifest -PreviousBytes $null -HadPrevious $false
+                Restore-CodeGraphManifestAfterFailure -CandidateManifest $PublishedManifest -CandidateGuard $CandidateManifestGuard -PreviousBytes $null -HadPrevious $false
             }
         }
         catch { $rollbackErrors += $_.Exception.Message }
@@ -711,7 +936,7 @@ function Move-CodeGraphCurrentToRollbackBackup {
         if ($null -ne $PreviousIdentityRef) { $PreviousIdentityRef.Value = $existingIdentity }
         $markerRewritten = $false
         try {
-            Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $BackupIdentity
+            Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $BackupIdentity -ExpectedPreviousIdentity $existingIdentity
             $markerRewritten = $true
             Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $BackupIdentity
             $probe = [string]$env:HMS_TEST_CODEGRAPH_CURRENT_GUARD_READY
@@ -722,7 +947,7 @@ function Move-CodeGraphCurrentToRollbackBackup {
         catch {
             $transitionError = $_
             if ($markerRewritten -and [string]$currentGuard.Path -ceq $CurrentPath -and (Test-Path -LiteralPath $CurrentPath) -and -not (Test-Path -LiteralPath $BackupPath)) {
-                try { Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $existingIdentity; Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $existingIdentity }
+                try { Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $existingIdentity -ExpectedPreviousIdentity $BackupIdentity; Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $existingIdentity }
                 catch { throw "CodeGraph current-to-backup transition failed and original marker restoration was incomplete. Original: $($transitionError.Exception.Message). Rollback: $($_.Exception.Message)" }
             }
             throw $transitionError
@@ -736,14 +961,11 @@ function Sync-CodeGraphBundle {
     param([Parameter(Mandatory)]$Spec)
 
     if ($env:OS -ne 'Windows_NT') { throw 'The HMS pinned CodeGraph bundle installer currently supports Windows only.' }
-    $existingManifest = Read-ManagedCodeGraphManifest
+    $existingManifestState = Open-ManagedCodeGraphManifestState
+    $existingManifest = if ($null -eq $existingManifestState) { $null } else { $existingManifestState.Manifest }
     $wasInstalled = $null -ne $existingManifest
-    $existingManifestBytes = $null
-    if ($wasInstalled) {
-        $manifestItem = Get-Item -LiteralPath $CodeGraphManifest -Force -ErrorAction Stop
-        if ([bool]$manifestItem.PSIsContainer -or [bool]($manifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Managed CodeGraph manifest must be a regular file.' }
-        $existingManifestBytes = [IO.File]::ReadAllBytes($CodeGraphManifest)
-    }
+    $existingManifestBytes = if ($null -eq $existingManifestState) { $null } else { [byte[]]$existingManifestState.Bytes }
+    try {
     $arch = Get-CodeGraphArchitecture
     $asset = $Spec.windows_assets.$arch
     $assetName = [string]$asset.name
@@ -776,6 +998,7 @@ function Sync-CodeGraphBundle {
         $candidateActivationGuard = $null
         $manifestPublished = $false
         $publishedManifest = $null
+        $manifestPublicationGuard = $null
         try {
             New-Item -ItemType Directory -Force -Path $temp | Out-Null
             Write-CodeGraphTempMarker -Path $temp -TransactionId $transactionId
@@ -830,22 +1053,20 @@ function Sync-CodeGraphBundle {
                     bundle_transaction_id = $transactionId
                     bundle_tree_sha256 = [string]$candidateIdentity.bundle_tree_sha256
                 }
-                $manifestTemp = Join-Path $CodeGraphRoot ('.hms-codegraph-manifest-' + $transactionId + '.tmp')
-                $publishedManifest | ConvertTo-Json | Set-Content -LiteralPath $manifestTemp -Encoding UTF8
-                if ($wasInstalled) { [IO.File]::Replace($manifestTemp, $CodeGraphManifest, $null, $true) }
-                else { [IO.File]::Move($manifestTemp, $CodeGraphManifest) }
+                $manifestPublicationGuard = Publish-CodeGraphInstallManifest -Manifest $publishedManifest -ExistingState $existingManifestState
                 $manifestPublished = $true
                 Assert-CodeGraphTransactionBundle -Path $current -Identity $candidateIdentity
                 if ($null -ne $candidateActivationGuard -and $null -ne $candidateActivationGuard.Handle) { $candidateActivationGuard.Handle.Dispose(); $candidateActivationGuard.Handle = $null; $candidateActivationGuard = $null }
                 if ($null -ne $backup -and (Test-Path -LiteralPath $backup)) {
                     Remove-CodeGraphTransactionBundle -Path $backup -Identity $backupIdentity
                 }
+                if ($null -ne $manifestPublicationGuard -and $null -ne $manifestPublicationGuard.Handle) { $manifestPublicationGuard.Handle.Dispose();$manifestPublicationGuard.Handle=$null;$manifestPublicationGuard=$null }
             }
             catch {
                 $installError = $_
                 if ($null -ne $candidateActivationGuard -and $null -ne $candidateActivationGuard.Handle) { $candidateActivationGuard.Handle.Dispose(); $candidateActivationGuard.Handle = $null; $candidateActivationGuard = $null }
                 if ($null -eq $candidateIdentity) { throw $installError }
-                $rollback = Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup -CandidateIdentity $candidateIdentity -BackupIdentity $backupIdentity -PreviousIdentity $previousIdentity -ManifestPublished $manifestPublished -PublishedManifest $publishedManifest -PreviousManifestBytes $existingManifestBytes -HadPrevious $wasInstalled
+                $rollback = Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup -CandidateIdentity $candidateIdentity -BackupIdentity $backupIdentity -PreviousIdentity $previousIdentity -ManifestPublished $manifestPublished -PublishedManifest $publishedManifest -CandidateManifestGuard $manifestPublicationGuard -PreviousManifestBytes $existingManifestBytes -HadPrevious $wasInstalled
                 $rollbackErrors = @($rollback.RollbackErrors)
                 if ($rollbackErrors.Count -gt 0) {
                     throw "CodeGraph installation failed and rollback was incomplete. Original: $($installError.Exception.Message). Rollback: $($rollbackErrors -join ' | ')"
@@ -855,11 +1076,14 @@ function Sync-CodeGraphBundle {
         }
         finally {
             if ($null -ne $candidateActivationGuard -and $null -ne $candidateActivationGuard.Handle) { $candidateActivationGuard.Handle.Dispose(); $candidateActivationGuard = $null }
+            if ($null -ne $manifestPublicationGuard -and $null -ne $manifestPublicationGuard.Handle) { $manifestPublicationGuard.Handle.Dispose();$manifestPublicationGuard.Handle=$null }
             if (Test-Path -LiteralPath $temp) { Remove-CodeGraphTempRoot -Path $temp -TransactionId $transactionId }
         }
     }
 
     return [pscustomobject]@{ WasInstalled = $wasInstalled; Command = $command }
+    }
+    finally { if ($null -ne $existingManifestState -and $null -ne $existingManifestState.Guard -and $null -ne $existingManifestState.Guard.Handle) { $existingManifestState.Guard.Handle.Dispose();$existingManifestState.Guard.Handle=$null } }
 }
 
 function Get-CodexMcpEntry {
