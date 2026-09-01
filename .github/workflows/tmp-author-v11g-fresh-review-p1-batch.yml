@@ -1,0 +1,193 @@
+name: Temporary author V11G fresh-review P1 remediation
+
+on:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.2.0-ui-design-authority
+    paths:
+      - .github/workflows/tmp-author-v11g-fresh-review-p1-batch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  author:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-2025
+    env:
+      CLEAN_BASELINE: f627df23dfc65b8f4cd8ecb2192c9bfccfdd69f5
+      EXPECTED_PARENT: 2c1f7f72d09f2e892ccbfc59ee3728102c6d2aa8
+      EXPECTED_RECIPE_SHA256: f0bd94b2f56fe24ee15894c8b016c1b8b40d5c43b33a16c3a126af88bd01bd58
+      V11_SOURCE: .github/workflows/tmp-author-v11-fresh-review-p1-batch.yml
+      V11B_PATH: .github/workflows/tmp-author-v11b-fresh-review-p1-batch.yml
+      V11C_PATH: .github/workflows/tmp-author-v11c-fresh-review-p1-batch.yml
+      V11D_PATH: .github/workflows/tmp-author-v11d-fresh-review-p1-batch.yml
+      V11E_PATH: .github/workflows/tmp-author-v11e-fresh-review-p1-batch.yml
+      V11F_PATH: .github/workflows/tmp-author-v11f-fresh-review-p1-batch.yml
+      SELF_PATH: .github/workflows/tmp-author-v11g-fresh-review-p1-batch.yml
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Bind V11G to exact V11F bootstrap and clean-baseline ancestry
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $parent=((& git rev-parse HEAD^)-join '').Trim().ToLowerInvariant()
+          if($LASTEXITCODE -ne 0 -or $parent -cne $env:EXPECTED_PARENT){throw "V11G parent mismatch. Expected $env:EXPECTED_PARENT, found $parent"}
+          $changed=@(& git diff --name-only HEAD^ HEAD)
+          if($changed.Count -ne 1 -or [string]$changed[0] -cne $env:SELF_PATH){throw "V11G bootstrap scope mismatch: $($changed -join ', ')"}
+          $baseline=((& git rev-parse $env:CLEAN_BASELINE)-join '').Trim().ToLowerInvariant()
+          if($LASTEXITCODE -ne 0 -or $baseline -cne $env:CLEAN_BASELINE){throw "V11G clean baseline object mismatch: $baseline"}
+          & git merge-base --is-ancestor $env:CLEAN_BASELINE HEAD
+          if($LASTEXITCODE -ne 0){throw "V11G clean baseline is not an ancestor of HEAD: $env:CLEAN_BASELINE"}
+          if(-not(Test-Path -LiteralPath $env:V11_SOURCE -PathType Leaf)){throw "V11G committed V11 source is absent: $env:V11_SOURCE"}
+          Write-Host 'V11G_BINDING=PASS_EXACT_PARENT_SELF_ONLY_CLEAN_BASELINE_ANCESTOR'
+
+      - name: Apply exact V11 recipe plus qualified harness and ABI corrections
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $source=Join-Path $env:GITHUB_WORKSPACE $env:V11_SOURCE
+          $lines=[IO.File]::ReadAllLines($source)
+          $stepStart='      - name: Apply exact four-P1 remediation batch'
+          $stepEnd='      - name: Create exact local V11 candidate and run full permanent structural suite'
+          $start=[Array]::IndexOf($lines,$stepStart)
+          $end=[Array]::IndexOf($lines,$stepEnd)
+          if($start -lt 0 -or $end -le $start){throw "Could not bind V11 recipe boundaries. start=$start end=$end"}
+          $run=-1
+          for($i=$start;$i -lt $end;$i++){if($lines[$i] -ceq '        run: |'){$run=$i;break}}
+          if($run -lt 0){throw 'V11 remediation run block marker not found.'}
+          $body=New-Object System.Collections.Generic.List[string]
+          $triple=$null
+          for($i=$run+1;$i -lt $end;$i++){
+            $raw=[string]$lines[$i]
+            if($null -ne $triple){
+              $body.Add($raw)
+              $n=([regex]::Matches($raw,[regex]::Escape($triple))).Count
+              if(($n % 2) -eq 1){$triple=$null}
+              continue
+            }
+            if(-not[string]::IsNullOrWhiteSpace($raw) -and -not $raw.StartsWith('          ')){throw "V11G extractor found under-indented non-literal Python line at source line $($i+1): $raw"}
+            $line=if($raw.StartsWith('          ')){$raw.Substring(10)}else{$raw}
+            $body.Add($line)
+            $single=([regex]::Matches($line,[regex]::Escape("'''"))).Count
+            $double=([regex]::Matches($line,[regex]::Escape('"""'))).Count
+            if(($single % 2) -eq 1 -and ($double % 2) -eq 1){throw "Ambiguous mixed triple quote at extracted source line $($i+1)."}
+            if(($single % 2) -eq 1){$triple="'''"}elseif(($double % 2) -eq 1){$triple='"""'}
+          }
+          if($null -ne $triple){throw "V11G extractor ended inside unterminated triple quote $triple"}
+          $runner=Join-Path $env:RUNNER_TEMP 'v11g-extracted-remediation.py'
+          [IO.File]::WriteAllText($runner,([string]::Join("`n",$body)+"`n"),(New-Object Text.UTF8Encoding($false)))
+          $bytes=[IO.File]::ReadAllBytes($runner)
+          $sha=[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+          Write-Host "EXTRACTED_V11G_RECIPE_SHA256=$sha"
+          if($sha -cne $env:EXPECTED_RECIPE_SHA256){throw "V11G extracted recipe SHA mismatch. Expected $env:EXPECTED_RECIPE_SHA256, found $sha"}
+          & python -m py_compile $runner
+          if($LASTEXITCODE -ne 0){throw 'V11G exact extracted recipe is not valid Python.'}
+          & python $runner
+          if($LASTEXITCODE -ne 0){throw "V11G exact extracted recipe failed with exit code $LASTEXITCODE"}
+
+          foreach($path in @('scripts/Test-HmsLateTrustBoundaries.ps1','scripts/Test-HmsOwnedTempCleanup.ps1')){
+            $full=Join-Path $env:GITHUB_WORKSPACE $path
+            $text=[IO.File]::ReadAllText($full)
+            $normalized=$text.TrimEnd("`r","`n")+"`n"
+            [IO.File]::WriteAllText($full,$normalized,(New-Object Text.UTF8Encoding($false)))
+          }
+
+          $late=Join-Path $env:GITHUB_WORKSPACE 'scripts/Test-HmsLateTrustBoundaries.ps1'
+          $lateLines=[IO.File]::ReadAllLines($late)
+          $matches=@()
+          for($i=0;$i -lt $lateLines.Length;$i++){
+            if($lateLines[$i].Contains("Name='delivery';Text=`$deliveryText") -and $lateLines[$i].Contains('exact cleanup still recursively deletes mutable child pathnames')){$matches+=$i}
+          }
+          if($matches.Count -ne 1){throw "V11G expected exactly one over-broad reviewed-boundary matcher, found $($matches.Count)"}
+          $replacement='foreach($entry in @([pscustomobject]@{Name=''delivery'';Text=$deliveryText;Forbidden=''foreach ($child in @(Get-ChildItem -LiteralPath $q -Force -ErrorAction Stop)) { Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop }''},[pscustomobject]@{Name=''uninstall'';Text=$uninstallText;Forbidden=''foreach ($child in @(Get-ChildItem -LiteralPath $q -Force -ErrorAction Stop)) { Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop }''},[pscustomobject]@{Name=''builder'';Text=$builderText;Forbidden=''Remove-Item -LiteralPath $child.FullName -Recurse''})){if($entry.Text-match[regex]::Escape([string]$entry.Forbidden)){throw "$($entry.Name) exact Windows cleanup still recursively deletes mutable child pathnames."}}'
+          $lateLines[$matches[0]]=$replacement
+          [IO.File]::WriteAllText($late,([string]::Join("`n",$lateLines)+"`n"),(New-Object Text.UTF8Encoding($false)))
+          Write-Host 'V11G_MATCHER_CORRECTION=WINDOWS_REVIEWED_BOUNDARIES_ONLY'
+
+          $syncPath=Join-Path $env:GITHUB_WORKSPACE 'scripts/Sync-DeliveryTools.ps1'
+          $sync=[IO.File]::ReadAllText($syncPath)
+          $signedHex='[uint32]0x80010000'
+          $unsignedDecimal='[uint32]2147549184'
+          $count=([regex]::Matches($sync,[regex]::Escape($signedHex))).Count
+          if($count -ne 1){throw "V11G expected exactly one signed-overflow Win32 access literal, found $count"}
+          $sync=$sync.Replace($signedHex,$unsignedDecimal)
+          [IO.File]::WriteAllText($syncPath,$sync,(New-Object Text.UTF8Encoding($false)))
+          Write-Host 'V11G_WIN32_ACCESS_ABI=PASS_UNSIGNED_GENERIC_READ_DELETE_2147549184'
+
+      - name: Create exact local V11G candidate and run full structural suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $targets=@(
+            'install.ps1','update.ps1','scripts/Sync-DeliveryTools.ps1','scripts/Build-HmsCompositeSkill.ps1','scripts/Copy-HmsCommittedGitPath.ps1','uninstall.ps1',
+            'scripts/Test-HmsTrustRemediations.ps1','scripts/Test-HmsOwnedTempCleanup.ps1','scripts/Test-HmsLateTrustBoundaries.ps1'
+          )
+          $temps=@($env:V11_SOURCE,$env:V11B_PATH,$env:V11C_PATH,$env:V11D_PATH,$env:V11E_PATH,$env:V11F_PATH,$env:SELF_PATH)
+          foreach($temp in $temps){if(-not(Test-Path -LiteralPath $temp)){throw "Expected temp author file missing: $temp"};Remove-Item -LiteralPath $temp -Force}
+          $allowed=@($targets+$temps)
+          $changed=@(& git status --porcelain=v1 --untracked-files=all | ForEach-Object {$_.Substring(3).Replace('\','/')} | Sort-Object -Unique)
+          $unexpected=@($changed|Where-Object{$_ -notin $allowed})
+          if($unexpected.Count){throw "Unexpected V11G author paths: $($unexpected -join ', ')"}
+          foreach($path in $allowed){if($path -notin $changed){throw "Expected V11G path not changed: $path"}}
+          & git diff --check
+          if($LASTEXITCODE -ne 0){throw 'git diff --check rejected V11G.'}
+          Write-Host 'V11G_DIFF_CHECK=PASS'
+          foreach($path in $targets){
+            $tokens=$null;$errs=$null
+            [Management.Automation.Language.Parser]::ParseFile((Join-Path $env:GITHUB_WORKSPACE $path),[ref]$tokens,[ref]$errs)|Out-Null
+            if(@($errs).Count){throw "Parser rejected $path : $((@($errs)|ForEach-Object Message)-join ' | ')"}
+          }
+          Write-Host 'V11G_POWERSHELL_PARSE=PASS_9_OF_9'
+          & git config user.name 'github-actions[bot]'
+          & git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          & git add -- $allowed
+          & git commit -m 'Close fresh-review lifecycle and exact-file cleanup P1s V11G'
+          if($LASTEXITCODE -ne 0){throw 'Local V11G candidate commit failed.'}
+          $net=@(& git diff --name-only $env:CLEAN_BASELINE HEAD)
+          if($net.Count -ne $targets.Count -or @($net|Where-Object{$_ -notin $targets}).Count){throw "V11G net scope mismatch: $($net -join ', ')"}
+          foreach($target in $targets){if($target -notin $net){throw "V11G net diff is missing target: $target"}}
+          $localHead=(((& git rev-parse HEAD)-join '').Trim().ToLowerInvariant())
+          $localTree=(((& git rev-parse 'HEAD^{tree}')-join '').Trim().ToLowerInvariant())
+          Write-Host "LOCAL_CANDIDATE=$localHead"
+          Write-Host "LOCAL_TREE=$localTree"
+          Write-Host 'V11G_NET_SCOPE=PASS_EXACT_9_FILES'
+          & (Join-Path $env:GITHUB_WORKSPACE 'scripts\Test-HmsSkills.ps1') -RepoRoot $env:GITHUB_WORKSPACE
+          if($LASTEXITCODE -ne 0){throw "Test-HmsSkills failed with exit code $LASTEXITCODE"}
+          Write-Host 'V11G_FULL_TEST_HMS_SKILLS=PASS'
+
+      - name: Prove production lifecycle excludes developer validators
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          foreach($path in @('install.ps1','update.ps1')){
+            $text=[IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE $path))
+            foreach($bad in @('scripts\Test-HmsSkills.ps1','scripts\Test-DeliveryTools.ps1')){if($text-match[regex]::Escape($bad)){throw "$path still executes developer validator: $bad"}}
+          }
+          Write-Host 'PASS: production install/update have no developer-validator execution boundary.'
+
+      - name: Prepare nine verified detached GitHub blobs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $targets=@(
+            'install.ps1','update.ps1','scripts/Sync-DeliveryTools.ps1','scripts/Build-HmsCompositeSkill.ps1','scripts/Copy-HmsCommittedGitPath.ps1','uninstall.ps1',
+            'scripts/Test-HmsTrustRemediations.ps1','scripts/Test-HmsOwnedTempCleanup.ps1','scripts/Test-HmsLateTrustBoundaries.ps1'
+          )
+          $headers=@{Authorization="Bearer $env:GH_TOKEN";Accept='application/vnd.github+json';'X-GitHub-Api-Version'='2022-11-28'}
+          $repo='hoangminhsang989/HMS-Skills-Codex'
+          foreach($path in $targets){
+            $bytes=[IO.File]::ReadAllBytes((Join-Path $env:GITHUB_WORKSPACE $path))
+            $payload=@{content=[Convert]::ToBase64String($bytes);encoding='base64'}|ConvertTo-Json -Compress
+            $result=Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$repo/git/blobs" -Headers $headers -Body $payload -ContentType 'application/json'
+            $expected=((& git hash-object --no-filters -- $path)-join '').Trim().ToLowerInvariant()
+            if([string]$result.sha -cne $expected){throw "GitHub blob mismatch for $path. Expected $expected, got $($result.sha)"}
+            Write-Host "PREPARED_BLOB $path $expected"
+          }
+          Write-Host "QUALIFIED_LOCAL_HEAD=$(((& git rev-parse HEAD)-join '').Trim().ToLowerInvariant())"
+          Write-Host "QUALIFIED_LOCAL_TREE=$(((& git rev-parse 'HEAD^{tree}')-join '').Trim().ToLowerInvariant())"
+          Write-Host 'DETACHED_BLOBS_ONLY=YES'
