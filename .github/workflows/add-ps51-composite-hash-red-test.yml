@@ -1,0 +1,129 @@
+name: Add PS5.1 composite hash RED test
+
+on:
+  push:
+    paths:
+      - '.github/workflows/add-ps51-composite-hash-red-test.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  add-ps51-composite-hash-red-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact workflow SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+
+      - name: Prove exact guarded inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($head -cne '${{ github.sha }}'.ToLowerInvariant()) { throw "Workflow checkout mismatch: $head" }
+          $sourceRef = 'refs/heads/stage/hms-superpowers-v0.3.0-windows-setup-menu'
+          $remoteLine = ((& git ls-remote origin $sourceRef) -join "`n").Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($remoteLine)) { throw 'Unable to resolve guarded source ref.' }
+          $remoteSha = (($remoteLine -split '\s+')[0]).ToLowerInvariant()
+          if ($remoteSha -cne $head) { throw "Guarded source ref moved. Expected $head, found $remoteSha" }
+          $status = ((& git status --porcelain=v1 --untracked-files=all) -join "`n").Trim()
+          if (-not [string]::IsNullOrWhiteSpace($status)) { throw "Workflow checkout is not clean: $status" }
+
+      - name: Add permanent PS5.1-safe composite hash contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = Join-Path $env:GITHUB_WORKSPACE 'scripts\Test-HmsWindowsSetup.ps1'
+          $content = [IO.File]::ReadAllText($path)
+          $marker = "    if (`$Scope -eq 'Bootstrap') {"
+          $matches = [regex]::Matches($content,[regex]::Escape($marker)).Count
+          if ($matches -ne 1) { throw "Expected exactly one Bootstrap return marker; found $matches." }
+          $block = @'
+              # The committed composite implementation executes under Windows PowerShell 5.1 during Setup repair.
+              # Trust-critical composite tree hashing must not depend on optional/module-autoload cmdlets.
+              $compositeImplPath = Join-Path $RepoRoot 'scripts\Build-HmsCompositeSkill.impl.ps1'
+              if (-not (Test-Path -LiteralPath $compositeImplPath -PathType Leaf)) { throw 'Composite implementation script is missing.' }
+              $compositeTokens = $null
+              $compositeParseErrors = $null
+              $compositeAst = [System.Management.Automation.Language.Parser]::ParseFile($compositeImplPath,[ref]$compositeTokens,[ref]$compositeParseErrors)
+              if ($compositeParseErrors.Count -ne 0) { throw "Composite implementation PowerShell parse failed: $($compositeParseErrors[0].Message)" }
+              $compositeHashFunctions = @($compositeAst.FindAll({
+                  param($node)
+                  $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-HmsCompositeFileSha256'
+              },$true))
+              if ($compositeHashFunctions.Count -ne 1) {
+                  throw "Trusted composite implementation must define exactly one PS5.1-safe Get-HmsCompositeFileSha256 helper; found $($compositeHashFunctions.Count)."
+              }
+              $compositeImplText = [IO.File]::ReadAllText($compositeImplPath)
+              if ($compositeImplText -match '(?i)\bGet-FileHash\b') {
+                  throw 'Trusted composite implementation must not depend on Get-FileHash because supported Windows PowerShell 5.1 hosts may not provide that cmdlet.'
+              }
+
+              if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+                  $hashTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-ps51-composite-hash-' + [guid]::NewGuid().ToString('N'))
+                  New-Item -ItemType Directory -Path $hashTestRoot | Out-Null
+                  try {
+                      $payload = Join-Path $hashTestRoot 'payload.bin'
+                      $probe = Join-Path $hashTestRoot 'probe.ps1'
+                      $stdout = Join-Path $hashTestRoot 'stdout.log'
+                      $stderr = Join-Path $hashTestRoot 'stderr.log'
+                      [IO.File]::WriteAllBytes($payload,[byte[]](9,8,7,6,5,4,3,2,1,0,255))
+                      $sha = [Security.Cryptography.SHA256]::Create()
+                      try { $expected = (($sha.ComputeHash([IO.File]::ReadAllBytes($payload)) | ForEach-Object { $_.ToString('x2') }) -join '') }
+                      finally { $sha.Dispose() }
+                      $helperText = $compositeHashFunctions[0].Extent.Text
+                      $payloadLiteral = $payload.Replace("'","''")
+                      $probeLines = @(
+                          'Set-StrictMode -Version Latest',
+                          '$ErrorActionPreference = ''Stop''',
+                          $helperText,
+                          ("`$actual = Get-HmsCompositeFileSha256 -Path '{0}'" -f $payloadLiteral),
+                          ("if (`$actual -cne '{0}') {{ throw ('PS5.1 composite SHA-256 mismatch. Expected {0}, found ' + `$actual) }}" -f $expected)
+                      )
+                      [IO.File]::WriteAllLines($probe,[string[]]$probeLines,(New-Object Text.UTF8Encoding($false)))
+                      $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+                      $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"' + $probe + '"')) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
+                      if ($proc.ExitCode -ne 0) {
+                          $failure = if (Test-Path -LiteralPath $stderr) { [IO.File]::ReadAllText($stderr).Trim() } else { '' }
+                          throw "Trusted composite SHA-256 helper must run under Windows PowerShell 5.1. Exit=$($proc.ExitCode) Error=$failure"
+                      }
+                  }
+                  finally { Remove-Item -LiteralPath $hashTestRoot -Recurse -Force -ErrorAction SilentlyContinue }
+              }
+          '@
+          $content = $content.Replace($marker,($block.TrimEnd() + "`r`n`r`n" + $marker))
+          [IO.File]::WriteAllText($path,$content,(New-Object Text.UTF8Encoding($false)))
+          & git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'RED test patch failed git diff --check.' }
+
+      - name: Prove new contract is RED for intended missing helper
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stdout = Join-Path $env:RUNNER_TEMP 'hms-ps51-composite-red.stdout.log'
+          $stderr = Join-Path $env:RUNNER_TEMP 'hms-ps51-composite-red.stderr.log'
+          $proc = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile','-File','./scripts/Test-HmsWindowsSetup.ps1','-Scope','Bootstrap') -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
+          $combined = ((Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue) + "`n" + (Get-Content -LiteralPath $stderr -Raw -ErrorAction SilentlyContinue))
+          Write-Host $combined
+          if ($proc.ExitCode -eq 0) { throw 'RED contract unexpectedly passed before composite remediation.' }
+          $plain = [regex]::Replace($combined,"`e\[[0-9;?]*[ -/]*[@-~]",'')
+          $normalized = ($plain -replace '\s+',' ').Trim()
+          if ($normalized -notmatch 'PS5\.1-safe Get-HmsCompositeFileSha256 helper; found[^0-9]*0\.') {
+              throw "RED contract failed for an unexpected reason. Normalized output: $normalized"
+          }
+          Write-Host 'PASS: permanent regression is RED for the missing PS5.1-safe composite SHA-256 helper.'
+
+      - name: Publish test-only RED successor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- scripts/Test-HmsWindowsSetup.ps1
+          git commit -m 'test: require PS5.1-safe composite SHA-256 hashing'
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to commit test-only RED successor.' }
+          git push origin HEAD:refs/heads/stage/hms-superpowers-v0.3.0-windows-setup-menu
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to publish test-only RED successor.' }
