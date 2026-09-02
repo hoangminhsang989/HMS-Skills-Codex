@@ -76,24 +76,19 @@ jobs:
                       finally { $sha.Dispose() }
                       $helperText = $deliveryHashFunctions[0].Extent.Text
                       $payloadLiteral = $payload.Replace("'","''")
-                      $probeText = @"
-              Set-StrictMode -Version Latest
-              `$ErrorActionPreference = 'Stop'
-              `$source = @'
-              param([string]`$Path)
-              $helperText
-              Get-HmsDeliveryFileSha256 -Path `$Path
-              '@
-              `$closure = [ScriptBlock]::Create(`$source).GetNewClosure()
-              `$actual = & `$closure '$payloadLiteral'
-              if (`$actual -cne '$expected') { throw "PS5.1 closure-safe delivery SHA-256 mismatch. Expected $expected, found `$actual" }
-              "@
-                      [IO.File]::WriteAllText($probe,$probeText,(New-Object Text.UTF8Encoding($false)))
+                      $probeLines = @(
+                          'Set-StrictMode -Version Latest',
+                          '$ErrorActionPreference = ''Stop''',
+                          $helperText,
+                          ("`$actual = Get-HmsDeliveryFileSha256 -Path '{0}'" -f $payloadLiteral),
+                          ("if (`$actual -cne '{0}') {{ throw \"PS5.1 delivery SHA-256 mismatch. Expected {0}, found `$actual\" }}" -f $expected)
+                      )
+                      [IO.File]::WriteAllLines($probe,[string[]]$probeLines,(New-Object Text.UTF8Encoding($false)))
                       $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
                       $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"' + $probe + '"')) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
                       if ($proc.ExitCode -ne 0) {
                           $failure = if (Test-Path -LiteralPath $stderr) { [IO.File]::ReadAllText($stderr).Trim() } else { '' }
-                          throw "Trusted delivery SHA-256 helper must run inside a Windows PowerShell 5.1 closure. Exit=$($proc.ExitCode) Error=$failure"
+                          throw "Trusted delivery SHA-256 helper must run under Windows PowerShell 5.1. Exit=$($proc.ExitCode) Error=$failure"
                       }
                   }
                   finally { Remove-Item -LiteralPath $hashTestRoot -Recurse -Force -ErrorAction SilentlyContinue }
