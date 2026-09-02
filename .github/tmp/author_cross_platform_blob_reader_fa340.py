@@ -22,10 +22,10 @@ def non_windows_block(label_expr: str) -> str:
         failed_prefix = "$Label git cat-file failed"
         stderr_prefix = "$Label git cat-file produced unexpected stderr"
     return f'''        $gitCommand = @((Get-Command git -CommandType Application -ErrorAction Stop))[0]
-        $gitPath = [string]$gitCommand.Source
-        if ([string]::IsNullOrWhiteSpace($gitPath) -or -not (Test-Path -LiteralPath $gitPath -PathType Leaf)) {{ throw "Resolved git executable does not exist: $gitPath" }}
+        $gitExecutablePath = [string]$gitCommand.Source
+        if ([string]::IsNullOrWhiteSpace($gitExecutablePath) -or -not (Test-Path -LiteralPath $gitExecutablePath -PathType Leaf)) {{ throw "Resolved git executable does not exist: $gitExecutablePath" }}
         $psi = New-Object Diagnostics.ProcessStartInfo
-        $psi.FileName = $gitPath
+        $psi.FileName = $gitExecutablePath
         $psi.Arguments = "cat-file blob $expected"
         $psi.WorkingDirectory = $RepoRoot
         $psi.UseShellExecute = $false
@@ -44,7 +44,7 @@ def non_windows_block(label_expr: str) -> str:
                 try {{ $proc.WaitForExit() }} catch {{}}
                 throw '{timeout_error}'
             }}
-            $copyTask.GetAwaiter().GetResult()
+            $null = $copyTask.GetAwaiter().GetResult()
             $stderr = $stderrTask.GetAwaiter().GetResult()
             if ($proc.ExitCode -ne 0) {{ throw "{failed_prefix}: $stderr" }}
             if (-not [string]::IsNullOrEmpty($stderr)) {{ throw "{stderr_prefix}: $stderr" }}
