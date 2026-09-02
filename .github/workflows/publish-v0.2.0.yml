@@ -1,0 +1,70 @@
+name: Publish HMS Superpowers v0.2.0
+
+on:
+  push:
+    branches:
+      - hms-release-v0.2.0-publication
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout authority commit
+        uses: actions/checkout@v4
+        with:
+          ref: 9054d07743297fdaa414068ef58b4ab60892f49e
+          fetch-depth: 0
+
+      - name: Verify exact authority identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "9054d07743297fdaa414068ef58b4ab60892f49e"
+          test "$(git rev-parse HEAD^{tree})" = "f088073a4a0153e9de2bb4c7497162f6c7815185"
+          if git show-ref --verify --quiet refs/tags/v0.2.0; then
+            test "$(git rev-list -n 1 v0.2.0)" = "9054d07743297fdaa414068ef58b4ab60892f49e"
+          fi
+
+      - name: Build release ZIP from authority tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=zip --output HMS-Superpowers-v0.2.0.zip 9054d07743297fdaa414068ef58b4ab60892f49e
+          sha256sum HMS-Superpowers-v0.2.0.zip > HMS-Superpowers-v0.2.0.zip.sha256
+
+      - name: Create immutable tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh api repos/${GITHUB_REPOSITORY}/git/ref/tags/v0.2.0 >/dev/null 2>&1; then
+            existing=$(gh api repos/${GITHUB_REPOSITORY}/git/ref/tags/v0.2.0 --jq '.object.sha')
+            test "$existing" = "9054d07743297fdaa414068ef58b4ab60892f49e"
+          else
+            gh api --method POST repos/${GITHUB_REPOSITORY}/git/refs \
+              -f ref='refs/tags/v0.2.0' \
+              -f sha='9054d07743297fdaa414068ef58b4ab60892f49e'
+          fi
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view v0.2.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            target=$(gh release view v0.2.0 --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq '.targetCommitish')
+            test "$target" = "9054d07743297fdaa414068ef58b4ab60892f49e" || test "$target" = "v0.2.0"
+          else
+            gh release create v0.2.0 \
+              HMS-Superpowers-v0.2.0.zip \
+              HMS-Superpowers-v0.2.0.zip.sha256 \
+              --repo "$GITHUB_REPOSITORY" \
+              --target 9054d07743297fdaa414068ef58b4ab60892f49e \
+              --title 'HMS Superpowers v0.2.0' \
+              --notes 'HMS Superpowers v0.2.0 — one unified skill + role/model dispatcher. Authority commit: 9054d07743297fdaa414068ef58b4ab60892f49e. Authority tree: f088073a4a0153e9de2bb4c7497162f6c7815185.'
+          fi
