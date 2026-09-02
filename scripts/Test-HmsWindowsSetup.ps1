@@ -114,7 +114,7 @@ if ($Scope -in @('All','Bootstrap')) {
     Assert-TextContains -Path $bootstrapPath -Pattern 'Assert-HmsSafeDirectory' -Message 'Setup bootstrap must guard setup-owned directories.'
     $parseTokens = $null
     $parseErrors = $null
-    $null = [System.Management.Automation.Language.Parser]::ParseFile($bootstrapPath, [ref]$parseTokens, [ref]$parseErrors)
+    $bootstrapAst = [System.Management.Automation.Language.Parser]::ParseFile($bootstrapPath, [ref]$parseTokens, [ref]$parseErrors)
     if ($parseErrors.Count -ne 0) {
         $first = $parseErrors[0]
         throw "Setup bootstrap PowerShell parse failed at line $($first.Extent.StartLineNumber), column $($first.Extent.StartColumnNumber): $($first.Message)"
@@ -122,6 +122,47 @@ if ($Scope -in @('All','Bootstrap')) {
     $bootstrapText = [IO.File]::ReadAllText($bootstrapPath)
     if ($bootstrapText -match '(?i)/latest/' -or $bootstrapText -match '(?i)npm\s+install') {
         throw 'Setup bootstrap must not use runtime latest URLs or npm install.'
+    }
+
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $invokeGitFunctions = @($bootstrapAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Invoke-HmsGit'
+        }, $true))
+        if ($invokeGitFunctions.Count -ne 1) { throw "Expected exactly one Invoke-HmsGit function; found $($invokeGitFunctions.Count)." }
+
+        $nativeTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-ps51-native-stderr-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $nativeTestRoot | Out-Null
+        try {
+            $fakeGit = Join-Path $nativeTestRoot 'fake-git.cmd'
+            $probe = Join-Path $nativeTestRoot 'probe.ps1'
+            $stdout = Join-Path $nativeTestRoot 'stdout.log'
+            $stderr = Join-Path $nativeTestRoot 'stderr.log'
+            [IO.File]::WriteAllText(
+                $fakeGit,
+                "@echo off`r`necho benign-git-progress 1>&2`r`necho fake-output`r`nexit /b 0`r`n",
+                [Text.Encoding]::ASCII)
+            $functionText = $invokeGitFunctions[0].Extent.Text
+            $fakeGitLiteral = $fakeGit.Replace("'", "''")
+            $repoLiteral = $nativeTestRoot.Replace("'", "''")
+            $probeText = @"
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+$functionText
+`$result = Invoke-HmsGit -GitExe '$fakeGitLiteral' -RepoRoot '$repoLiteral' -Arguments @('status') -FailureMessage 'fake git failed.'
+if (`$result -notmatch 'fake-output') { throw "Invoke-HmsGit lost stdout from an exit-zero native command: `$result" }
+"@
+            [IO.File]::WriteAllText($probe, $probeText, (New-Object Text.UTF8Encoding($false)))
+            $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+            $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"' + $probe + '"')) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
+            if ($proc.ExitCode -ne 0) {
+                $failure = if (Test-Path -LiteralPath $stderr) { [IO.File]::ReadAllText($stderr).Trim() } else { '' }
+                throw "Invoke-HmsGit must tolerate benign native stderr when exit code is zero under Windows PowerShell 5.1. Exit=$($proc.ExitCode) Error=$failure"
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $nativeTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
     if ($Scope -eq 'Bootstrap') {
