@@ -16,7 +16,7 @@ function Get-HmsCommittedBlobSnapshot {
     if ([string]::IsNullOrWhiteSpace($RelativePath) -or $RelativePath.StartsWith('/') -or $RelativePath.StartsWith('\\') -or $RelativePath -match '(^|[\\/])\.\.([\\/]|$)') {
         throw "$Label committed relative path is unsafe: $RelativePath"
     }
-    $gitPath = $RelativePath.Replace('\\','/')
+    $gitPath = $RelativePath.Replace('\','/')
     $expected = ((& git -C $RepoRoot rev-parse "$headValue`:$gitPath" 2>$null) -join '').Trim().ToLowerInvariant()
     if ($LASTEXITCODE -ne 0 -or $expected -notmatch '^[0-9a-f]{40}$') { throw "$Label committed blob is unavailable: $gitPath" }
     $type = ((& git -C $RepoRoot cat-file -t $expected 2>$null) -join '').Trim().ToLowerInvariant()
@@ -107,14 +107,27 @@ function Get-HmsCommittedLifecycleScriptSnapshot {
     if ($rootMatches -ne 1) { throw "$Label trusted transform expected exactly one repository-root bootstrap, found $rootMatches." }
     $source = $source.Replace($rootLiteral,'$RepoRoot = $HmsTrustedRepoRoot')
 
+    if ($ScriptRelativePath.Replace('\','/') -ceq 'scripts/Sync-UiSkills.ps1') {
+        $lockExistenceLiteral = 'if (-not (Test-Path -LiteralPath $LockPath)) { throw "UI skills lock file not found: $LockPath" }'
+    }
+    elseif ($ScriptRelativePath.Replace('\','/') -ceq 'scripts/Sync-DeliveryTools.ps1') {
+        $lockExistenceLiteral = 'if (-not (Test-Path -LiteralPath $LockPath)) { throw "Delivery tools lock file not found: $LockPath" }'
+    }
+    else {
+        throw "$Label trusted lifecycle transform is not authorized for script: $ScriptRelativePath"
+    }
+    $existenceMatches = [regex]::Matches($source,[regex]::Escape($lockExistenceLiteral)).Count
+    if ($existenceMatches -ne 1) { throw "$Label trusted transform expected exactly one live lock existence check, found $existenceMatches." }
+    $source = $source.Replace($lockExistenceLiteral,'if ([string]::IsNullOrWhiteSpace($HmsTrustedLockJson)) { throw "Trusted committed lock JSON is empty." }')
+
     $lockLiteral = 'try { $lock = Get-Content -LiteralPath $LockPath -Raw | ConvertFrom-Json }'
     $lockMatches = [regex]::Matches($source,[regex]::Escape($lockLiteral)).Count
     if ($lockMatches -ne 1) { throw "$Label trusted transform expected exactly one live lock read, found $lockMatches." }
     $source = $source.Replace($lockLiteral,'try { $lock = $HmsTrustedLockJson | ConvertFrom-Json }')
 
-    # Bind the only transformed values into a private closure so the helper never falls back to
-    # caller-supplied/live pathname state. The executable source remains exact committed source
-    # except for these two mechanically asserted trust-input substitutions.
+    # Bind the only transformed trust values into a private closure so the helper never falls back
+    # to caller-supplied/live pathname state. The executable source remains exact committed source
+    # except for three mechanically asserted substitutions: repo root, lock existence, lock bytes.
     $HmsTrustedRepoRoot = $RepoRoot
     $HmsTrustedLockJson = [string]$lockText.Text
     try { $script = [ScriptBlock]::Create($source).GetNewClosure() }
