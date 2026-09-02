@@ -1,6 +1,6 @@
 # HMS Superpowers v0.3.0 — Windows Setup + Menu Application Design
 
-Status: **DESIGN APPROVED BY OWNER; IMPLEMENTATION NOT YET AUTHORIZED**
+Status: **DESIGN APPROVED IN CHAT; WRITTEN SPEC PENDING OWNER REVIEW; IMPLEMENTATION NOT AUTHORIZED**
 
 Date: 2026-09-02
 
@@ -86,7 +86,7 @@ The bootstrap owns:
 - download, SHA-256 verification, staging, and atomic activation of setup-owned support tools;
 - exact HMS repository origin/ref/commit reconciliation;
 - preparation of a process-local PATH that prefers the HMS-owned MinGit toolchain for HMS lifecycle commands;
-- selection of a usable Codex CLI, with a pinned HMS-owned fallback when no usable Codex CLI exists;
+- selection of a qualified Codex CLI for HMS child processes, with a pinned HMS-owned native fallback whenever the ambient Codex command cannot be proven equivalent to the pin;
 - launching the existing `install.ps1` only after source identity is proven.
 
 ### 4.3 `HMS-Superpowers.exe`
@@ -126,7 +126,7 @@ Setup-owned application/support files live outside the Git checkout so updating 
   HMS-Superpowers.exe
   support\
     git\...
-    codex\...          # only when HMS-owned Codex fallback is required
+    codex\...
   setup-authority.json
   setup-tools.lock.json
 ```
@@ -212,9 +212,13 @@ An existing machine Git installation is left untouched.
 
 ### 8.3 Codex CLI
 
-The menu and Setup first detect whether a usable `codex` CLI is already available to the user. A usable existing CLI must start successfully and report a syntactically valid version. Setup does not overwrite that installation.
+An ambient `codex` command is treated as user-owned state, not automatically as a trusted HMS prerequisite. The menu may display its version for diagnostics, but HMS lifecycle child processes may use the ambient Codex command only when all of these checks pass:
 
-If Codex is missing or cannot start, HMS installs a private native Windows x64 fallback from the official OpenAI Codex GitHub release. Node.js/npm is therefore not a prerequisite.
+- the resolved command is a native executable rather than an unreviewed wrapper/script;
+- `codex --version` succeeds and reports the pinned version expected by the Setup support lock;
+- the resolved executable SHA-256 equals the pinned extracted-executable SHA-256.
+
+If any of those conditions is false, Setup leaves the user's Codex installation untouched and installs/uses a private native Windows x64 fallback from the official OpenAI Codex GitHub release. Node.js/npm is therefore not a prerequisite and an arbitrary PATH wrapper can never become the HMS trusted fallback merely because it starts successfully.
 
 Initial v0.3.0 fallback lock authority:
 
@@ -226,9 +230,9 @@ ZIP SHA-256: 11634c7da0aadf53dff3ec0bad9fd3715371afff189becac433270b21cf299c9
 Extracted EXE SHA-256: 01b0fd4167393e004b9174c77ae5f8570486118e19dc4216cfc62a62a74b6ee6
 ```
 
-The bootstrap verifies both the downloaded archive and extracted executable before activation. The fallback is supplied to HMS child processes through process-local environment selection and is not allowed to silently replace the user's normal Codex command globally.
+The bootstrap verifies both the downloaded archive and extracted executable before activation. The selected qualified Codex binary is supplied only to HMS child processes through process-local environment selection. Setup does not change the user's global Codex command or global PATH.
 
-Authentication remains in Codex's normal user state; Setup must not request, copy, export, or rewrite user authentication secrets.
+Authentication remains in Codex's normal user state (`CODEX_HOME` / the user's existing Codex auth store). Setup must not request, copy, export, or rewrite user authentication secrets.
 
 ### 8.4 Existing HMS dependencies
 
@@ -271,7 +275,7 @@ The visible Setup sequence is:
 ```text
 Checking system
   -> Preparing verified support Git
-  -> Checking / preparing Codex CLI
+  -> Qualifying / preparing pinned Codex CLI
   -> Acquiring exact HMS release source
   -> Installing HMS dependencies
   -> Building HMS composite
@@ -325,6 +329,7 @@ The new layers must preserve or strengthen the existing trust model:
 - no execution of HMS lifecycle source until canonical repository origin/commit/tree/clean state are proven;
 - no menu direct-execution of mutable PowerShell implementation bytes when an authenticated outer launcher is required;
 - no silent fallback from trusted support Git to an arbitrary PATH `git.exe` for HMS lifecycle mutations;
+- no arbitrary ambient Codex wrapper/script accepted as an HMS trusted runtime dependency;
 - no destructive cleanup of unknown paths/reparse points;
 - no hidden-index state accepted on HMS authority inputs;
 - no claim of Codex model switching or installation success without observable process evidence;
@@ -388,8 +393,9 @@ Before merge/release, v0.3.0 must demonstrate on Windows x64:
 - MinGit ZIP hash mismatch rejection;
 - Codex fallback ZIP hash mismatch rejection;
 - Codex fallback extracted EXE hash mismatch rejection;
-- fresh install with existing usable Codex CLI;
-- fresh install with Codex missing and pinned native fallback installed;
+- rejection of an ambient Codex wrapper/script as a trusted HMS dependency;
+- acceptance of an ambient native Codex binary only when pinned version and SHA match;
+- fresh install with ambient Codex missing/unqualified and pinned native fallback installed;
 - fresh install/repair with support MinGit missing or corrupted;
 - exact HMS tag/commit/tree binding during Setup;
 - rejection of dirty, divergent, unexpected-origin, and hidden-index HMS checkouts;
