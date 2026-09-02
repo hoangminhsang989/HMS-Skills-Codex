@@ -42,7 +42,7 @@ jobs:
 
           Push-Location $root
           try {
-            & python '.github/tmp/author_lifecycle_blob_reader_3537.py'
+            & python '.github/tmp/author_lifecycle_blob_reader_3537_v2.py'
             if ($LASTEXITCODE -ne 0) { throw "Mechanical patcher failed with exit $LASTEXITCODE" }
           }
           finally { Pop-Location }
