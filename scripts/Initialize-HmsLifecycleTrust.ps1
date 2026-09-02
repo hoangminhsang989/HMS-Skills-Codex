@@ -1,0 +1,128 @@
+# Authenticated committed-object helpers for install/update lifecycle execution.
+# This file is never trusted by pathname: install.ps1/update.ps1 first load its exact
+# committed blob from a captured HMS HEAD, verify the Git object identity, then dot-source
+# the resulting in-memory ScriptBlock.
+
+function Get-HmsCommittedBlobSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Head,
+        [Parameter(Mandatory)][string]$RelativePath,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    $headValue = $Head.Trim().ToLowerInvariant()
+    if ($headValue -notmatch '^[0-9a-f]{40}$') { throw "$Label trusted HEAD is invalid: $Head" }
+    if ([string]::IsNullOrWhiteSpace($RelativePath) -or $RelativePath.StartsWith('/') -or $RelativePath.StartsWith('\\') -or $RelativePath -match '(^|[\\/])\.\.([\\/]|$)') {
+        throw "$Label committed relative path is unsafe: $RelativePath"
+    }
+    $gitPath = $RelativePath.Replace('\\','/')
+    $expected = ((& git -C $RepoRoot rev-parse "$headValue`:$gitPath" 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $expected -notmatch '^[0-9a-f]{40}$') { throw "$Label committed blob is unavailable: $gitPath" }
+    $type = ((& git -C $RepoRoot cat-file -t $expected 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $type -cne 'blob') { throw "$Label committed object is not a blob: $gitPath" }
+
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = 'git'
+    $psi.Arguments = "cat-file blob $expected"
+    $psi.WorkingDirectory = $RepoRoot
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = New-Object Diagnostics.Process
+    $proc.StartInfo = $psi
+    if (-not $proc.Start()) { throw "$Label could not start git cat-file." }
+    $memory = New-Object IO.MemoryStream
+    try {
+        $proc.StandardOutput.BaseStream.CopyTo($memory)
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) { throw "$Label git cat-file failed: $stderr" }
+        $bytes = $memory.ToArray()
+    }
+    finally {
+        $memory.Dispose()
+        $proc.Dispose()
+    }
+
+    $header = [Text.Encoding]::ASCII.GetBytes(('blob ' + [string]$bytes.Length + [char]0))
+    $sha1 = [Security.Cryptography.SHA1]::Create()
+    $hashStream = New-Object IO.MemoryStream
+    try {
+        $hashStream.Write($header,0,$header.Length)
+        if ($bytes.Length -gt 0) { $hashStream.Write($bytes,0,$bytes.Length) }
+        $hashStream.Position = 0
+        $actual = (($sha1.ComputeHash($hashStream) | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $hashStream.Dispose()
+        $sha1.Dispose()
+    }
+    if ($actual -cne $expected) { throw "$Label committed-byte identity mismatch. Expected $expected, found $actual." }
+    return [pscustomobject]@{ Sha=$expected; Bytes=[byte[]]$bytes; RelativePath=$gitPath }
+}
+
+function Get-HmsCommittedUtf8Text {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Head,
+        [Parameter(Mandatory)][string]$RelativePath,
+        [Parameter(Mandatory)][string]$Label
+    )
+    $snapshot = Get-HmsCommittedBlobSnapshot -RepoRoot $RepoRoot -Head $Head -RelativePath $RelativePath -Label $Label
+    try { $text = (New-Object Text.UTF8Encoding($false,$true)).GetString([byte[]]$snapshot.Bytes) }
+    catch { throw "$Label committed bytes are not strict UTF-8: $($_.Exception.Message)" }
+    return [pscustomobject]@{ Sha=[string]$snapshot.Sha; Text=$text; RelativePath=[string]$snapshot.RelativePath }
+}
+
+function Get-HmsCommittedScriptSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Head,
+        [Parameter(Mandatory)][string]$RelativePath,
+        [Parameter(Mandatory)][string]$Label
+    )
+    $text = Get-HmsCommittedUtf8Text -RepoRoot $RepoRoot -Head $Head -RelativePath $RelativePath -Label $Label
+    try { $script = [ScriptBlock]::Create([string]$text.Text) }
+    catch { throw "$Label committed PowerShell could not be parsed: $($_.Exception.Message)" }
+    return [pscustomobject]@{ Sha=[string]$text.Sha; ScriptBlock=$script; RelativePath=[string]$text.RelativePath }
+}
+
+function Get-HmsCommittedLifecycleScriptSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Head,
+        [Parameter(Mandatory)][string]$ScriptRelativePath,
+        [Parameter(Mandatory)][string]$LockRelativePath,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    $scriptText = Get-HmsCommittedUtf8Text -RepoRoot $RepoRoot -Head $Head -RelativePath $ScriptRelativePath -Label $Label
+    $lockText = Get-HmsCommittedUtf8Text -RepoRoot $RepoRoot -Head $Head -RelativePath $LockRelativePath -Label "$Label lock"
+    $source = [string]$scriptText.Text
+
+    $rootLiteral = '$RepoRoot = Split-Path -Parent $PSScriptRoot'
+    $rootMatches = [regex]::Matches($source,[regex]::Escape($rootLiteral)).Count
+    if ($rootMatches -ne 1) { throw "$Label trusted transform expected exactly one repository-root bootstrap, found $rootMatches." }
+    $source = $source.Replace($rootLiteral,'$RepoRoot = $HmsTrustedRepoRoot')
+
+    $lockLiteral = 'try { $lock = Get-Content -LiteralPath $LockPath -Raw | ConvertFrom-Json }'
+    $lockMatches = [regex]::Matches($source,[regex]::Escape($lockLiteral)).Count
+    if ($lockMatches -ne 1) { throw "$Label trusted transform expected exactly one live lock read, found $lockMatches." }
+    $source = $source.Replace($lockLiteral,'try { $lock = $HmsTrustedLockJson | ConvertFrom-Json }')
+
+    # Bind the only transformed values into a private closure so the helper never falls back to
+    # caller-supplied/live pathname state. The executable source remains exact committed source
+    # except for these two mechanically asserted trust-input substitutions.
+    $HmsTrustedRepoRoot = $RepoRoot
+    $HmsTrustedLockJson = [string]$lockText.Text
+    try { $script = [ScriptBlock]::Create($source).GetNewClosure() }
+    catch { throw "$Label trusted transformed PowerShell could not be parsed: $($_.Exception.Message)" }
+    return [pscustomobject]@{
+        Sha=[string]$scriptText.Sha
+        LockSha=[string]$lockText.Sha
+        ScriptBlock=$script
+        RelativePath=[string]$scriptText.RelativePath
+    }
+}
