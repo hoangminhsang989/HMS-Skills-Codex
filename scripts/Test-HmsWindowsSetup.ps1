@@ -117,6 +117,38 @@ if ($Scope -in @('All','Bootstrap')) {
         throw 'Setup bootstrap must not use runtime latest URLs or npm install.'
     }
 
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-bootstrap-diagnostic-test-' + [guid]::NewGuid().ToString('N'))
+        $badAuthorityPath = Join-Path $testRoot 'bad-authority.json'
+        $diagnosticPath = Join-Path $testRoot 'bootstrap-error.log'
+        $testInstallRoot = Join-Path $testRoot 'repo'
+        $testAppRoot = Join-Path $testRoot 'app'
+        New-Item -ItemType Directory -Path $testRoot | Out-Null
+        try {
+            [IO.File]::WriteAllText($badAuthorityPath, '{"schema_version":0}', (New-Object Text.UTF8Encoding($false)))
+            $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+            & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $bootstrapPath `
+                -AuthorityPath $badAuthorityPath `
+                -ToolsLockPath $toolsLockPath `
+                -InstallRoot $testInstallRoot `
+                -AppRoot $testAppRoot `
+                -Mode Diagnose `
+                -DiagnosticPath $diagnosticPath *> $null
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -eq 0) { throw 'Bootstrap diagnostic regression probe unexpectedly succeeded with malformed authority.' }
+            if (-not (Test-Path -LiteralPath $diagnosticPath -PathType Leaf)) {
+                throw 'Bootstrap failure must persist its exact diagnostic when DiagnosticPath is supplied.'
+            }
+            $diagnostic = [IO.File]::ReadAllText($diagnosticPath)
+            if ($diagnostic -notmatch 'Unsupported setup authority schema_version') {
+                throw "Bootstrap diagnostic did not preserve the expected failure reason: $diagnostic"
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     if ($Scope -eq 'Bootstrap') {
         Write-Host 'PASS: HMS setup bootstrap static contract is satisfied.'
         return
