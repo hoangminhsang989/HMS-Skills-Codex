@@ -21,7 +21,7 @@ jobs:
           ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 1
 
-      - name: Localize lifecycle mutex ownership
+      - name: Localize updater phase after mutex release
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -31,90 +31,99 @@ jobs:
           $oldCodexHome = $env:CODEX_HOME
           $mutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
 
-          function Invoke-ExternalMutexProbe {
-            param([Parameter(Mandatory)][string]$Label)
-            $job = Start-Job -ScriptBlock {
-              param($Name,$ProbeLabel)
-              $ErrorActionPreference='Stop'
-              $m = New-Object System.Threading.Mutex($false,$Name)
-              $owned=$false
-              try {
-                try { $owned=$m.WaitOne([TimeSpan]::FromSeconds(8)) }
-                catch [System.Threading.AbandonedMutexException] { $owned=$true }
-                if (-not $owned) { throw "MUTEX_PROBE_TIMEOUT:$ProbeLabel" }
-                "MUTEX_PROBE_ACQUIRED:$ProbeLabel"
-              }
-              finally {
-                if ($owned) { $m.ReleaseMutex() }
-                $m.Dispose()
-              }
-            } -ArgumentList $mutexName,$Label
-            try {
-              $null = Wait-Job $job -Timeout 12
-              $out = @(Receive-Job $job -ErrorAction Continue 2>&1)
-              $out | ForEach-Object { Write-Host $_ }
-              if ($job.State -ne 'Completed') {
-                Write-Host "MUTEX_PROBE_RESULT:$Label:BLOCKED:$($job.State)"
-                return $false
-              }
-              Write-Host "MUTEX_PROBE_RESULT:$Label:PASS"
-              return $true
-            }
-            finally { Remove-Job $job -Force -ErrorAction SilentlyContinue }
+          function Add-ExactMarker {
+            param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Needle,[Parameter(Mandatory)][string]$Replacement,[Parameter(Mandatory)][string]$Label)
+            $count = [regex]::Matches($Source,[regex]::Escape($Needle)).Count
+            if ($count -ne 1) { throw ('Instrument anchor {0} expected exactly once, found {1}.' -f $Label,$count) }
+            return $Source.Replace($Needle,$Replacement)
           }
 
           try {
-            $env:HOME=$runnerHome
-            $env:CODEX_HOME=Join-Path $runnerHome '.codex'
+            $env:HOME = $runnerHome
+            $env:CODEX_HOME = Join-Path $runnerHome '.codex'
+
             & (Join-Path $root 'install.ps1') -InstallRoot $root -SkipCodeGraph -SkipThreeLevelDelivery
-            $afterInstall = Invoke-ExternalMutexProbe -Label 'after-full-install'
 
             $builder = Join-Path $root 'scripts\Build-HmsCompositeSkill.ps1'
-            $rollbackObserved=$false
+            $rollbackObserved = $false
             try {
-              $env:HMS_TEST_FAIL_STAGE_ACTIVATION='1'
+              $env:HMS_TEST_FAIL_STAGE_ACTIVATION = '1'
               & $builder -InstallRoot $root -Hms $true -Superpowers $true -Taste $true -Impeccable $true
             }
             catch {
-              Write-Host "ROLLBACK_EXCEPTION:$($_.Exception.Message)"
-              if ($_.Exception.Message -match 'Injected staged-root activation failure') { $rollbackObserved=$true } else { throw }
+              Write-Host ('ROLLBACK_EXCEPTION={0}' -f $_.Exception.Message)
+              if ($_.Exception.Message -match 'Injected staged-root activation failure') { $rollbackObserved = $true } else { throw }
             }
             finally { Remove-Item Env:HMS_TEST_FAIL_STAGE_ACTIVATION -ErrorAction SilentlyContinue }
             if (-not $rollbackObserved) { throw 'Expected rollback branch was not observed.' }
-            $afterRollback = Invoke-ExternalMutexProbe -Label 'after-stage-rollback'
 
             $uiLock = Get-Content -LiteralPath (Join-Path $root 'ui-skills.lock.json') -Raw | ConvertFrom-Json
             $tasteRoot = Join-Path $runnerHome '.codex\taste-skill'
             $tasteRel = ([string]$uiLock.taste.skill_path).TrimEnd('/') + '/SKILL.md'
-            $tastePath = Join-Path $tasteRoot ($tasteRel -replace '/', '\')
+            $tastePath = Join-Path $tasteRoot ($tasteRel.Replace('/','\'))
             Add-Content -LiteralPath $tastePath -Value "`n<!-- HMS DIAG dirty Taste -->"
 
+            $source = Get-Content -LiteralPath (Join-Path $root 'update.ps1') -Raw
+            $source = Add-ExactMarker -Source $source -Label 'after-mutex' `
+              -Needle '    if (-not $mutexOwned) { throw "Timed out waiting for composite build lock: $BuildMutexName" }' `
+              -Replacement "    if (-not `$mutexOwned) { throw \"Timed out waiting for composite build lock: `$BuildMutexName\" }`r`n    Write-Output 'DIAG_UPDATE_AFTER_MUTEX'"
+            $source = Add-ExactMarker -Source $source -Label 'after-first-index-check' `
+              -Needle "    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }`r`n    Assert-NoHiddenIndexState -Path `$InstallRoot" `
+              -Replacement "    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }`r`n    Assert-NoHiddenIndexState -Path `$InstallRoot`r`n    Write-Output 'DIAG_UPDATE_AFTER_INDEX_CHECK'"
+            $source = Add-ExactMarker -Source $source -Label 'pre-head' `
+              -Needle '    $preUpdateHead = Get-HmsCanonicalHead -Path $InstallRoot' `
+              -Replacement "    `$preUpdateHead = Get-HmsCanonicalHead -Path `$InstallRoot`r`n    Write-Output 'DIAG_UPDATE_AFTER_PRE_HEAD'"
+            $source = Add-ExactMarker -Source $source -Label 'pre-bootstrap' `
+              -Needle '    $preTrustBootstrap = Get-HmsLifecycleTrustBootstrap -RepoRoot $InstallRoot -Head $preUpdateHead' `
+              -Replacement "    `$preTrustBootstrap = Get-HmsLifecycleTrustBootstrap -RepoRoot `$InstallRoot -Head `$preUpdateHead`r`n    Write-Output 'DIAG_UPDATE_AFTER_PRE_BOOTSTRAP'"
+            $source = Add-ExactMarker -Source $source -Label 'pre-dot-source' `
+              -Needle '    . $preTrustBootstrap.ScriptBlock' `
+              -Replacement "    . `$preTrustBootstrap.ScriptBlock`r`n    Write-Output 'DIAG_UPDATE_AFTER_PRE_DOTSOURCE'"
+            $source = Add-ExactMarker -Source $source -Label 'pre-reader' `
+              -Needle "    `$preReaderSnapshot = Get-HmsCommittedScriptSnapshot -RepoRoot `$InstallRoot -Head `$preUpdateHead -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Label 'Pre-update composite module-state reader'" `
+              -Replacement "    `$preReaderSnapshot = Get-HmsCommittedScriptSnapshot -RepoRoot `$InstallRoot -Head `$preUpdateHead -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Label 'Pre-update composite module-state reader'`r`n    Write-Output 'DIAG_UPDATE_AFTER_PRE_READER'"
+            $source = Add-ExactMarker -Source $source -Label 'module-state' `
+              -Needle '    $state = Get-ModuleState -ReaderScript $preReaderSnapshot.ScriptBlock' `
+              -Replacement "    `$state = Get-ModuleState -ReaderScript `$preReaderSnapshot.ScriptBlock`r`n    Write-Output 'DIAG_UPDATE_AFTER_MODULE_STATE'"
+            $source = Add-ExactMarker -Source $source -Label 'taste-preflight' `
+              -Needle "    if (-not `$SkipTaste) { Assert-ExistingPinnedSourceClean -Path `$TasteRoot -Label 'GPT Taste' }" `
+              -Replacement "    Write-Output 'DIAG_UPDATE_BEFORE_TASTE_PREFLIGHT'`r`n    if (-not `$SkipTaste) { Assert-ExistingPinnedSourceClean -Path `$TasteRoot -Label 'GPT Taste' }`r`n    Write-Output 'DIAG_UPDATE_AFTER_TASTE_PREFLIGHT'"
+
+            $instrumentedUpdate = Join-Path $env:RUNNER_TEMP 'update-instrumented.ps1'
+            [IO.File]::WriteAllText($instrumentedUpdate,$source,(New-Object Text.UTF8Encoding($false)))
+            $parseErrors = $null
+            $null = [Management.Automation.Language.Parser]::ParseFile($instrumentedUpdate,[ref]$null,[ref]$parseErrors)
+            if (@($parseErrors).Count -ne 0) { throw ('Instrumented updater parse errors: ' + (($parseErrors | ForEach-Object Message) -join '; ')) }
+
             $parentMutex = New-Object System.Threading.Mutex($false,$mutexName)
-            $parentOwned=$false
-            $updateJob=$null
+            $parentOwned = $false
+            $updateJob = $null
             try {
-              $parentOwned=$parentMutex.WaitOne([TimeSpan]::FromSeconds(15))
+              $parentOwned = $parentMutex.WaitOne([TimeSpan]::FromSeconds(15))
               if (-not $parentOwned) { throw 'Parent could not acquire mutex before updater diagnostic.' }
               Write-Host 'PARENT_MUTEX_ACQUIRED'
-              $updatePath = Join-Path $root 'update.ps1'
               $updateJob = Start-Job -ScriptBlock {
                 param($Path,$Install)
-                $ErrorActionPreference='Stop'
-                Write-Output "UPDATE_CHILD_START:$([DateTime]::UtcNow.ToString('o'))"
+                $ErrorActionPreference = 'Stop'
+                Write-Output ('UPDATE_CHILD_START={0}' -f [DateTime]::UtcNow.ToString('o'))
                 try { & $Path -InstallRoot $Install -SkipCodeGraph -SkipThreeLevelDelivery }
-                catch { Write-Output "UPDATE_CHILD_EXCEPTION:$($_.Exception.Message)"; throw }
-              } -ArgumentList $updatePath,$root
+                catch { Write-Output ('UPDATE_CHILD_EXCEPTION={0}' -f $_.Exception.Message); throw }
+              } -ArgumentList $instrumentedUpdate,$root
+
               Start-Sleep -Seconds 3
-              Write-Host "UPDATE_CHILD_HELD_STATE:$($updateJob.State)"
-              $parentMutex.ReleaseMutex(); $parentOwned=$false
+              Receive-Job $updateJob -ErrorAction Continue 2>&1 | ForEach-Object { Write-Host $_ }
+              Write-Host ('UPDATE_CHILD_HELD_STATE={0}' -f $updateJob.State)
+              $parentMutex.ReleaseMutex(); $parentOwned = $false
               Write-Host 'PARENT_MUTEX_RELEASED'
-              $deadline=[DateTime]::UtcNow.AddSeconds(30)
+
+              $deadline = [DateTime]::UtcNow.AddSeconds(20)
               while ([DateTime]::UtcNow -lt $deadline -and $updateJob.State -in @('Running','NotStarted')) {
                 Receive-Job $updateJob -ErrorAction Continue 2>&1 | ForEach-Object { Write-Host $_ }
-                Start-Sleep -Milliseconds 250
+                Start-Sleep -Milliseconds 200
               }
               Receive-Job $updateJob -ErrorAction Continue 2>&1 | ForEach-Object { Write-Host $_ }
-              Write-Host "UPDATE_CHILD_FINAL_STATE:$($updateJob.State)"
+              Write-Host ('UPDATE_CHILD_FINAL_STATE={0}' -f $updateJob.State)
+              if ($updateJob.State -in @('Running','NotStarted')) { Write-Host 'DIAG_UPDATER_STILL_BLOCKED_AFTER_20S' }
             }
             finally {
               if ($parentOwned) { try { $parentMutex.ReleaseMutex() } catch {} }
@@ -122,11 +131,8 @@ jobs:
               if ($null -ne $updateJob) { Remove-Job $updateJob -Force -ErrorAction SilentlyContinue }
               & git -C $tasteRoot restore --worktree -- $tasteRel
             }
-
-            Write-Host "DIAG_AFTER_INSTALL=$afterInstall"
-            Write-Host "DIAG_AFTER_ROLLBACK=$afterRollback"
           }
           finally {
-            $env:HOME=$oldHome
-            $env:CODEX_HOME=$oldCodexHome
+            $env:HOME = $oldHome
+            $env:CODEX_HOME = $oldCodexHome
           }
