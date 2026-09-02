@@ -131,22 +131,33 @@ try {
     $parsedSuperLock = $superLock.Text | ConvertFrom-Json
     if ([string]$parsedSuperLock.repository -cne 'https://github.com/obra/superpowers.git') { throw 'Committed Superpowers lock snapshot was not used.' }
 
+    # Builder has an additional stricter source-integrity gate. Its committed bootstrap must execute
+    # (not the injected live pathname) and then fail closed because the source checkout is dirty.
     $builder = Get-HmsCommittedScriptSnapshot -RepoRoot $RepoRoot -Head $head -RelativePath 'scripts/Build-HmsCompositeSkill.ps1' -Label 'Adversarial composite builder'
-    & $builder.ScriptBlock `
-        -InstallRoot $RepoRoot `
-        -OutputRoot $outputRoot `
-        -SkillsRoot $skillsRoot `
-        -Hms $false `
-        -Superpowers $false `
-        -Taste $false `
-        -Impeccable $false `
-        -TrustedRepoRoot $RepoRoot `
-        -TrustedHead $head `
-        -TrustedBootstrapBlob ([string]$builder.Sha)
+    $builderRejectedDirty = $false
+    try {
+        & $builder.ScriptBlock `
+            -InstallRoot $RepoRoot `
+            -OutputRoot $outputRoot `
+            -SkillsRoot $skillsRoot `
+            -Hms $false `
+            -Superpowers $false `
+            -Taste $false `
+            -Impeccable $false `
+            -TrustedRepoRoot $RepoRoot `
+            -TrustedHead $head `
+            -TrustedBootstrapBlob ([string]$builder.Sha)
+    }
+    catch {
+        $message = $_.Exception.Message
+        if ($message -match 'HMS_LIVE_HELPER_INJECTION_EXECUTED') { throw 'Injected live builder bytes executed before authenticated source rejection.' }
+        if ($message -match 'source is dirty; refusing to compile unreviewed bytes') { $builderRejectedDirty = $true }
+        else { throw }
+    }
+    if (-not $builderRejectedDirty) { throw 'Authenticated builder did not fail closed on post-capture dirty source.' }
+    if (Test-Path -LiteralPath (Join-Path $outputRoot 'hms-superpowers\manifest.json')) { throw 'Dirty-source builder rejection unexpectedly published a composite.' }
 
-    $builtManifest = Join-Path $outputRoot 'hms-superpowers\manifest.json'
-    if (-not (Test-Path -LiteralPath $builtManifest -PathType Leaf)) { throw 'Committed builder snapshot did not produce the expected isolated composite.' }
-    Write-Host 'PASS: post-HEAD live helper and lock injection cannot execute or influence committed lifecycle snapshots.'
+    Write-Host 'PASS: post-HEAD live reader/UI/delivery/lock injection cannot execute or influence committed lifecycle snapshots; builder rejects the dirty source before publication.'
 }
 finally {
     $env:HOME = $oldHome
