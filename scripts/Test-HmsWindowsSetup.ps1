@@ -118,6 +118,44 @@ if ($Scope -in @('All','Lifecycle')) {
         }
     }
 
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $gitCommand = @((Get-Command git.exe -CommandType Application -ErrorAction Stop))[0]
+        $gitExe = [string]$gitCommand.Source
+        $targetEolRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-lifecycle-target-eol-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $targetEolRoot -Force | Out-Null
+        try {
+            Copy-Item -LiteralPath (Join-Path $RepoRoot '.gitattributes') -Destination (Join-Path $targetEolRoot '.gitattributes')
+            foreach ($relative in @('install.ps1','update.ps1','uninstall.ps1')) {
+                $sourcePath = Join-Path $RepoRoot $relative
+                $sourceText = [IO.File]::ReadAllText($sourcePath).Replace("`r`n","`n").Replace("`r","`n")
+                [IO.File]::WriteAllText((Join-Path $targetEolRoot $relative),$sourceText,(New-Object Text.UTF8Encoding($false)))
+            }
+            & $gitExe -C $targetEolRoot init --initial-branch=main 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to initialize lifecycle target EOL regression repository.' }
+            & $gitExe -C $targetEolRoot config core.autocrlf true
+            & $gitExe -C $targetEolRoot config user.name 'HMS Regression'
+            & $gitExe -C $targetEolRoot config user.email 'hms-regression@example.invalid'
+            & $gitExe -C $targetEolRoot add -- .gitattributes install.ps1 update.ps1 uninstall.ps1
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to stage lifecycle target EOL regression fixture.' }
+            & $gitExe -C $targetEolRoot commit -m 'fixture' 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to commit lifecycle target EOL regression fixture.' }
+            foreach ($relative in @('install.ps1','update.ps1','uninstall.ps1')) {
+                Remove-Item -LiteralPath (Join-Path $targetEolRoot $relative) -Force
+            }
+            & $gitExe -C $targetEolRoot checkout -- install.ps1 update.ps1 uninstall.ps1 2>$null
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to restore lifecycle target EOL regression fixture.' }
+            foreach ($relative in @('install.ps1','update.ps1','uninstall.ps1')) {
+                $expected = ((& $gitExe -C $targetEolRoot rev-parse ('HEAD:' + $relative) 2>$null) -join '').Trim().ToLowerInvariant()
+                $actual = ((& $gitExe -C $targetEolRoot hash-object --no-filters -- $relative 2>$null) -join '').Trim().ToLowerInvariant()
+                if ($LASTEXITCODE -ne 0 -or $actual -notmatch '^[0-9a-f]{40}$') { throw "Unable to hash restored authenticated lifecycle target bytes: $relative" }
+                if ($actual -cne $expected) {
+                    throw "Authenticated lifecycle target checkout bytes must remain literal under Windows core.autocrlf=true: $relative. Expected $expected, found $actual."
+                }
+            }
+        }
+        finally { Remove-Item -LiteralPath $targetEolRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
     if ($Scope -eq 'Lifecycle') {
         Write-Host 'PASS: HMS authenticated lifecycle launcher static contract is satisfied.'
         return
