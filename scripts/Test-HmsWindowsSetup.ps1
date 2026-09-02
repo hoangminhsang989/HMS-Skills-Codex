@@ -266,6 +266,58 @@ if (`$result -notmatch 'fake-output') { throw "Invoke-HmsGit lost stdout from an
         finally { Remove-Item -LiteralPath $hashTestRoot -Recurse -Force -ErrorAction SilentlyContinue }
     }
 
+    # The committed composite implementation executes under Windows PowerShell 5.1 during Setup repair.
+    # Trust-critical composite tree hashing must not depend on optional/module-autoload cmdlets.
+    $compositeImplPath = Join-Path $RepoRoot 'scripts\Build-HmsCompositeSkill.impl.ps1'
+    if (-not (Test-Path -LiteralPath $compositeImplPath -PathType Leaf)) { throw 'Composite implementation script is missing.' }
+    $compositeTokens = $null
+    $compositeParseErrors = $null
+    $compositeAst = [System.Management.Automation.Language.Parser]::ParseFile($compositeImplPath,[ref]$compositeTokens,[ref]$compositeParseErrors)
+    if ($compositeParseErrors.Count -ne 0) { throw "Composite implementation PowerShell parse failed: $($compositeParseErrors[0].Message)" }
+    $compositeHashFunctions = @($compositeAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-HmsCompositeFileSha256'
+    },$true))
+    if ($compositeHashFunctions.Count -ne 1) {
+        throw "Trusted composite implementation must define exactly one PS5.1-safe Get-HmsCompositeFileSha256 helper; found $($compositeHashFunctions.Count)."
+    }
+    $compositeImplText = [IO.File]::ReadAllText($compositeImplPath)
+    if ($compositeImplText -match '(?i)\bGet-FileHash\b') {
+        throw 'Trusted composite implementation must not depend on Get-FileHash because supported Windows PowerShell 5.1 hosts may not provide that cmdlet.'
+    }
+
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $hashTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-ps51-composite-hash-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $hashTestRoot | Out-Null
+        try {
+            $payload = Join-Path $hashTestRoot 'payload.bin'
+            $probe = Join-Path $hashTestRoot 'probe.ps1'
+            $stdout = Join-Path $hashTestRoot 'stdout.log'
+            $stderr = Join-Path $hashTestRoot 'stderr.log'
+            [IO.File]::WriteAllBytes($payload,[byte[]](9,8,7,6,5,4,3,2,1,0,255))
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try { $expected = (($sha.ComputeHash([IO.File]::ReadAllBytes($payload)) | ForEach-Object { $_.ToString('x2') }) -join '') }
+            finally { $sha.Dispose() }
+            $helperText = $compositeHashFunctions[0].Extent.Text
+            $payloadLiteral = $payload.Replace("'","''")
+            $probeLines = @(
+                'Set-StrictMode -Version Latest',
+                '$ErrorActionPreference = ''Stop''',
+                $helperText,
+                ("`$actual = Get-HmsCompositeFileSha256 -Path '{0}'" -f $payloadLiteral),
+                ("if (`$actual -cne '{0}') {{ throw ('PS5.1 composite SHA-256 mismatch. Expected {0}, found ' + `$actual) }}" -f $expected)
+            )
+            [IO.File]::WriteAllLines($probe,[string[]]$probeLines,(New-Object Text.UTF8Encoding($false)))
+            $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+            $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"' + $probe + '"')) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
+            if ($proc.ExitCode -ne 0) {
+                $failure = if (Test-Path -LiteralPath $stderr) { [IO.File]::ReadAllText($stderr).Trim() } else { '' }
+                throw "Trusted composite SHA-256 helper must run under Windows PowerShell 5.1. Exit=$($proc.ExitCode) Error=$failure"
+            }
+        }
+        finally { Remove-Item -LiteralPath $hashTestRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
     if ($Scope -eq 'Bootstrap') {
         Write-Host 'PASS: HMS setup bootstrap static contract is satisfied.'
         return
