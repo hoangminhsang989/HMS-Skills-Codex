@@ -98,8 +98,9 @@ try {
     }
     [IO.File]::WriteAllText($manifestPath,($manifest | ConvertTo-Json -Depth 5),(New-Object Text.UTF8Encoding($false)))
 
-    # HEAD is already captured above. Replace every cited live helper/lock after capture with bytes
-    # that would fail immediately if production reopened the mutable pathname.
+    # HEAD is already captured above. Replace every cited live helper after capture with bytes
+    # that fail immediately, and remove every live lock path entirely. Trusted execution must use
+    # only committed Git-object bytes/locks from the captured HEAD.
     foreach ($relative in @(
         'scripts/Read-HmsCompositeModuleState.ps1',
         'scripts/Sync-UiSkills.ps1',
@@ -112,7 +113,7 @@ try {
     }
     foreach ($relative in @('superpowers.lock.json','ui-skills.lock.json','delivery-tools.lock.json')) {
         $path = Join-Path $RepoRoot $relative.Replace('/',[IO.Path]::DirectorySeparatorChar)
-        [IO.File]::WriteAllText($path,'{"HMS_LIVE_LOCK_INJECTION":true}',(New-Object Text.UTF8Encoding($false)))
+        Remove-Item -LiteralPath $path -Force
     }
 
     $reader = Get-HmsCommittedScriptSnapshot -RepoRoot $RepoRoot -Head $head -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Label 'Adversarial module-state reader'
@@ -157,7 +158,7 @@ try {
     if (-not $builderRejectedDirty) { throw 'Authenticated builder did not fail closed on post-capture dirty source.' }
     if (Test-Path -LiteralPath (Join-Path $outputRoot 'hms-superpowers\manifest.json')) { throw 'Dirty-source builder rejection unexpectedly published a composite.' }
 
-    Write-Host 'PASS: post-HEAD live reader/UI/delivery/lock injection cannot execute or influence committed lifecycle snapshots; builder rejects the dirty source before publication.'
+    Write-Host 'PASS: post-HEAD live reader/UI/delivery injection and missing live locks cannot influence committed lifecycle snapshots; builder rejects dirty source before publication.'
 }
 finally {
     $env:HOME = $oldHome
