@@ -181,7 +181,13 @@ function Get-HmsLifecycleTrustBootstrap {
             $stderrTask = $proc.StandardError.ReadToEndAsync()
             if (-not $proc.WaitForExit(10000)) {
                 try { $proc.Kill() } catch {}
-                try { $proc.WaitForExit() } catch {}
+                $terminatedAfterKill = $false
+                try { $terminatedAfterKill = $proc.WaitForExit(2000) } catch {}
+                if (-not $terminatedAfterKill) {
+                    try { $proc.StandardOutput.BaseStream.Dispose() } catch {}
+                    try { $proc.StandardError.Dispose() } catch {}
+                    throw 'Lifecycle committed-blob git cat-file timed out after 10 seconds and did not terminate within 2 seconds after kill.'
+                }
                 throw 'Lifecycle trust bootstrap git cat-file timed out after 10 seconds.'
             }
             $null = $copyTask.GetAwaiter().GetResult()
