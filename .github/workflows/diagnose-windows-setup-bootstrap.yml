@@ -1,4 +1,4 @@
-name: Diagnose HMS Windows setup bootstrap
+name: Apply guarded HMS setup bootstrap parser fix
 
 on:
   push:
@@ -6,69 +6,81 @@ on:
       - stage/hms-superpowers-v0.3.0-windows-setup-menu
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  diagnose-bootstrap:
+  patch-bootstrap:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
-      - name: Checkout exact diagnostic SHA
+      - name: Checkout exact patch authority SHA
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
 
-      - name: Prove exact identity and generate candidate authority
+      - name: Apply one-byte-equivalent guarded parser repair
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $branchRef = 'refs/heads/stage/hms-superpowers-v0.3.0-windows-setup-menu'
+          $expectedBlob = 'a36caa4bfac016eca515d3c11d0e342ad4de7547'
           $head = (& git rev-parse HEAD).Trim().ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $head -cne '${{ github.sha }}'.ToLowerInvariant()) { throw "Diagnostic checkout mismatch: $head" }
-          $tree = (& git rev-parse 'HEAD^{tree}').Trim().ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $tree -notmatch '^[0-9a-f]{40}$') { throw "Diagnostic tree capture failed: $tree" }
-          $sourceRef = 'refs/heads/stage/hms-superpowers-v0.3.0-windows-setup-menu'
-          $remoteLine = ((& git ls-remote origin $sourceRef) -join "`n").Trim()
-          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($remoteLine)) { throw 'Unable to resolve diagnostic source ref.' }
+          if ($LASTEXITCODE -ne 0 -or $head -cne '${{ github.sha }}'.ToLowerInvariant()) { throw "Patch checkout mismatch: $head" }
+          $remoteLine = ((& git ls-remote origin $branchRef) -join "`n").Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($remoteLine)) { throw 'Unable to resolve canonical patch branch.' }
           $remoteSha = (($remoteLine -split '\s+')[0]).ToLowerInvariant()
-          if ($remoteSha -cne $head) { throw "Diagnostic source ref moved. Expected $head, found $remoteSha" }
-          $generated = Join-Path $env:RUNNER_TEMP 'hms-bootstrap-diagnostic'
-          New-Item -ItemType Directory -Path $generated | Out-Null
-          $authorityPath = Join-Path $generated 'setup-authority.json'
-          $authority = [ordered]@{
-            schema_version = 1
-            product_version = '0.3.0'
-            mode = 'candidate'
-            repository = 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
-            source_ref = $sourceRef
-            commit = $head
-            tree = $tree
-            release_tag = $null
-          }
-          [IO.File]::WriteAllText($authorityPath, ($authority | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false)))
-          "AUTHORITY_PATH=$authorityPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "PASS: diagnostic authority HEAD=$head TREE=$tree"
+          if ($remoteSha -cne $head) { throw "Patch branch moved. Expected $head, found $remoteSha" }
 
-      - name: Execute committed bootstrap and expose exact failure
+          $bootstrap = Join-Path $env:GITHUB_WORKSPACE 'installer\Invoke-HmsSetupBootstrap.ps1'
+          $blob = (& git rev-parse 'HEAD:installer/Invoke-HmsSetupBootstrap.ps1').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $blob -cne $expectedBlob) { throw "Bootstrap blob authority mismatch. Expected $expectedBlob, found $blob" }
+          $workingBlob = (& git hash-object -- $bootstrap).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $workingBlob -cne $expectedBlob) { throw "Checked-out bootstrap bytes differ from committed authority blob: $workingBlob" }
+
+          $old = [Text.Encoding]::UTF8.GetBytes("if (-not (Test-HmsPinnedCodexExecutable -Path `$finalExe -ExpectedSha256 ([string]`$Lock.exe_sha256)) { throw 'Pinned Codex fallback failed its executable/version smoke check.' }")
+          $new = [Text.Encoding]::UTF8.GetBytes("if (-not (Test-HmsPinnedCodexExecutable -Path `$finalExe -ExpectedSha256 ([string]`$Lock.exe_sha256))) { throw 'Pinned Codex fallback failed its executable/version smoke check.' }")
+          $bytes = [IO.File]::ReadAllBytes($bootstrap)
+          $text = [Text.Encoding]::UTF8.GetString($bytes)
+          $oldText = [Text.Encoding]::UTF8.GetString($old)
+          $newText = [Text.Encoding]::UTF8.GetString($new)
+          $matches = [regex]::Matches($text, [regex]::Escape($oldText)).Count
+          if ($matches -ne 1) { throw "Expected exactly one malformed Codex parser expression; found $matches." }
+          $patched = $text.Replace($oldText, $newText)
+          [IO.File]::WriteAllBytes($bootstrap, [Text.Encoding]::UTF8.GetBytes($patched))
+
+          $tokens = $null
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile($bootstrap, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -ne 0) { throw "Patched bootstrap still fails PowerShell parser: $($errors[0].Message)" }
+          ./scripts/Test-HmsWindowsSetup.ps1 -Scope Bootstrap
+          if ($LASTEXITCODE -ne 0) { throw 'Permanent bootstrap regression test failed after parser repair.' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff --check failed after parser repair.' }
+          $changed = @(& git diff --name-only)
+          if ($changed.Count -ne 1 -or $changed[0] -cne 'installer/Invoke-HmsSetupBootstrap.ps1') { throw "Parser repair changed unexpected paths: $($changed -join ', ')" }
+          $diff = (& git diff --unified=0 -- installer/Invoke-HmsSetupBootstrap.ps1) -join "`n"
+          if ($diff -notmatch [regex]::Escape("exe_sha256))) {")) { throw 'Expected closing-parenthesis repair is absent from diff.' }
+          Write-Host 'PASS: exact bootstrap blob received the single parser repair and permanent regression test is green.'
+
+      - name: Commit guarded parser repair to successor branch
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
-          $bootstrap = Join-Path $env:GITHUB_WORKSPACE 'installer\Invoke-HmsSetupBootstrap.ps1'
-          $toolsLock = Join-Path $env:GITHUB_WORKSPACE 'installer\setup-tools.lock.json'
-          $stdout = Join-Path $env:RUNNER_TEMP 'hms-bootstrap.stdout.log'
-          $stderr = Join-Path $env:RUNNER_TEMP 'hms-bootstrap.stderr.log'
-          $arguments = @(
-            '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"' + $bootstrap + '"'),
-            '-AuthorityPath',('"' + $env:AUTHORITY_PATH + '"'),
-            '-ToolsLockPath',('"' + $toolsLock + '"'),
-            '-Mode','Install'
-          )
-          $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList $arguments -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
-          Write-Host "BOOTSTRAP_EXIT=$($proc.ExitCode)"
-          Write-Host '=== BOOTSTRAP STDOUT ==='
-          if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -Raw | Write-Host }
-          Write-Host '=== BOOTSTRAP STDERR ==='
-          if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Raw | Write-Host }
-          if ($proc.ExitCode -eq 0) { throw 'Diagnostic expected the previously reproduced bootstrap failure, but bootstrap succeeded.' }
-          throw "Diagnostic captured bootstrap exit $($proc.ExitCode); inspect stderr above for the root exception."
+          $branch = 'stage/hms-superpowers-v0.3.0-windows-setup-menu'
+          $branchRef = 'refs/heads/' + $branch
+          $head = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+          $remoteLine = ((& git ls-remote origin $branchRef) -join "`n").Trim()
+          $remoteSha = (($remoteLine -split '\s+')[0]).ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $remoteSha -cne $head) { throw "Successor branch moved before parser repair push. Expected $head, found $remoteSha" }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- installer/Invoke-HmsSetupBootstrap.ps1
+          git commit -m 'fix: close setup bootstrap Codex parser expression'
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to commit guarded bootstrap parser repair.' }
+          $newHead = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+          git push origin ("HEAD:refs/heads/" + $branch)
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to fast-forward successor branch with parser repair.' }
+          $after = (((& git ls-remote origin $branchRef) -join "`n").Trim() -split '\s+')[0].ToLowerInvariant()
+          if ($after -cne $newHead) { throw "Remote successor branch did not land on parser repair commit. Expected $newHead, found $after" }
+          Write-Host "PASS: guarded parser repair published as $newHead"
