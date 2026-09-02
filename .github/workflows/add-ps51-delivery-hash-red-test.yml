@@ -81,7 +81,7 @@ jobs:
                           '$ErrorActionPreference = ''Stop''',
                           $helperText,
                           ("`$actual = Get-HmsDeliveryFileSha256 -Path '{0}'" -f $payloadLiteral),
-                          ("if (`$actual -cne '{0}') {{ throw \"PS5.1 delivery SHA-256 mismatch. Expected {0}, found `$actual\" }}" -f $expected)
+                          ("if (`$actual -cne '{0}') {{ throw ('PS5.1 delivery SHA-256 mismatch. Expected {0}, found ' + `$actual) }}" -f $expected)
                       )
                       [IO.File]::WriteAllLines($probe,[string[]]$probeLines,(New-Object Text.UTF8Encoding($false)))
                       $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
