@@ -1,0 +1,144 @@
+name: TMP remediate bounded post-kill 15a778
+
+on:
+  push:
+    branches:
+      - remediate/bounded-post-kill-15a778
+
+permissions:
+  contents: write
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact temp author head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+
+      - name: Verify temp author base
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+          $parent = (& git rev-parse HEAD^).Trim().ToLowerInvariant()
+          Write-Host "TEMP_AUTHOR_HEAD=$head"
+          Write-Host "TEMP_AUTHOR_PARENT=$parent"
+          if ($parent -cne '15a778d7b1f2d7ed7eb429a1ae1eb31a0531b621') { throw "Unexpected remediation base: $parent" }
+          $delta = @(& git diff --name-only HEAD^ HEAD)
+          if ($LASTEXITCODE -ne 0 -or $delta.Count -ne 1 -or $delta[0] -cne '.github/workflows/tmp-remediate-bounded-post-kill-15a778.yml') {
+            throw "Temp author bootstrap scope mismatch: $($delta -join ', ')"
+          }
+          Write-Host 'TEMP_AUTHOR_BASE=PASS'
+
+      - name: Patch exact P1 and permanent regression
+        shell: python
+        run: |
+          from pathlib import Path
+
+          targets = [
+              Path('install.ps1'),
+              Path('update.ps1'),
+              Path('scripts/Initialize-HmsLifecycleTrust.ps1'),
+          ]
+          old = """                try { $proc.Kill() } catch {}\n                try { $proc.WaitForExit() } catch {}\n"""
+          new = """                try { $proc.Kill() } catch {}\n                $terminatedAfterKill = $false\n                try { $terminatedAfterKill = $proc.WaitForExit(2000) } catch {}\n                if (-not $terminatedAfterKill) {\n                    try { $proc.StandardOutput.BaseStream.Dispose() } catch {}\n                    try { $proc.StandardError.Dispose() } catch {}\n                    throw 'Lifecycle committed-blob git cat-file timed out after 10 seconds and did not terminate within 2 seconds after kill.'\n                }\n"""
+          for path in targets:
+              text = path.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected exactly one unbounded post-kill wait, found {count}')
+              path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+
+          test_path = Path('scripts/Test-HmsLifecycleSnapshotTrust.ps1')
+          text = test_path.read_text(encoding='utf-8')
+          anchor = "$updateText = [IO.File]::ReadAllText($updatePath)\n"
+          if text.count(anchor) != 1:
+              raise SystemExit('lifecycle snapshot test anchor mismatch')
+          contract = r'''$trustPath = Join-Path $RepoRoot 'scripts\Initialize-HmsLifecycleTrust.ps1'
+          $trustText = [IO.File]::ReadAllText($trustPath)
+          foreach ($source in @(
+              [pscustomobject]@{ Name='install.ps1'; Text=$installText },
+              [pscustomobject]@{ Name='update.ps1'; Text=$updateText },
+              [pscustomobject]@{ Name='scripts/Initialize-HmsLifecycleTrust.ps1'; Text=$trustText }
+          )) {
+              if ([string]$source.Text -match [regex]::Escape('try { $proc.WaitForExit() } catch {}')) {
+                  throw "$($source.Name) reintroduced an unbounded post-kill WaitForExit()."
+              }
+              foreach ($required in @(
+                  '$terminatedAfterKill = $false',
+                  '$proc.WaitForExit(2000)',
+                  'if (-not $terminatedAfterKill)',
+                  '$proc.StandardOutput.BaseStream.Dispose()',
+                  '$proc.StandardError.Dispose()'
+              )) {
+                  if ([string]$source.Text -notmatch [regex]::Escape($required)) {
+                      throw "$($source.Name) is missing bounded post-kill lifecycle contract: $required"
+                  }
+              }
+          }
+          Write-Host 'PASS: non-Windows committed-blob post-kill wait is bounded and pipe handles are closed on failed termination.'
+          '''
+          text = text.replace(anchor, anchor + contract)
+          test_path.write_text(text, encoding='utf-8', newline='\n')
+
+      - name: Parse and qualify exact patched files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = @(
+            'install.ps1',
+            'scripts/Initialize-HmsLifecycleTrust.ps1',
+            'scripts/Test-HmsLifecycleSnapshotTrust.ps1',
+            'update.ps1'
+          )
+          $changed = @(& git diff --name-only | Sort-Object)
+          if ($LASTEXITCODE -ne 0 -or ($changed -join "`n") -cne ($expected -join "`n")) {
+            throw "Patch scope mismatch: $($changed -join ', ')"
+          }
+          foreach ($relative in $expected) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $relative),[ref]$tokens,[ref]$errors)
+            if (@($errors).Count -ne 0) { throw "Parser failed for $relative : $($errors -join '; ')" }
+          }
+          & git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff --check failed.' }
+          Write-Host 'PATCH_SCOPE=PASS_EXACT_4'
+          Write-Host 'PARSER_4_OF_4=PASS'
+
+      - name: Run full HMS skills suite on non-Windows path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/Test-HmsSkills.ps1
+          Write-Host 'LINUX_TEST_HMS_SKILLS=PASS'
+
+      - name: Commit qualified temp remediation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = @(
+            'install.ps1',
+            'scripts/Initialize-HmsLifecycleTrust.ps1',
+            'scripts/Test-HmsLifecycleSnapshotTrust.ps1',
+            'update.ps1'
+          )
+          & git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Final git diff --check failed.' }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- $expected
+          $staged = @(& git diff --cached --name-only | Sort-Object)
+          if (($staged -join "`n") -cne ($expected -join "`n")) { throw "Staged scope mismatch: $($staged -join ', ')" }
+          git commit -m 'Bound non-Windows post-kill wait'
+          if ($LASTEXITCODE -ne 0) { throw 'Temp remediation commit failed.' }
+          $commit = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+          $tree = (& git rev-parse HEAD^{tree}).Trim().ToLowerInvariant()
+          Write-Host "TEMP_REMEDIATION_COMMIT=$commit"
+          Write-Host "TEMP_REMEDIATION_TREE=$tree"
+          git push origin HEAD:remediate/bounded-post-kill-15a778
+          if ($LASTEXITCODE -ne 0) { throw 'Temp remediation push failed.' }
+          Write-Host 'TEMP_REMEDIATION_PUSH=PASS'
