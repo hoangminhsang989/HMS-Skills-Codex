@@ -11,7 +11,7 @@ permissions:
 jobs:
   windows-mutex-diag:
     runs-on: windows-2025
-    timeout-minutes: 15
+    timeout-minutes: 8
     env:
       CANDIDATE_SHA: 3537c42f4ce8672491d51f077e5de3854bb5d354
     steps:
@@ -21,125 +21,83 @@ jobs:
           ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 1
 
-      - name: Localize updater phase after mutex release
+      - name: Compare sequential and concurrent committed-blob drains inside Start-Job
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $root = $env:GITHUB_WORKSPACE
-          $runnerHome = $env:USERPROFILE
-          $oldHome = $env:HOME
-          $oldCodexHome = $env:CODEX_HOME
-          $mutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
+          $relative = 'scripts/Initialize-HmsLifecycleTrust.ps1'
+          $head = $env:CANDIDATE_SHA.ToLowerInvariant()
+          $expected = ((& git -C $root rev-parse "$head`:$relative" 2>$null) -join '').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $expected -notmatch '^[0-9a-f]{40}$') { throw 'Bootstrap blob lookup failed.' }
+          Write-Host "BOOTSTRAP_BLOB=$expected"
 
-          function Insert-ExactMarkerAfter {
-            param(
-              [Parameter(Mandatory)][string]$Source,
-              [Parameter(Mandatory)][string]$Needle,
-              [Parameter(Mandatory)][string]$Marker,
-              [Parameter(Mandatory)][string]$Label
-            )
-            $count = [regex]::Matches($Source,[regex]::Escape($Needle)).Count
-            if ($count -ne 1) { throw ('Instrument anchor {0} expected exactly once, found {1}.' -f $Label,$count) }
-            $nl = if ($Source.Contains("`r`n")) { "`r`n" } else { "`n" }
-            return $Source.Replace($Needle,($Needle + $nl + "    Write-Output '$Marker'"))
-          }
-
-          function Insert-ExactMarkerBefore {
-            param(
-              [Parameter(Mandatory)][string]$Source,
-              [Parameter(Mandatory)][string]$Needle,
-              [Parameter(Mandatory)][string]$Marker,
-              [Parameter(Mandatory)][string]$Label
-            )
-            $count = [regex]::Matches($Source,[regex]::Escape($Needle)).Count
-            if ($count -ne 1) { throw ('Instrument anchor {0} expected exactly once, found {1}.' -f $Label,$count) }
-            $nl = if ($Source.Contains("`r`n")) { "`r`n" } else { "`n" }
-            return $Source.Replace($Needle,("    Write-Output '$Marker'" + $nl + $Needle))
-          }
-
-          try {
-            $env:HOME = $runnerHome
-            $env:CODEX_HOME = Join-Path $runnerHome '.codex'
-
-            & (Join-Path $root 'install.ps1') -InstallRoot $root -SkipCodeGraph -SkipThreeLevelDelivery
-
-            $builder = Join-Path $root 'scripts\Build-HmsCompositeSkill.ps1'
-            $rollbackObserved = $false
+          $syncJob = Start-Job -ScriptBlock {
+            param($RepoRoot,$Blob)
+            $ErrorActionPreference='Stop'
+            $psi=New-Object Diagnostics.ProcessStartInfo
+            $psi.FileName='git'
+            $psi.Arguments="cat-file blob $Blob"
+            $psi.WorkingDirectory=$RepoRoot
+            $psi.UseShellExecute=$false
+            $psi.RedirectStandardOutput=$true
+            $psi.RedirectStandardError=$true
+            $psi.CreateNoWindow=$true
+            $proc=New-Object Diagnostics.Process
+            $proc.StartInfo=$psi
+            $memory=New-Object IO.MemoryStream
             try {
-              $env:HMS_TEST_FAIL_STAGE_ACTIVATION = '1'
-              & $builder -InstallRoot $root -Hms $true -Superpowers $true -Taste $true -Impeccable $true
+              if (-not $proc.Start()) { throw 'sync start failed' }
+              Write-Output 'SYNC_AFTER_START'
+              $proc.StandardOutput.BaseStream.CopyTo($memory)
+              Write-Output ('SYNC_AFTER_STDOUT={0}' -f $memory.Length)
+              $stderr=$proc.StandardError.ReadToEnd()
+              Write-Output ('SYNC_AFTER_STDERR={0}' -f $stderr.Length)
+              $proc.WaitForExit()
+              Write-Output ('SYNC_EXIT={0}' -f $proc.ExitCode)
             }
-            catch {
-              Write-Host ('ROLLBACK_EXCEPTION={0}' -f $_.Exception.Message)
-              if ($_.Exception.Message -match 'Injected staged-root activation failure') { $rollbackObserved = $true } else { throw }
-            }
-            finally { Remove-Item Env:HMS_TEST_FAIL_STAGE_ACTIVATION -ErrorAction SilentlyContinue }
-            if (-not $rollbackObserved) { throw 'Expected rollback branch was not observed.' }
+            finally { $memory.Dispose(); $proc.Dispose() }
+          } -ArgumentList $root,$expected
 
-            $uiLock = Get-Content -LiteralPath (Join-Path $root 'ui-skills.lock.json') -Raw | ConvertFrom-Json
-            $tasteRoot = Join-Path $runnerHome '.codex\taste-skill'
-            $tasteRel = ([string]$uiLock.taste.skill_path).TrimEnd('/') + '/SKILL.md'
-            $tastePath = Join-Path $tasteRoot ($tasteRel.Replace('/','\'))
-            Add-Content -LiteralPath $tastePath -Value "`n<!-- HMS DIAG dirty Taste -->"
+          $null=Wait-Job $syncJob -Timeout 12
+          Receive-Job $syncJob -ErrorAction Continue 2>&1 | ForEach-Object { Write-Host $_ }
+          Write-Host "SYNC_JOB_STATE=$($syncJob.State)"
+          if ($syncJob.State -in @('Running','NotStarted')) { Stop-Job $syncJob -ErrorAction SilentlyContinue }
+          Remove-Job $syncJob -Force -ErrorAction SilentlyContinue
 
-            $source = Get-Content -LiteralPath (Join-Path $root 'update.ps1') -Raw
-            $source = Insert-ExactMarkerAfter -Source $source -Label 'after-mutex' -Marker 'DIAG_UPDATE_AFTER_MUTEX' -Needle '    if (-not $mutexOwned) { throw "Timed out waiting for composite build lock: $BuildMutexName" }'
-            $source = Insert-ExactMarkerAfter -Source $source -Label 'pre-head' -Marker 'DIAG_UPDATE_AFTER_PRE_HEAD' -Needle '    $preUpdateHead = Get-HmsCanonicalHead -Path $InstallRoot'
-            $source = Insert-ExactMarkerAfter -Source $source -Label 'pre-bootstrap' -Marker 'DIAG_UPDATE_AFTER_PRE_BOOTSTRAP' -Needle '    $preTrustBootstrap = Get-HmsLifecycleTrustBootstrap -RepoRoot $InstallRoot -Head $preUpdateHead'
-            $source = Insert-ExactMarkerAfter -Source $source -Label 'pre-dot-source' -Marker 'DIAG_UPDATE_AFTER_PRE_DOTSOURCE' -Needle '    . $preTrustBootstrap.ScriptBlock'
-            $readerNeedle = "    `$preReaderSnapshot = Get-HmsCommittedScriptSnapshot -RepoRoot `$InstallRoot -Head `$preUpdateHead -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Label 'Pre-update composite module-state reader'"
-            $source = Insert-ExactMarkerAfter -Source $source -Label 'pre-reader' -Marker 'DIAG_UPDATE_AFTER_PRE_READER' -Needle $readerNeedle
-            $source = Insert-ExactMarkerAfter -Source $source -Label 'module-state' -Marker 'DIAG_UPDATE_AFTER_MODULE_STATE' -Needle '    $state = Get-ModuleState -ReaderScript $preReaderSnapshot.ScriptBlock'
-            $tasteNeedle = "    if (-not `$SkipTaste) { Assert-ExistingPinnedSourceClean -Path `$TasteRoot -Label 'GPT Taste' }"
-            $source = Insert-ExactMarkerBefore -Source $source -Label 'taste-preflight-before' -Marker 'DIAG_UPDATE_BEFORE_TASTE_PREFLIGHT' -Needle $tasteNeedle
-            $source = Insert-ExactMarkerAfter -Source $source -Label 'taste-preflight-after' -Marker 'DIAG_UPDATE_AFTER_TASTE_PREFLIGHT' -Needle $tasteNeedle
-
-            $instrumentedUpdate = Join-Path $env:RUNNER_TEMP 'update-instrumented.ps1'
-            [IO.File]::WriteAllText($instrumentedUpdate,$source,(New-Object Text.UTF8Encoding($false)))
-            $tokens = $null
-            $parseErrors = $null
-            $null = [Management.Automation.Language.Parser]::ParseFile($instrumentedUpdate,[ref]$tokens,[ref]$parseErrors)
-            if (@($parseErrors).Count -ne 0) { throw ('Instrumented updater parse errors: ' + (($parseErrors | ForEach-Object Message) -join '; ')) }
-            Write-Host 'DIAG_INSTRUMENTED_UPDATE_PARSE_PASS'
-
-            $parentMutex = New-Object System.Threading.Mutex($false,$mutexName)
-            $parentOwned = $false
-            $updateJob = $null
+          $asyncJob = Start-Job -ScriptBlock {
+            param($RepoRoot,$Blob)
+            $ErrorActionPreference='Stop'
+            $psi=New-Object Diagnostics.ProcessStartInfo
+            $psi.FileName='git'
+            $psi.Arguments="cat-file blob $Blob"
+            $psi.WorkingDirectory=$RepoRoot
+            $psi.UseShellExecute=$false
+            $psi.RedirectStandardOutput=$true
+            $psi.RedirectStandardError=$true
+            $psi.CreateNoWindow=$true
+            $proc=New-Object Diagnostics.Process
+            $proc.StartInfo=$psi
+            $memory=New-Object IO.MemoryStream
             try {
-              $parentOwned = $parentMutex.WaitOne([TimeSpan]::FromSeconds(15))
-              if (-not $parentOwned) { throw 'Parent could not acquire mutex before updater diagnostic.' }
-              Write-Host 'PARENT_MUTEX_ACQUIRED'
-              $updateJob = Start-Job -ScriptBlock {
-                param($Path,$Install)
-                $ErrorActionPreference = 'Stop'
-                Write-Output ('UPDATE_CHILD_START={0}' -f [DateTime]::UtcNow.ToString('o'))
-                try { & $Path -InstallRoot $Install -SkipCodeGraph -SkipThreeLevelDelivery }
-                catch { Write-Output ('UPDATE_CHILD_EXCEPTION={0}' -f $_.Exception.Message); throw }
-              } -ArgumentList $instrumentedUpdate,$root
-
-              Start-Sleep -Seconds 3
-              Receive-Job $updateJob -ErrorAction Continue 2>&1 | ForEach-Object { Write-Host $_ }
-              Write-Host ('UPDATE_CHILD_HELD_STATE={0}' -f $updateJob.State)
-              $parentMutex.ReleaseMutex(); $parentOwned = $false
-              Write-Host 'PARENT_MUTEX_RELEASED'
-
-              $deadline = [DateTime]::UtcNow.AddSeconds(20)
-              while ([DateTime]::UtcNow -lt $deadline -and $updateJob.State -in @('Running','NotStarted')) {
-                Receive-Job $updateJob -ErrorAction Continue 2>&1 | ForEach-Object { Write-Host $_ }
-                Start-Sleep -Milliseconds 200
-              }
-              Receive-Job $updateJob -ErrorAction Continue 2>&1 | ForEach-Object { Write-Host $_ }
-              Write-Host ('UPDATE_CHILD_FINAL_STATE={0}' -f $updateJob.State)
-              if ($updateJob.State -in @('Running','NotStarted')) { Write-Host 'DIAG_UPDATER_STILL_BLOCKED_AFTER_20S' }
+              if (-not $proc.Start()) { throw 'async start failed' }
+              Write-Output 'ASYNC_AFTER_START'
+              $stdoutTask=$proc.StandardOutput.BaseStream.CopyToAsync($memory)
+              $stderrTask=$proc.StandardError.ReadToEndAsync()
+              if (-not $proc.WaitForExit(15000)) { try { $proc.Kill($true) } catch {}; throw 'async git cat-file timeout' }
+              $stdoutTask.GetAwaiter().GetResult()
+              $stderr=$stderrTask.GetAwaiter().GetResult()
+              Write-Output ('ASYNC_AFTER_STDOUT={0}' -f $memory.Length)
+              Write-Output ('ASYNC_AFTER_STDERR={0}' -f $stderr.Length)
+              Write-Output ('ASYNC_EXIT={0}' -f $proc.ExitCode)
             }
-            finally {
-              if ($parentOwned) { try { $parentMutex.ReleaseMutex() } catch {} }
-              $parentMutex.Dispose()
-              if ($null -ne $updateJob) { Remove-Job $updateJob -Force -ErrorAction SilentlyContinue }
-              & git -C $tasteRoot restore --worktree -- $tasteRel
-            }
-          }
-          finally {
-            $env:HOME = $oldHome
-            $env:CODEX_HOME = $oldCodexHome
-          }
+            finally { $memory.Dispose(); $proc.Dispose() }
+          } -ArgumentList $root,$expected
+
+          $null=Wait-Job $asyncJob -Timeout 25
+          $asyncOutput=@(Receive-Job $asyncJob -ErrorAction Continue 2>&1)
+          $asyncOutput | ForEach-Object { Write-Host $_ }
+          Write-Host "ASYNC_JOB_STATE=$($asyncJob.State)"
+          if ($asyncJob.State -ne 'Completed') { throw 'Concurrent pipe drain did not complete in child job.' }
+          if (-not ($asyncOutput -match '^ASYNC_EXIT=0$')) { throw 'Concurrent pipe drain did not prove git exit 0.' }
+          Remove-Job $asyncJob -Force -ErrorAction SilentlyContinue
