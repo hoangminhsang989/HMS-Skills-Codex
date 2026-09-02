@@ -109,8 +109,10 @@ jobs:
           $combined = ((Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue) + "`n" + (Get-Content -LiteralPath $stderr -Raw -ErrorAction SilentlyContinue))
           Write-Host $combined
           if ($proc.ExitCode -eq 0) { throw 'RED contract unexpectedly passed before production remediation.' }
-          if ($combined -notmatch 'PS5\.1-safe Get-HmsDeliveryFileSha256 helper; found 0') {
-              throw 'RED contract failed for an unexpected reason.'
+          $plain = [regex]::Replace($combined,"`e\[[0-9;?]*[ -/]*[@-~]",'')
+          $normalized = ($plain -replace '\s+',' ').Trim()
+          if ($normalized -notmatch 'PS5\.1-safe Get-HmsDeliveryFileSha256 helper; found 0\.') {
+              throw "RED contract failed for an unexpected reason. Normalized output: $normalized"
           }
           Write-Host 'PASS: permanent regression is RED for the missing PS5.1-safe delivery SHA-256 helper.'
 
