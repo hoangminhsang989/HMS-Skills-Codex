@@ -23,4 +23,5 @@ foreach ($path in @($implementationPath,$remediationPath,$ownedTempCleanupPath,$
 & $rollbackIdentityPath -RepoRoot $RepoRoot
 & $lateTrustPath -RepoRoot $RepoRoot
 & $lifecycleSnapshotPath -RepoRoot $RepoRoot
+& $windowsSetupPath -RepoRoot $RepoRoot -Scope Lifecycle
 & $windowsSetupPath -RepoRoot $RepoRoot
