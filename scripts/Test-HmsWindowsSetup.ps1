@@ -69,6 +69,42 @@ if ($Scope -in @('All','Lifecycle')) {
         throw 'Lifecycle shim must not execute mutable lifecycle scripts through powershell -File.'
     }
 
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $gitCommand = @((Get-Command git.exe -CommandType Application -ErrorAction Stop))[0]
+        $gitExe = [string]$gitCommand.Source
+        $checkoutTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-lifecycle-eol-' + [guid]::NewGuid().ToString('N'))
+        $checkoutShimDir = Join-Path $checkoutTestRoot 'scripts'
+        $checkoutShimPath = Join-Path $checkoutShimDir 'Invoke-HmsLifecycleAction.ps1'
+        New-Item -ItemType Directory -Path $checkoutShimDir -Force | Out-Null
+        try {
+            $normalizedShim = $lifecycleShimText.Replace("`r`n","`n").Replace("`r","`n")
+            [IO.File]::WriteAllText($checkoutShimPath, $normalizedShim, (New-Object Text.UTF8Encoding($false)))
+            Copy-Item -LiteralPath (Join-Path $RepoRoot '.gitattributes') -Destination (Join-Path $checkoutTestRoot '.gitattributes')
+            & $gitExe -C $checkoutTestRoot init --initial-branch=main 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to initialize lifecycle EOL regression repository.' }
+            & $gitExe -C $checkoutTestRoot config core.autocrlf true
+            & $gitExe -C $checkoutTestRoot config user.name 'HMS Regression'
+            & $gitExe -C $checkoutTestRoot config user.email 'hms-regression@example.invalid'
+            & $gitExe -C $checkoutTestRoot add -- .gitattributes scripts/Invoke-HmsLifecycleAction.ps1
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to stage lifecycle EOL regression fixture.' }
+            & $gitExe -C $checkoutTestRoot commit -m 'fixture' 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to commit lifecycle EOL regression fixture.' }
+            $expected = ((& $gitExe -C $checkoutTestRoot rev-parse 'HEAD:scripts/Invoke-HmsLifecycleAction.ps1' 2>$null) -join '').Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $expected -notmatch '^[0-9a-f]{40}$') { throw 'Unable to resolve lifecycle EOL fixture blob.' }
+            Remove-Item -LiteralPath $checkoutShimPath -Force
+            & $gitExe -C $checkoutTestRoot checkout -- scripts/Invoke-HmsLifecycleAction.ps1 2>$null
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to restore lifecycle EOL regression fixture.' }
+            $actual = ((& $gitExe -C $checkoutTestRoot hash-object --no-filters scripts/Invoke-HmsLifecycleAction.ps1 2>$null) -join '').Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $actual -notmatch '^[0-9a-f]{40}$') { throw 'Unable to hash restored lifecycle shim bytes.' }
+            if ($actual -cne $expected) {
+                throw "Lifecycle shim checkout bytes must remain literal under Windows core.autocrlf=true. Expected $expected, found $actual."
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $checkoutTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     if ($Scope -eq 'Lifecycle') {
         Write-Host 'PASS: HMS authenticated lifecycle launcher static contract is satisfied.'
         return
