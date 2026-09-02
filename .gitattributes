@@ -3,6 +3,7 @@
 # cannot authorize altered bytes because runtime verification uses hash-object --no-filters.
 install.ps1 text eol=lf
 update.ps1 text eol=lf
+uninstall.ps1 text eol=lf
 scripts/Build-HmsCompositeSkill.ps1 text eol=lf
 manager/HmsSuperpowersManager.ps1 text eol=lf
 manager/HmsSuperpowersManager.utf8.ps1 text eol=lf
