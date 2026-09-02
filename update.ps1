@@ -19,6 +19,7 @@ $ImpeccableRoot = Join-Path $env:USERPROFILE '.codex\impeccable'
 $CompositeManifest = Join-Path $env:USERPROFILE '.codex\hms-composite\hms-superpowers\manifest.json'
 $SkillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
 $BuildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
+$LifecycleTrustRelative = 'scripts/Initialize-HmsLifecycleTrust.ps1'
 
 function ConvertTo-NormalizedRemote {
     param([Parameter(Mandatory)][string]$Remote)
@@ -85,8 +86,63 @@ function Assert-ExistingPinnedSourceClean {
     if ($dirty) { throw "Refusing to reconcile non-clean pinned repository: $Path" }
 }
 
+function Get-HmsCanonicalHead {
+    param([Parameter(Mandatory)][string]$Path)
+    $head = ((& git -C $Path rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') { throw "Unable to capture canonical HMS HEAD for $Path" }
+    $type = ((& git -C $Path cat-file -t $head 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $type -cne 'commit') { throw "Captured HMS HEAD is not an available commit: $head" }
+    return $head
+}
+
+function Get-HmsLifecycleTrustBootstrap {
+    param([Parameter(Mandatory)][string]$RepoRoot,[Parameter(Mandatory)][string]$Head)
+    $expected = ((& git -C $RepoRoot rev-parse "$Head`:$LifecycleTrustRelative" 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $expected -notmatch '^[0-9a-f]{40}$') { throw 'Lifecycle trust bootstrap committed blob is unavailable.' }
+    $type = ((& git -C $RepoRoot cat-file -t $expected 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $type -cne 'blob') { throw 'Lifecycle trust bootstrap object is not a committed blob.' }
+
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = 'git'
+    $psi.Arguments = "cat-file blob $expected"
+    $psi.WorkingDirectory = $RepoRoot
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = New-Object Diagnostics.Process
+    $proc.StartInfo = $psi
+    if (-not $proc.Start()) { throw 'Could not start git cat-file for lifecycle trust bootstrap.' }
+    $memory = New-Object IO.MemoryStream
+    try {
+        $proc.StandardOutput.BaseStream.CopyTo($memory)
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) { throw "Lifecycle trust bootstrap git cat-file failed: $stderr" }
+        $bytes = $memory.ToArray()
+    }
+    finally { $memory.Dispose(); $proc.Dispose() }
+
+    $header = [Text.Encoding]::ASCII.GetBytes(('blob ' + [string]$bytes.Length + [char]0))
+    $sha1 = [Security.Cryptography.SHA1]::Create()
+    $hashStream = New-Object IO.MemoryStream
+    try {
+        $hashStream.Write($header,0,$header.Length)
+        if ($bytes.Length -gt 0) { $hashStream.Write($bytes,0,$bytes.Length) }
+        $hashStream.Position = 0
+        $actual = (($sha1.ComputeHash($hashStream) | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally { $hashStream.Dispose(); $sha1.Dispose() }
+    if ($actual -cne $expected) { throw "Lifecycle trust bootstrap identity mismatch. Expected $expected, found $actual." }
+    try { $source = (New-Object Text.UTF8Encoding($false,$true)).GetString([byte[]]$bytes) }
+    catch { throw "Lifecycle trust bootstrap is not strict UTF-8: $($_.Exception.Message)" }
+    return [pscustomobject]@{ Sha=$expected; ScriptBlock=[ScriptBlock]::Create($source) }
+}
+
 function Read-SuperLock {
-    $lock = Get-Content -LiteralPath (Join-Path $InstallRoot 'superpowers.lock.json') -Raw | ConvertFrom-Json
+    param([Parameter(Mandatory)][string]$JsonText)
+    try { $lock = $JsonText | ConvertFrom-Json }
+    catch { throw "Committed Superpowers lock is invalid JSON: $($_.Exception.Message)" }
     if ([string]$lock.repository -cne $CanonicalSuperpowersRemote -or [string]$lock.commit -notmatch '^[0-9a-f]{40}$') { throw 'Invalid Superpowers lock.' }
     return $lock
 }
@@ -110,10 +166,10 @@ function Sync-PinnedRepo {
 }
 
 function Get-ModuleState {
+    param([scriptblock]$ReaderScript)
     if (Test-Path -LiteralPath $CompositeManifest) {
-        $reader = Join-Path $InstallRoot 'scripts\Read-HmsCompositeModuleState.ps1'
-        if (-not (Test-Path -LiteralPath $reader)) { throw "Strict composite manifest reader is missing: $reader" }
-        return & $reader -ManifestPath $CompositeManifest
+        if ($null -eq $ReaderScript) { throw 'Authenticated composite manifest reader is unavailable.' }
+        return & $ReaderScript -ManifestPath $CompositeManifest
     }
     $legacy = [ordered]@{ hms='hms'; superpowers='superpowers'; taste='gpt-taste'; impeccable='impeccable' }
     $state = [ordered]@{}
@@ -140,7 +196,15 @@ try {
 
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }
     Assert-NoHiddenIndexState -Path $InstallRoot
-    $state = Get-ModuleState
+
+    # Preserve existing module choices from the exact pre-update committed reader. This authority
+    # is captured before any HMS fetch/fast-forward so an update cannot reinterpret prior state
+    # through a newly downloaded or live-worktree reader.
+    $preUpdateHead = Get-HmsCanonicalHead -Path $InstallRoot
+    $preTrustBootstrap = Get-HmsLifecycleTrustBootstrap -RepoRoot $InstallRoot -Head $preUpdateHead
+    . $preTrustBootstrap.ScriptBlock
+    $preReaderSnapshot = Get-HmsCommittedScriptSnapshot -RepoRoot $InstallRoot -Head $preUpdateHead -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Label 'Pre-update composite module-state reader'
+    $state = Get-ModuleState -ReaderScript $preReaderSnapshot.ScriptBlock
 
     # Fail fast on local UI-source drift before HMS/external network reconciliation.
     if (-not $SkipTaste) { Assert-ExistingPinnedSourceClean -Path $TasteRoot -Label 'GPT Taste' }
@@ -149,31 +213,53 @@ try {
     # Source reconciliation and composite compilation are one cross-process transaction.
     Update-CleanRepo -Path $InstallRoot -ExpectedRemote $HmsRemote
     Assert-NoHiddenIndexState -Path $InstallRoot
+    $trustedHead = Get-HmsCanonicalHead -Path $InstallRoot
+
+    # Re-import from the exact post-update committed bootstrap. All subsequent executable helpers
+    # and their lock inputs are now bound to this one post-update HEAD, not mutable worktree paths.
+    $postTrustBootstrap = Get-HmsLifecycleTrustBootstrap -RepoRoot $InstallRoot -Head $trustedHead
+    . $postTrustBootstrap.ScriptBlock
+
     # Developer/CI test harnesses are intentionally not executable from the trusted production lifecycle.
     # Permanent CI qualifies those validators on exact committed release candidates.
 
     if (-not $SkipSuperpowers) {
-        $lock = Read-SuperLock
+        $superLockText = Get-HmsCommittedUtf8Text -RepoRoot $InstallRoot -Head $trustedHead -RelativePath 'superpowers.lock.json' -Label 'Superpowers lock'
+        $lock = Read-SuperLock -JsonText $superLockText.Text
         Sync-PinnedRepo -Path $SuperpowersRoot -Remote ([string]$lock.repository) -Commit ([string]$lock.commit)
     }
+
+    $uiSnapshot = Get-HmsCommittedLifecycleScriptSnapshot -RepoRoot $InstallRoot -Head $trustedHead -ScriptRelativePath 'scripts/Sync-UiSkills.ps1' -LockRelativePath 'ui-skills.lock.json' -Label 'UI source reconciliation'
     $uiArgs = @{}
     if ($SkipTaste) { $uiArgs.SkipTaste = $true }
     if ($SkipImpeccable) { $uiArgs.SkipImpeccable = $true }
-    & (Join-Path $InstallRoot 'scripts\Sync-UiSkills.ps1') @uiArgs
+    & $uiSnapshot.ScriptBlock @uiArgs
 
+    $deliverySnapshot = Get-HmsCommittedLifecycleScriptSnapshot -RepoRoot $InstallRoot -Head $trustedHead -ScriptRelativePath 'scripts/Sync-DeliveryTools.ps1' -LockRelativePath 'delivery-tools.lock.json' -Label 'Delivery source reconciliation'
     $deliveryArgs = @{}
     if (-not $SkipCodeGraph) { $deliveryArgs.EnableCodeGraphIfNew = $true }
     if ($SkipCodeGraph) { $deliveryArgs.SkipCodeGraph = $true }
     if ($SkipThreeLevelDelivery) { $deliveryArgs.SkipThreeLevelDelivery = $true }
-    & (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') @deliveryArgs
+    & $deliverySnapshot.ScriptBlock @deliveryArgs
 
-    # The builder acquires this named Mutex recursively on the same lifecycle thread.
-    # Both successful WaitOne calls are required to release exactly once; release failures are fatal below.
-    & (Join-Path $InstallRoot 'scripts\Build-HmsCompositeSkill.ps1') -InstallRoot $InstallRoot -Hms ([bool]$state.hms) -Superpowers ([bool]$state.superpowers) -Taste ([bool]$state.taste) -Impeccable ([bool]$state.impeccable)
+    # The builder acquires this named Mutex recursively on the same lifecycle thread and retains
+    # its existing trusted-context verification/materialization contract.
+    $builderSnapshot = Get-HmsCommittedScriptSnapshot -RepoRoot $InstallRoot -Head $trustedHead -RelativePath 'scripts/Build-HmsCompositeSkill.ps1' -Label 'Composite builder public bootstrap'
+    & $builderSnapshot.ScriptBlock `
+        -InstallRoot $InstallRoot `
+        -Hms ([bool]$state.hms) `
+        -Superpowers ([bool]$state.superpowers) `
+        -Taste ([bool]$state.taste) `
+        -Impeccable ([bool]$state.impeccable) `
+        -TrustedRepoRoot $InstallRoot `
+        -TrustedHead $trustedHead `
+        -TrustedBootstrapBlob ([string]$builderSnapshot.Sha)
 
     Write-Host 'HMS Skills Codex update PASS.'
     Write-Host 'Existing module ON/OFF choices were preserved.'
     Write-Host 'Codex public skill remains: $hms-superpowers'
+    Write-Host "Pre-update state authority: committed snapshot $preUpdateHead"
+    Write-Host "Post-update lifecycle authority: committed snapshot $trustedHead"
     Write-Host 'Restart Codex if discovery does not refresh automatically.'
 }
 finally {
