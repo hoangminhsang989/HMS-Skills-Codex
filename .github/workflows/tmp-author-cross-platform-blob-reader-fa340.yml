@@ -1,0 +1,116 @@
+name: TMP author cross-platform blob reader remediation fa340
+
+on:
+  push:
+    branches:
+      - remediate/cross-platform-blob-reader-fa340
+
+permissions:
+  contents: write
+
+jobs:
+  author:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      BASE_SHA: fa340bda134612b1df42222e21becf2f96563937
+      TARGET_BRANCH: stage/hms-superpowers-v0.2.0-ui-design-authority
+    steps:
+      - name: Checkout author branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: remediate/cross-platform-blob-reader-fa340
+          fetch-depth: 0
+
+      - name: Build and qualify exact three-file successor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          $paths = @('install.ps1','scripts/Initialize-HmsLifecycleTrust.ps1','update.ps1')
+
+          $remoteHeadLine = ((& git -C $root ls-remote origin "refs/heads/$env:TARGET_BRANCH") -join '').Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($remoteHeadLine)) { throw 'Unable to resolve target branch head.' }
+          $remoteHead = ($remoteHeadLine -split '\s+')[0].ToLowerInvariant()
+          if ($remoteHead -cne $env:BASE_SHA) { throw "Target branch drifted. Expected $env:BASE_SHA, found $remoteHead" }
+          Write-Host "TARGET_HEAD_PREWRITE=$remoteHead"
+
+          foreach ($path in $paths) {
+            & git -C $root checkout $env:BASE_SHA -- $path
+            if ($LASTEXITCODE -ne 0) { throw "Unable to materialize exact base bytes for $path" }
+          }
+
+          Push-Location $root
+          try {
+            & python '.github/tmp/author_cross_platform_blob_reader_fa340.py'
+            if ($LASTEXITCODE -ne 0) { throw "Mechanical patcher failed with exit $LASTEXITCODE" }
+
+            foreach ($relative in $paths) {
+              $tokens = $null
+              $parseErrors = $null
+              $null = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root $relative),[ref]$tokens,[ref]$parseErrors)
+              if (@($parseErrors).Count -ne 0) {
+                throw "PowerShell parse failed for ${relative}: $((@($parseErrors) | ForEach-Object Message) -join '; ')"
+              }
+            }
+            Write-Host 'PARSER_3_OF_3=PASS'
+
+            ./scripts/Test-HmsSkills.ps1
+            if ($LASTEXITCODE -ne 0) { throw "Test-HmsSkills failed with exit $LASTEXITCODE" }
+            Write-Host 'LINUX_TEST_HMS_SKILLS=PASS'
+          }
+          finally { Pop-Location }
+
+          & git -C $root diff --check $env:BASE_SHA -- @paths
+          if ($LASTEXITCODE -ne 0) { throw 'git diff --check failed.' }
+
+          $blobMap = [ordered]@{}
+          foreach ($relative in $paths) {
+            $blob = ((& git -C $root hash-object -w -- $relative) -join '').Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $blob -notmatch '^[0-9a-f]{40}$') { throw "Unable to hash patched file: $relative" }
+            $blobMap[$relative] = $blob
+            Write-Host "PATCHED_BLOB_${relative}=$blob"
+          }
+
+          $indexPath = Join-Path $env:RUNNER_TEMP ('hms-cross-platform-index-' + [guid]::NewGuid().ToString('N'))
+          try {
+            $env:GIT_INDEX_FILE = $indexPath
+            & git -C $root read-tree $env:BASE_SHA
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to seed temporary index from base tree.' }
+            foreach ($relative in $paths) {
+              & git -C $root update-index --add --cacheinfo 100644 $blobMap[$relative] $relative
+              if ($LASTEXITCODE -ne 0) { throw "Unable to stage patched blob in temporary index: $relative" }
+            }
+            $tree = ((& git -C $root write-tree) -join '').Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $tree -notmatch '^[0-9a-f]{40}$') { throw 'Unable to write successor tree.' }
+          }
+          finally {
+            Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $indexPath -Force -ErrorAction SilentlyContinue
+          }
+
+          $changed = @(& git -C $root diff-tree --no-commit-id --name-only -r $env:BASE_SHA $tree | Sort-Object)
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to compare successor tree to base.' }
+          if (($changed -join "`n") -cne ($paths -join "`n")) {
+            throw "Final tree scope mismatch. Expected [$($paths -join ', ')], found [$($changed -join ', ')]"
+          }
+          Write-Host 'FINAL_TREE_SCOPE=PASS_EXACT_3'
+          Write-Host "FINAL_TREE=$tree"
+
+          & git -C $root config user.name 'github-actions[bot]'
+          & git -C $root config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          $commit = (('Restore cross-platform committed blob retrieval' | & git -C $root commit-tree $tree -p $env:BASE_SHA) -join '').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$') { throw 'Unable to create successor commit.' }
+          $commitTree = ((& git -C $root rev-parse "$commit^{tree}") -join '').Trim().ToLowerInvariant()
+          $parent = ((& git -C $root rev-parse "$commit^") -join '').Trim().ToLowerInvariant()
+          if ($commitTree -cne $tree -or $parent -cne $env:BASE_SHA) { throw 'Successor commit identity binding failed.' }
+          Write-Host "FINAL_COMMIT=$commit"
+          Write-Host "FINAL_PARENT=$parent"
+
+          $remoteHeadLine2 = ((& git -C $root ls-remote origin "refs/heads/$env:TARGET_BRANCH") -join '').Trim()
+          $remoteHead2 = ($remoteHeadLine2 -split '\s+')[0].ToLowerInvariant()
+          if ($remoteHead2 -cne $env:BASE_SHA) { throw "Target branch drifted before push. Expected $env:BASE_SHA, found $remoteHead2" }
+
+          & git -C $root push origin "${commit}:refs/heads/$env:TARGET_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw 'Final successor push failed.' }
+          Write-Host 'FINAL_SUCCESSOR_PUSH=PASS'
