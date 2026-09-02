@@ -22,28 +22,41 @@ function Get-HmsCommittedBlobSnapshot {
     $type = ((& git -C $RepoRoot cat-file -t $expected 2>$null) -join '').Trim().ToLowerInvariant()
     if ($LASTEXITCODE -ne 0 -or $type -cne 'blob') { throw "$Label committed object is not a blob: $gitPath" }
 
+    $gitExe = @((Get-Command git.exe -CommandType Application -ErrorAction Stop))[0].Source
+    $cmdExe = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+    $stdoutPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-committed-blob-' + [guid]::NewGuid().ToString('N') + '.bin')
+    $stderrPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-committed-blob-' + [guid]::NewGuid().ToString('N') + '.err')
+    foreach ($commandPath in @($gitExe,$cmdExe,$RepoRoot,$stdoutPath,$stderrPath)) {
+        if ([string]::IsNullOrWhiteSpace($commandPath) -or $commandPath -match '["%\r\n]') {
+            throw "$Label command path is unsafe for exact cmd.exe redirection: $commandPath"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $gitExe -PathType Leaf)) { throw "$Label resolved git.exe does not exist: $gitExe" }
+    if (-not (Test-Path -LiteralPath $cmdExe -PathType Leaf)) { throw "$Label trusted cmd.exe does not exist: $cmdExe" }
+
     $psi = New-Object Diagnostics.ProcessStartInfo
-    $psi.FileName = 'git'
-    $psi.Arguments = "cat-file blob $expected"
-    $psi.WorkingDirectory = $RepoRoot
+    $psi.FileName = $cmdExe
+    $psi.Arguments = ('/d /q /v:off /s /c ""{0}" -C "{1}" cat-file blob {2} > "{3}" 2> "{4}""' -f $gitExe,$RepoRoot,$expected,$stdoutPath,$stderrPath)
     $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
     $proc = New-Object Diagnostics.Process
     $proc.StartInfo = $psi
-    if (-not $proc.Start()) { throw "$Label could not start git cat-file." }
-    $memory = New-Object IO.MemoryStream
     try {
-        $proc.StandardOutput.BaseStream.CopyTo($memory)
-        $stderr = $proc.StandardError.ReadToEnd()
-        $proc.WaitForExit()
+        if (-not $proc.Start()) { throw "$Label could not start trusted cmd.exe for git cat-file." }
+        if (-not $proc.WaitForExit(10000)) {
+            try { $proc.Kill() } catch {}
+            throw "$Label git cat-file timed out after 10 seconds."
+        }
+        $stderr = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { [IO.File]::ReadAllText($stderrPath) } else { '' }
         if ($proc.ExitCode -ne 0) { throw "$Label git cat-file failed: $stderr" }
-        $bytes = $memory.ToArray()
+        if (-not (Test-Path -LiteralPath $stdoutPath -PathType Leaf)) { throw "$Label git cat-file output file was not created." }
+        if (-not [string]::IsNullOrEmpty($stderr)) { throw "$Label git cat-file produced unexpected stderr: $stderr" }
+        $bytes = [IO.File]::ReadAllBytes($stdoutPath)
     }
     finally {
-        $memory.Dispose()
         $proc.Dispose()
+        Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
     }
 
     $header = [Text.Encoding]::ASCII.GetBytes(('blob ' + [string]$bytes.Length + [char]0))

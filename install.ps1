@@ -121,26 +121,42 @@ function Get-HmsLifecycleTrustBootstrap {
     $type = ((& git -C $RepoRoot cat-file -t $expected 2>$null) -join '').Trim().ToLowerInvariant()
     if ($LASTEXITCODE -ne 0 -or $type -cne 'blob') { throw 'Lifecycle trust bootstrap object is not a committed blob.' }
 
+    $gitExe = @((Get-Command git.exe -CommandType Application -ErrorAction Stop))[0].Source
+    $cmdExe = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+    $stdoutPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-lifecycle-blob-' + [guid]::NewGuid().ToString('N') + '.bin')
+    $stderrPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-lifecycle-blob-' + [guid]::NewGuid().ToString('N') + '.err')
+    foreach ($commandPath in @($gitExe,$cmdExe,$RepoRoot,$stdoutPath,$stderrPath)) {
+        if ([string]::IsNullOrWhiteSpace($commandPath) -or $commandPath -match '["%\r\n]') {
+            throw "Lifecycle trust bootstrap command path is unsafe for exact cmd.exe redirection: $commandPath"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $gitExe -PathType Leaf)) { throw "Resolved git.exe does not exist: $gitExe" }
+    if (-not (Test-Path -LiteralPath $cmdExe -PathType Leaf)) { throw "Trusted cmd.exe does not exist: $cmdExe" }
+
     $psi = New-Object Diagnostics.ProcessStartInfo
-    $psi.FileName = 'git'
-    $psi.Arguments = "cat-file blob $expected"
-    $psi.WorkingDirectory = $RepoRoot
+    $psi.FileName = $cmdExe
+    $psi.Arguments = ('/d /q /v:off /s /c ""{0}" -C "{1}" cat-file blob {2} > "{3}" 2> "{4}""' -f $gitExe,$RepoRoot,$expected,$stdoutPath,$stderrPath)
     $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
     $proc = New-Object Diagnostics.Process
     $proc.StartInfo = $psi
-    if (-not $proc.Start()) { throw 'Could not start git cat-file for lifecycle trust bootstrap.' }
-    $memory = New-Object IO.MemoryStream
     try {
-        $proc.StandardOutput.BaseStream.CopyTo($memory)
-        $stderr = $proc.StandardError.ReadToEnd()
-        $proc.WaitForExit()
+        if (-not $proc.Start()) { throw 'Could not start trusted cmd.exe for lifecycle trust bootstrap.' }
+        if (-not $proc.WaitForExit(10000)) {
+            try { $proc.Kill() } catch {}
+            throw 'Lifecycle trust bootstrap git cat-file timed out after 10 seconds.'
+        }
+        $stderr = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { [IO.File]::ReadAllText($stderrPath) } else { '' }
         if ($proc.ExitCode -ne 0) { throw "Lifecycle trust bootstrap git cat-file failed: $stderr" }
-        $bytes = $memory.ToArray()
+        if (-not (Test-Path -LiteralPath $stdoutPath -PathType Leaf)) { throw 'Lifecycle trust bootstrap output file was not created.' }
+        if (-not [string]::IsNullOrEmpty($stderr)) { throw "Lifecycle trust bootstrap git cat-file produced unexpected stderr: $stderr" }
+        $bytes = [IO.File]::ReadAllBytes($stdoutPath)
     }
-    finally { $memory.Dispose(); $proc.Dispose() }
+    finally {
+        $proc.Dispose()
+        Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+    }
 
     $header = [Text.Encoding]::ASCII.GetBytes(('blob ' + [string]$bytes.Length + [char]0))
     $sha1 = [Security.Cryptography.SHA1]::Create()
