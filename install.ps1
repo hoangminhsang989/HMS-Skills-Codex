@@ -18,6 +18,7 @@ $CompositeRoot = Join-Path $env:USERPROFILE '.codex\hms-composite\hms-superpower
 $CompositeManifest = Join-Path $CompositeRoot 'manifest.json'
 $SkillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
 $BuildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
+$LifecycleTrustRelative = 'scripts/Initialize-HmsLifecycleTrust.ps1'
 
 function Assert-Git {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }
@@ -104,11 +105,63 @@ function Sync-Repository {
     }
 }
 
+function Get-HmsCanonicalHead {
+    param([Parameter(Mandatory)][string]$Path)
+    $head = ((& git -C $Path rev-parse HEAD 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') { throw "Unable to capture canonical HMS HEAD for $Path" }
+    $type = ((& git -C $Path cat-file -t $head 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $type -cne 'commit') { throw "Captured HMS HEAD is not an available commit: $head" }
+    return $head
+}
+
+function Get-HmsLifecycleTrustBootstrap {
+    param([Parameter(Mandatory)][string]$RepoRoot,[Parameter(Mandatory)][string]$Head)
+    $expected = ((& git -C $RepoRoot rev-parse "$Head`:$LifecycleTrustRelative" 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $expected -notmatch '^[0-9a-f]{40}$') { throw 'Lifecycle trust bootstrap committed blob is unavailable.' }
+    $type = ((& git -C $RepoRoot cat-file -t $expected 2>$null) -join '').Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $type -cne 'blob') { throw 'Lifecycle trust bootstrap object is not a committed blob.' }
+
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = 'git'
+    $psi.Arguments = "cat-file blob $expected"
+    $psi.WorkingDirectory = $RepoRoot
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = New-Object Diagnostics.Process
+    $proc.StartInfo = $psi
+    if (-not $proc.Start()) { throw 'Could not start git cat-file for lifecycle trust bootstrap.' }
+    $memory = New-Object IO.MemoryStream
+    try {
+        $proc.StandardOutput.BaseStream.CopyTo($memory)
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) { throw "Lifecycle trust bootstrap git cat-file failed: $stderr" }
+        $bytes = $memory.ToArray()
+    }
+    finally { $memory.Dispose(); $proc.Dispose() }
+
+    $header = [Text.Encoding]::ASCII.GetBytes(('blob ' + [string]$bytes.Length + [char]0))
+    $sha1 = [Security.Cryptography.SHA1]::Create()
+    $hashStream = New-Object IO.MemoryStream
+    try {
+        $hashStream.Write($header,0,$header.Length)
+        if ($bytes.Length -gt 0) { $hashStream.Write($bytes,0,$bytes.Length) }
+        $hashStream.Position = 0
+        $actual = (($sha1.ComputeHash($hashStream) | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally { $hashStream.Dispose(); $sha1.Dispose() }
+    if ($actual -cne $expected) { throw "Lifecycle trust bootstrap identity mismatch. Expected $expected, found $actual." }
+    try { $source = (New-Object Text.UTF8Encoding($false,$true)).GetString([byte[]]$bytes) }
+    catch { throw "Lifecycle trust bootstrap is not strict UTF-8: $($_.Exception.Message)" }
+    return [pscustomobject]@{ Sha=$expected; ScriptBlock=[ScriptBlock]::Create($source) }
+}
+
 function Read-ValidatedSuperpowersLock {
-    $path = Join-Path $InstallRoot 'superpowers.lock.json'
-    if (-not (Test-Path -LiteralPath $path)) { throw "Superpowers lock file not found: $path" }
-    try { $lock = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json }
-    catch { throw "Superpowers lock file is not valid JSON: $($_.Exception.Message)" }
+    param([Parameter(Mandatory)][string]$JsonText)
+    try { $lock = $JsonText | ConvertFrom-Json }
+    catch { throw "Committed Superpowers lock is not valid JSON: $($_.Exception.Message)" }
     if ([string]$lock.repository -cne $CanonicalSuperpowersRemote) { throw "Unexpected Superpowers repository in lock: $($lock.repository)" }
     if ([string]$lock.commit -notmatch '^[0-9a-f]{40}$') { throw "Invalid Superpowers commit in lock: $($lock.commit)" }
     return $lock
@@ -139,10 +192,10 @@ function Sync-PinnedRepository {
 }
 
 function Get-ModuleState {
+    param([scriptblock]$ReaderScript)
     if (Test-Path -LiteralPath $CompositeManifest) {
-        $reader = Join-Path $InstallRoot 'scripts\Read-HmsCompositeModuleState.ps1'
-        if (-not (Test-Path -LiteralPath $reader)) { throw "Strict composite manifest reader is missing: $reader" }
-        return & $reader -ManifestPath $CompositeManifest
+        if ($null -eq $ReaderScript) { throw 'Authenticated composite manifest reader is unavailable.' }
+        return & $ReaderScript -ManifestPath $CompositeManifest
     }
 
     $legacy = [ordered]@{
@@ -184,40 +237,57 @@ try {
     # Source reconciliation and composite compilation are one cross-process transaction.
     Sync-Repository -Remote $HmsRemote -Path $InstallRoot
     Assert-NoHiddenIndexState -Path $InstallRoot
-    $state = Get-ModuleState
+    $trustedHead = Get-HmsCanonicalHead -Path $InstallRoot
+
+    # Import trust helpers only from the exact committed Git object at the captured post-sync HEAD.
+    # No live lifecycle helper pathname is reopened for executable authority after this boundary.
+    $trustBootstrap = Get-HmsLifecycleTrustBootstrap -RepoRoot $InstallRoot -Head $trustedHead
+    . $trustBootstrap.ScriptBlock
+
+    $readerSnapshot = Get-HmsCommittedScriptSnapshot -RepoRoot $InstallRoot -Head $trustedHead -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Label 'Composite module-state reader'
+    $state = Get-ModuleState -ReaderScript $readerSnapshot.ScriptBlock
 
     # Developer/CI test harnesses are intentionally not executable from the trusted production lifecycle.
     # Permanent CI qualifies those validators on exact committed release candidates.
 
     if (-not $SkipSuperpowers) {
-        $superLock = Read-ValidatedSuperpowersLock
+        $superLockText = Get-HmsCommittedUtf8Text -RepoRoot $InstallRoot -Head $trustedHead -RelativePath 'superpowers.lock.json' -Label 'Superpowers lock'
+        $superLock = Read-ValidatedSuperpowersLock -JsonText $superLockText.Text
         Sync-PinnedRepository -Remote ([string]$superLock.repository) -Path $SuperpowersRoot -Commit ([string]$superLock.commit)
     }
 
+    $uiSnapshot = Get-HmsCommittedLifecycleScriptSnapshot -RepoRoot $InstallRoot -Head $trustedHead -ScriptRelativePath 'scripts/Sync-UiSkills.ps1' -LockRelativePath 'ui-skills.lock.json' -Label 'UI source reconciliation'
     $uiArgs = @{}
     if ($SkipTaste) { $uiArgs.SkipTaste = $true }
     if ($SkipImpeccable) { $uiArgs.SkipImpeccable = $true }
-    & (Join-Path $InstallRoot 'scripts\Sync-UiSkills.ps1') @uiArgs
+    & $uiSnapshot.ScriptBlock @uiArgs
 
+    $deliverySnapshot = Get-HmsCommittedLifecycleScriptSnapshot -RepoRoot $InstallRoot -Head $trustedHead -ScriptRelativePath 'scripts/Sync-DeliveryTools.ps1' -LockRelativePath 'delivery-tools.lock.json' -Label 'Delivery source reconciliation'
     $deliveryArgs = @{}
     if (-not $SkipCodeGraph) { $deliveryArgs.EnsureCodeGraphConfig = $true }
     if ($SkipCodeGraph) { $deliveryArgs.SkipCodeGraph = $true }
     if ($SkipThreeLevelDelivery) { $deliveryArgs.SkipThreeLevelDelivery = $true }
-    & (Join-Path $InstallRoot 'scripts\Sync-DeliveryTools.ps1') @deliveryArgs
+    & $deliverySnapshot.ScriptBlock @deliveryArgs
 
     # The builder acquires this named Mutex recursively on the same lifecycle thread.
-    # Both successful WaitOne calls are required to release exactly once; release failures are fatal below.
-    & (Join-Path $InstallRoot 'scripts\Build-HmsCompositeSkill.ps1') `
+    # Its public bootstrap is also executed from the exact captured committed bytes and receives
+    # the existing trusted-context tuple so all deeper support materialization stays HEAD-bound.
+    $builderSnapshot = Get-HmsCommittedScriptSnapshot -RepoRoot $InstallRoot -Head $trustedHead -RelativePath 'scripts/Build-HmsCompositeSkill.ps1' -Label 'Composite builder public bootstrap'
+    & $builderSnapshot.ScriptBlock `
         -InstallRoot $InstallRoot `
         -Hms ([bool]$state.hms) `
         -Superpowers ([bool]$state.superpowers) `
         -Taste ([bool]$state.taste) `
-        -Impeccable ([bool]$state.impeccable)
+        -Impeccable ([bool]$state.impeccable) `
+        -TrustedRepoRoot $InstallRoot `
+        -TrustedHead $trustedHead `
+        -TrustedBootstrapBlob ([string]$builderSnapshot.Sha)
 
     Write-Host 'HMS Skills Codex installation PASS.'
     Write-Host 'Codex public skill: $hms-superpowers'
     Write-Host ('Enabled modules: ' + (@(('hms','superpowers','taste','impeccable') | Where-Object { [bool]$state.$_ }) -join ', '))
     if (-not $SkipCodeGraph) { Write-Host 'CodeGraph remains an MCP tool, not a separate public skill.' }
+    Write-Host "Lifecycle helper authority: committed snapshot $trustedHead"
     Write-Host 'Restart Codex to refresh discovery.'
 }
 finally {
