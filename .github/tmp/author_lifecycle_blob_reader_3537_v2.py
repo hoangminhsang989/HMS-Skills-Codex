@@ -10,6 +10,9 @@ structural_helper = r'''
 def replace_helper_structural(path: Path, new: str) -> None:
     raw = path.read_bytes()
     text = raw.decode('utf-8')
+    if '\r' in text.replace('\r\n', ''):
+        raise RuntimeError('committed blob helper: unexpected lone CR byte in checkout materialization')
+    text = text.replace('\r\n', '\n')
     start_marker = "    $psi = New-Object Diagnostics.ProcessStartInfo\n    $psi.FileName = 'git'\n    $psi.Arguments = \"cat-file blob $expected\"\n"
     end_marker = "\n    $header = [Text.Encoding]::ASCII.GetBytes(('blob ' + [string]$bytes.Length + [char]0))"
     if text.count(start_marker) != 1:
