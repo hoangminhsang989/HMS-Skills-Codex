@@ -20,7 +20,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.CANDIDATE_SHA }}
-      - name: Validate skill structure
+      - name: Validate source structure and PowerShell
         shell: pwsh
         run: |
           $actual = (& git rev-parse HEAD).Trim().ToLowerInvariant()
@@ -36,6 +36,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.CANDIDATE_SHA }}
+
       - name: Install pinned Codex CLI for real discovery
         shell: pwsh
         run: |
@@ -46,7 +47,8 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $actualVersion -notmatch [regex]::Escape($env:CODEX_CLI_VERSION)) {
             throw "Unexpected Codex CLI version output: $actualVersion"
           }
-      - name: Verify install update discovery and uninstall contracts
+
+      - name: Verify unified install manager model-dispatch update discovery and uninstall contracts
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -56,8 +58,6 @@ jobs:
             throw "Workflow checkout identity mismatch. Expected $expectedSha, found $workspaceHead"
           }
 
-          # Codex resolves its user skill root from the OS home directory. Use the
-          # real ephemeral runner profile so installer and app-server observe the same home.
           $runnerHome = $env:USERPROFILE
           $originalHome = $env:HOME
           $originalCodexHome = $env:CODEX_HOME
@@ -68,146 +68,190 @@ jobs:
             & "$env:GITHUB_WORKSPACE\install.ps1" -InstallRoot $env:GITHUB_WORKSPACE
 
             $headAfterInstall = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim().ToLowerInvariant()
-            if ($LASTEXITCODE -ne 0 -or $headAfterInstall -ne $expectedSha) {
-              throw "Installer changed candidate-bound HMS identity. Expected $expectedSha, found $headAfterInstall"
+            if ($headAfterInstall -ne $expectedSha) { throw 'Installer changed the candidate-bound HMS identity.' }
+
+            $skillsRoot = Join-Path $runnerHome '.agents\skills'
+            $compositeLink = Join-Path $skillsRoot 'hms-superpowers'
+            $compositeRoot = Join-Path $runnerHome '.codex\hms-composite\hms-superpowers'
+            $manifestPath = Join-Path $compositeRoot 'manifest.json'
+            $modelSettingsPath = Join-Path $runnerHome '.codex\hms-composite\model-settings.json'
+            $modelRouterRoot = Join-Path $compositeRoot 'references\model-router'
+            $modelDispatcherRoot = Join-Path $compositeRoot 'references\model-dispatcher'
+            $builderPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.ps1'
+            if (-not (Test-Path -LiteralPath $compositeLink)) { throw 'Unified hms-superpowers discovery Junction was not created.' }
+            foreach ($legacy in @('hms','superpowers','gpt-taste','impeccable')) {
+              if (Test-Path -LiteralPath (Join-Path $skillsRoot $legacy)) { throw "Legacy direct discovery leaked after unified install: $legacy" }
             }
 
-            $hmsLink = Join-Path $runnerHome '.agents\skills\hms'
-            $superpowersLink = Join-Path $runnerHome '.agents\skills\superpowers'
-            if (-not (Test-Path -LiteralPath $hmsLink)) { throw 'HMS skills junction was not created.' }
-            if (-not (Test-Path -LiteralPath $superpowersLink)) { throw 'Superpowers skills junction was not created.' }
-
-            $lock = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'superpowers.lock.json') -Raw | ConvertFrom-Json
-            $actualSuperpowersHead = (& git -C (Join-Path $runnerHome '.codex\superpowers') rev-parse HEAD).Trim()
-            if ($LASTEXITCODE -ne 0 -or $actualSuperpowersHead -ne [string]$lock.commit) {
-              throw "Superpowers pin mismatch. Expected $($lock.commit), found $actualSuperpowersHead"
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            foreach ($key in @('hms','superpowers','taste','impeccable')) {
+              if (-not [bool]$manifest.modules.$key) { throw "Default clean install did not enable module '$key'." }
             }
+            if ([string]$manifest.routing_contract.model_router -cne 'always-internal') { throw 'Composite manifest did not bind the dedicated model router.' }
+            if ([string]$manifest.routing_contract.model_dispatcher -cne 'always-internal') { throw 'Composite manifest did not bind the dedicated model dispatcher.' }
+            if ([string]$manifest.routing_contract.model_fallback -cne 'upward-only') { throw 'Composite manifest model fallback contract mismatch.' }
+            if ([string]::IsNullOrWhiteSpace([string]$manifest.routing_contract.composite_build_lock)) { throw 'Composite manifest is missing the cross-process build lock identity.' }
+            if (-not (Test-Path -LiteralPath (Join-Path $modelRouterRoot 'MODULE.md'))) { throw 'Composite is missing the dedicated model-router MODULE.md.' }
+            if (-not (Test-Path -LiteralPath (Join-Path $modelDispatcherRoot 'MODULE.md'))) { throw 'Composite is missing the dedicated model-dispatcher MODULE.md.' }
+            if (-not (Test-Path -LiteralPath (Join-Path $modelDispatcherRoot 'Resolve-HmsModelRoute.ps1'))) { throw 'Composite is missing the bundled deterministic model resolver.' }
+
+            $nestedSkillFiles = @(Get-ChildItem -LiteralPath $compositeRoot -Filter 'SKILL.md' -File -Recurse)
+            if ($nestedSkillFiles.Count -ne 1) { throw "Composite contains $($nestedSkillFiles.Count) SKILL.md files; expected exactly one." }
+
+            $superLock = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'superpowers.lock.json') -Raw | ConvertFrom-Json
+            $superRoot = Join-Path $runnerHome '.codex\superpowers'
+            $superHead = (& git -C $superRoot rev-parse HEAD).Trim().ToLowerInvariant()
+            if ($superHead -ne [string]$superLock.commit) { throw 'Superpowers exact pin mismatch.' }
+            $uiLock = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'ui-skills.lock.json') -Raw | ConvertFrom-Json
+            $tasteRoot = Join-Path $runnerHome '.codex\taste-skill'
+            $impeccableRoot = Join-Path $runnerHome '.codex\impeccable'
+            $tasteHead = (& git -C $tasteRoot rev-parse HEAD).Trim().ToLowerInvariant()
+            $impeccableHead = (& git -C $impeccableRoot rev-parse HEAD).Trim().ToLowerInvariant()
+            if ($tasteHead -ne [string]$uiLock.taste.commit) { throw 'GPT Taste exact pin mismatch.' }
+            if ($impeccableHead -ne [string]$uiLock.impeccable.commit) { throw 'Impeccable exact pin mismatch.' }
+
+            & "$env:GITHUB_WORKSPACE\manager\HmsSuperpowersManager.ps1" -SelfTest
+
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\manager\HmsModelSettings.ps1" -SelfTest
+            if ($LASTEXITCODE -ne 0) { throw "Windows PowerShell 5.1 model-settings self-test failed with exit code $LASTEXITCODE." }
+            Write-Host 'PASS: HMS Model Settings strict/atomic/direct-floor self-test qualified on Windows PowerShell 5.1.'
+
+            $modelSettings = [ordered]@{
+              schema_version = 1
+              managed_by = 'HMS-Skills-Codex'
+              artifact = 'hms-model-settings'
+              models = [ordered]@{ luna=$false; terra=$true; sol=$true }
+            }
+            $modelSettings | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $modelSettingsPath -Encoding UTF8
+            $fallbackBefore = & "$env:GITHUB_WORKSPACE\scripts\Resolve-HmsModelRoute.ps1" -RiskClass 'FAST_LOW_RISK / HIGH_VOLUME_MECHANICAL' -RequiredFloor 'LUNA_LOW_RISK' -SettingsPath $modelSettingsPath
+            if ($fallbackBefore.status -cne 'ASSIGNED' -or $fallbackBefore.assigned_model -cne 'gpt-5.6-terra' -or -not [bool]$fallbackBefore.reassigned) {
+              throw 'Luna OFF did not reassign low-risk work to Terra before update.'
+            }
+
+            # A dirty external source must be rejected before a staged bundle can be activated.
+            $manifestHashBeforeDirty = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+            $tasteSkillRelative = ([string]$uiLock.taste.skill_path).TrimEnd('/') + '/SKILL.md'
+            $tasteSkillPath = Join-Path $tasteRoot ($tasteSkillRelative -replace '/', '\')
+            Add-Content -LiteralPath $tasteSkillPath -Value "`n<!-- HMS CI dirty-source sentinel -->"
+            $dirtyRejected = $false
+            try {
+              & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -Hms $true -Superpowers $true -Taste $true -Impeccable $true
+            }
+            catch {
+              if ($_.Exception.Message -match 'GPT Taste source is dirty') { $dirtyRejected = $true } else { throw }
+            }
+            finally {
+              & git -C $tasteRoot restore --worktree -- $tasteSkillRelative
+              if ($LASTEXITCODE -ne 0) { throw 'Failed to restore Taste source after dirty-source qualification.' }
+            }
+            if (-not $dirtyRejected) { throw 'Composite compiler did not reject dirty GPT Taste source.' }
+            $manifestHashAfterDirty = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+            if ($manifestHashAfterDirty -cne $manifestHashBeforeDirty) { throw 'Dirty-source rejection mutated the active composite manifest.' }
+            if (-not [string]::IsNullOrWhiteSpace(((& git -C $tasteRoot status --porcelain=v1 --untracked-files=all) -join "`n"))) { throw 'Taste source did not return to clean state.' }
+
+            # Prove two independent PowerShell processes can rebuild the same managed target without racing activation/rollback.
+            # Keep this race proof intentionally lightweight: full all-module materialization is already qualified above and in the trust workflow.
+            $parallelRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-composite-lock-' + [guid]::NewGuid().ToString('N'))
+            $parallelOutput = Join-Path $parallelRoot 'composite'
+            $parallelSkills = Join-Path $parallelRoot 'agents\skills'
+            $jobScript = {
+              param($Builder,$Install,$Output,$Skills,$HmsEnabled)
+              $ErrorActionPreference = 'Stop'
+              & $Builder -InstallRoot $Install -OutputRoot $Output -SkillsRoot $Skills -Hms ([bool]$HmsEnabled) -Superpowers $false -Taste $false -Impeccable $false
+            }
+            $jobs = @()
+            try {
+              $jobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$parallelOutput,$parallelSkills,$true
+              $jobs += Start-Job -ScriptBlock $jobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$parallelOutput,$parallelSkills,$false
+              $deadline = [DateTime]::UtcNow.AddSeconds(120)
+              while ([DateTime]::UtcNow -lt $deadline) {
+                foreach ($job in $jobs) { Receive-Job -Job $job -ErrorAction Stop | Write-Host }
+                if (@($jobs | Where-Object { $_.State -notin @('Completed','Failed','Stopped') }).Count -eq 0) { break }
+                Start-Sleep -Milliseconds 250
+              }
+              foreach ($job in $jobs) {
+                Receive-Job -Job $job -ErrorAction Stop | Write-Host
+                if ($job.State -ne 'Completed') { throw "Concurrent lightweight composite build job did not complete: $($job.State)" }
+              }
+              $parallelManifestPath = Join-Path $parallelOutput 'hms-superpowers\manifest.json'
+              if (-not (Test-Path -LiteralPath $parallelManifestPath)) { throw 'Concurrent build did not leave a valid composite manifest.' }
+              $parallelManifest = Get-Content -LiteralPath $parallelManifestPath -Raw | ConvertFrom-Json
+              if ([bool]$parallelManifest.modules.superpowers -or [bool]$parallelManifest.modules.taste -or [bool]$parallelManifest.modules.impeccable) {
+                throw 'Concurrent lightweight build unexpectedly enabled an external work module.'
+              }
+              if ($parallelManifest.modules.hms -isnot [bool]) { throw 'Concurrent lightweight build left a non-boolean HMS module state.' }
+              $parallelSkillFiles = @(Get-ChildItem -LiteralPath (Join-Path $parallelOutput 'hms-superpowers') -Filter 'SKILL.md' -File -Recurse)
+              if ($parallelSkillFiles.Count -ne 1) { throw 'Concurrent build violated exactly-one-public-SKILL invariant.' }
+              $parallelLink = Join-Path $parallelSkills 'hms-superpowers'
+              $parallelLinkItem = Get-Item -LiteralPath $parallelLink -Force -ErrorAction SilentlyContinue
+              if ([bool]$parallelManifest.modules.hms) {
+                if ($null -eq $parallelLinkItem -or [string]$parallelLinkItem.LinkType -ine 'Junction') { throw 'Concurrent HMS-ON result did not leave exact discovery Junction.' }
+              }
+              elseif ($null -ne $parallelLinkItem) {
+                throw 'Concurrent HMS-OFF result left discovery enabled.'
+              }
+              $leftovers = @(Get-ChildItem -LiteralPath $parallelOutput -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.stage-*' -or $_.Name -like '.backup-*' })
+              if ($leftovers.Count -ne 0) { throw 'Concurrent build left stage/backup artifacts.' }
+              & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -OutputRoot $parallelOutput -SkillsRoot $parallelSkills -Hms $false -Superpowers $false -Taste $false -Impeccable $false
+            }
+            finally {
+              foreach ($job in $jobs) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+              if (Test-Path -LiteralPath $parallelRoot) { Remove-Item -LiteralPath $parallelRoot -Recurse -Force }
+            }
+            Write-Host 'PASS: lightweight cross-process composite compilation is serialized; dirty external source rejection remains separately qualified.'
 
             & "$env:GITHUB_WORKSPACE\scripts\Test-CodexSkillDiscovery.ps1" -Cwd $env:GITHUB_WORKSPACE
 
+            # Direct source discovery must be impossible through the old UI sync switches.
+            $directRejected = $false
+            try { & "$env:GITHUB_WORKSPACE\scripts\Sync-UiSkills.ps1" -EnsureDiscovery }
+            catch {
+              if ($_.Exception.Message -match 'Direct UI-advisor discovery is disabled') { $directRejected = $true } else { throw }
+            }
+            if (-not $directRejected) { throw 'Legacy direct UI-advisor discovery was not rejected.' }
+
+            # Prove a Manager-equivalent module choice survives update while the public skill remains singular.
+            & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -Hms $true -Superpowers $true -Taste $false -Impeccable $true
+            $beforeUpdate = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            if ([bool]$beforeUpdate.modules.taste) { throw 'Failed to create Taste OFF composite state.' }
+            if (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\taste')) { throw 'Taste reference remained after Taste OFF rebuild.' }
+            if (-not (Test-Path -LiteralPath (Join-Path $compositeRoot 'references\model-router\MODULE.md'))) { throw 'Model router disappeared during module rebuild.' }
+            if (-not (Test-Path -LiteralPath (Join-Path $modelDispatcherRoot 'MODULE.md'))) { throw 'Model dispatcher disappeared during module rebuild.' }
+
             & "$env:GITHUB_WORKSPACE\update.ps1" -InstallRoot $env:GITHUB_WORKSPACE
-            $headAfterUpdate = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim().ToLowerInvariant()
-            if ($LASTEXITCODE -ne 0 -or $headAfterUpdate -ne $expectedSha) {
-              throw "Updater changed candidate-bound HMS identity. Expected $expectedSha, found $headAfterUpdate"
+            $afterUpdate = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            if ([bool]$afterUpdate.modules.taste) { throw 'Updater incorrectly re-enabled Taste.' }
+            if (-not [bool]$afterUpdate.modules.impeccable) { throw 'Updater unexpectedly disabled Impeccable.' }
+            foreach ($legacy in @('hms','superpowers','gpt-taste','impeccable')) {
+              if (Test-Path -LiteralPath (Join-Path $skillsRoot $legacy)) { throw "Updater recreated legacy direct discovery: $legacy" }
+            }
+            if (-not (Test-Path -LiteralPath $modelSettingsPath)) { throw 'Updater removed the model settings file.' }
+            $fallbackAfter = & "$env:GITHUB_WORKSPACE\scripts\Resolve-HmsModelRoute.ps1" -RiskClass 'FAST_LOW_RISK / HIGH_VOLUME_MECHANICAL' -RequiredFloor 'LUNA_LOW_RISK' -SettingsPath $modelSettingsPath
+            if ($fallbackAfter.status -cne 'ASSIGNED' -or $fallbackAfter.assigned_model -cne 'gpt-5.6-terra' -or -not [bool]$fallbackAfter.reassigned) {
+              throw 'Updater did not preserve Luna OFF model reassignment state.'
             }
 
-            & "$env:GITHUB_WORKSPACE\uninstall.ps1" -InstallRoot $env:GITHUB_WORKSPACE -IncludeSuperpowers
-            if (Test-Path -LiteralPath $hmsLink) { throw 'HMS junction remained after uninstall.' }
-            if (Test-Path -LiteralPath $superpowersLink) { throw 'Superpowers junction remained after uninstall.' }
+            # Restore all work modules and prove real Codex discovery remains one entry point.
+            & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -Hms $true -Superpowers $true -Taste $true -Impeccable $true
+            & "$env:GITHUB_WORKSPACE\scripts\Test-CodexSkillDiscovery.ps1" -Cwd $env:GITHUB_WORKSPACE
 
-            # A clean local branch that is ahead of the verified remote must never be
-            # accepted as installed/updated authority merely because merge --ff-only
-            # reports "Already up to date".
-            $aheadClone = Join-Path $env:RUNNER_TEMP 'local-ahead-hms-clone'
-            git clone --branch main --single-branch 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git' $aheadClone
-            if ($LASTEXITCODE -ne 0) { throw 'Failed to create local-ahead synthetic clone.' }
-            git -C $aheadClone config user.email 'ci@example.invalid'
-            git -C $aheadClone config user.name 'HMS CI'
-            Set-Content -LiteralPath (Join-Path $aheadClone 'LOCAL_AHEAD_SENTINEL.txt') -Value 'unverified local commit'
-            git -C $aheadClone add LOCAL_AHEAD_SENTINEL.txt
-            git -C $aheadClone commit -m 'synthetic local-ahead commit' | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Failed to create synthetic local-ahead commit.' }
-            $aheadHead = (& git -C $aheadClone rev-parse HEAD).Trim()
-            $remoteMain = (& git -C $aheadClone rev-parse refs/remotes/origin/main).Trim()
-            if ($LASTEXITCODE -ne 0 -or $aheadHead -eq $remoteMain) { throw 'Local-ahead test setup did not create distinct identities.' }
-            if (git -C $aheadClone status --porcelain) { throw 'Local-ahead test setup is unexpectedly dirty.' }
-
-            $installRejectedAhead = $false
-            try {
-              & "$env:GITHUB_WORKSPACE\install.ps1" -InstallRoot $aheadClone -SkipSuperpowers
-            }
-            catch {
-              $installRejectedAhead = $true
-            }
-            if (-not $installRejectedAhead) { throw 'Installer incorrectly accepted a clean local-ahead branch.' }
-            if (Test-Path -LiteralPath $hmsLink) { throw 'Rejected local-ahead install created an HMS discovery junction.' }
-            if ((& git -C $aheadClone rev-parse HEAD).Trim() -ne $aheadHead) { throw 'Installer mutated local-ahead HEAD before rejection.' }
-
-            $updateRejectedAhead = $false
-            try {
-              & "$env:GITHUB_WORKSPACE\update.ps1" -InstallRoot $aheadClone -SkipSuperpowers
-            }
-            catch {
-              $updateRejectedAhead = $true
-            }
-            if (-not $updateRejectedAhead) { throw 'Updater incorrectly accepted a clean local-ahead branch.' }
-            if ((& git -C $aheadClone rev-parse HEAD).Trim() -ne $aheadHead) { throw 'Updater mutated local-ahead HEAD before rejection.' }
-            Remove-Item -LiteralPath $aheadClone -Recurse -Force
-
-            # Prove the public custom -InstallRoot is honored for clone deletion.
-            $customClone = Join-Path $env:RUNNER_TEMP 'custom-hms-clone'
-            New-Item -ItemType Directory -Force -Path (Join-Path $customClone 'skills\hms-superpowers') | Out-Null
-            Set-Content -LiteralPath (Join-Path $customClone 'skills\hms-superpowers\SKILL.md') -Value 'marker'
-            git -C $customClone init | Out-Null
-            git -C $customClone remote add origin 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
-            & "$env:GITHUB_WORKSPACE\uninstall.ps1" -InstallRoot $customClone -RemoveClones
-            if (Test-Path -LiteralPath $customClone) { throw 'Custom InstallRoot clone was not removed.' }
-
-            # Prove clone deletion failures remain failures rather than apparent success.
-            $blockedClone = Join-Path $env:RUNNER_TEMP 'blocked-hms-clone'
-            New-Item -ItemType Directory -Force -Path (Join-Path $blockedClone 'skills\hms-superpowers') | Out-Null
-            $blockedMarker = Join-Path $blockedClone 'skills\hms-superpowers\SKILL.md'
-            Set-Content -LiteralPath $blockedMarker -Value 'locked marker'
-            git -C $blockedClone init | Out-Null
-            git -C $blockedClone remote add origin 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
-            $stream = [IO.File]::Open($blockedMarker, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-            try {
-              $failedClosed = $false
-              try {
-                & "$env:GITHUB_WORKSPACE\uninstall.ps1" -InstallRoot $blockedClone -RemoveClones
-              }
-              catch {
-                $failedClosed = $true
-              }
-              if (-not $failedClosed) { throw 'Locked clone deletion was incorrectly reported as success.' }
-            }
-            finally {
-              $stream.Dispose()
-              if (Test-Path -LiteralPath $blockedClone) { Remove-Item -LiteralPath $blockedClone -Recurse -Force }
+            # Uninstall without clone deletion removes discovery only and preserves pinned sources/model settings.
+            & "$env:GITHUB_WORKSPACE\uninstall.ps1" -InstallRoot $env:GITHUB_WORKSPACE -IncludeSuperpowers -IncludeUiSkills
+            if (Test-Path -LiteralPath $compositeLink) { throw 'Composite discovery remained after uninstall.' }
+            foreach ($source in @(
+              $superRoot,
+              $tasteRoot,
+              $impeccableRoot,
+              $compositeRoot,
+              $modelSettingsPath
+            )) {
+              if (-not (Test-Path -LiteralPath $source)) { throw "Non-destructive uninstall removed preserved source/state: $source" }
             }
 
-            # A tampered Superpowers repository must be rejected before any Superpowers clone/junction mutation.
-            $tamperedHome = Join-Path $env:RUNNER_TEMP 'tampered-home'
-            $tamperedRepo = Join-Path $env:RUNNER_TEMP 'tampered-repo'
-            New-Item -ItemType Directory -Force -Path $tamperedRepo | Out-Null
-            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Force | Where-Object Name -ne '.git' | ForEach-Object {
-              Copy-Item -LiteralPath $_.FullName -Destination $tamperedRepo -Recurse -Force
-            }
-            $tamperedLockPath = Join-Path $tamperedRepo 'superpowers.lock.json'
-            $tamperedLock = Get-Content -LiteralPath $tamperedLockPath -Raw | ConvertFrom-Json
-            $tamperedLock.repository = 'https://127.0.0.1:9/attacker/superpowers.git'
-            $tamperedLock | ConvertTo-Json | Set-Content -LiteralPath $tamperedLockPath
-            git -C $tamperedRepo init | Out-Null
-            git -C $tamperedRepo config user.email 'ci@example.invalid'
-            git -C $tamperedRepo config user.name 'HMS CI'
-            git -C $tamperedRepo remote add origin 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
-            git -C $tamperedRepo add -A
-            git -C $tamperedRepo commit -m 'synthetic tampered lock' | Out-Null
-            git -C $tamperedRepo checkout --detach HEAD | Out-Null
-
-            $env:USERPROFILE = $tamperedHome
-            $env:HOME = $tamperedHome
-            $env:CODEX_HOME = Join-Path $tamperedHome '.codex'
-            $lockRejected = $false
-            try {
-              & "$env:GITHUB_WORKSPACE\install.ps1" -InstallRoot $tamperedRepo
-            }
-            catch {
-              if ($_.Exception.Message -match 'Unexpected Superpowers repository in lock') {
-                $lockRejected = $true
-              }
-              else {
-                throw
-              }
-            }
-            if (-not $lockRejected) { throw 'Tampered Superpowers repository was not rejected by pre-network lock validation.' }
-            if (Test-Path -LiteralPath (Join-Path $tamperedHome '.codex\superpowers')) { throw 'Tampered lock caused a Superpowers clone mutation before rejection.' }
-            if (Test-Path -LiteralPath (Join-Path $tamperedHome '.agents\skills\hms')) { throw 'Tampered lock caused an HMS discovery junction mutation before rejection.' }
+            Write-Host 'PASS: Windows exact-SHA unified single-skill install/update/Manager/model-routing/source-trust/serialization/Codex-discovery/uninstall contract completed.'
           }
           finally {
             $env:USERPROFILE = $runnerHome
             $env:HOME = $originalHome
             $env:CODEX_HOME = $originalCodexHome
           }
-
-          Write-Host 'PASS: Windows candidate-SHA-bound install/update/Codex-discovery/uninstall contract smoke completed.'

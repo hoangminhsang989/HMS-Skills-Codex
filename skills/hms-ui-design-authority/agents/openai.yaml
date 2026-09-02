@@ -1,0 +1,7 @@
+interface:
+  display_name: "HMS UI Design Authority"
+  short_description: "Penpot-first HMS UI authority and visual gate"
+  default_prompt: "Use $hms-ui-design-authority to implement or review the requested HMS UI change from the current canonical design authority, preserve DESIGN.md/tokens/component mapping, and require fresh visual evidence before PASS."
+
+policy:
+  allow_implicit_invocation: true

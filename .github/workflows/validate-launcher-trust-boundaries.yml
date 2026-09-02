@@ -1,0 +1,102 @@
+name: Validate HMS launcher trust boundaries
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  windows-launcher-trust:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Qualify compatibility Manager and Model Settings outer launch trust
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Set-StrictMode -Version Latest
+          $PSNativeCommandUseErrorActionPreference=$false
+          $root=$env:GITHUB_WORKSPACE
+          $expected=$env:CANDIDATE_SHA.ToLowerInvariant()
+          $actual=((& git -C $root rev-parse HEAD)-join '').Trim().ToLowerInvariant()
+          if($LASTEXITCODE -ne 0 -or $actual -cne $expected){throw "Workflow checkout identity mismatch. Expected $expected, found $actual"}
+
+          $primary=Join-Path $root 'HMS-Skills-Manager.cmd'
+          $compat=Join-Path $root 'HMS-Superpowers-Manager.cmd'
+          $modelLauncher=Join-Path $root 'HMS-Model-Settings.cmd'
+          $managerShim=Join-Path $root 'manager\HmsSuperpowersManager.ps1'
+          $modelShim=Join-Path $root 'manager\HmsModelSettings.ps1'
+          foreach($path in @($primary,$compat,$modelLauncher,$managerShim,$modelShim)){
+            if(-not(Test-Path -LiteralPath $path -PathType Leaf)){throw "Required launcher trust file is missing: $path"}
+          }
+
+          $primaryText=[IO.File]::ReadAllText($primary)
+          $compatText=[IO.File]::ReadAllText($compat)
+          $modelText=[IO.File]::ReadAllText($modelLauncher)
+          if($compatText -cne $primaryText){throw 'Compatibility Manager launcher is not bound to the reviewed primary outer bootstrap.'}
+          foreach($literal in @("rev-parse `$spec","cat-file -t `$expected","[IO.File]::Open(`$path","ComputeHash(`$ms)","ScriptBlock]::Create(`$source)","-TrustedBootstrapBlob `$expected")){
+            if($modelText -notmatch [regex]::Escape($literal)){throw "Model Settings outer launcher is missing trust primitive: $literal"}
+          }
+          if($compatText -match '(?i)\s-File\s+.*HmsSuperpowersManager\.ps1'){throw 'Compatibility Manager launcher still executes the live shim with -File.'}
+          if($modelText -match '(?i)\s-File\s+.*HmsModelSettings\.ps1'){throw 'Model Settings launcher still executes the live shim with -File.'}
+          Write-Host 'PASS: both documented alternate launchers use an outer committed-byte bootstrap rather than direct -File execution.'
+
+          function Invoke-CmdLauncher {
+            param([Parameter(Mandatory)][string]$Path)
+            $output=(& cmd.exe /d /c "`"$Path`"" 2>&1) -join "`n"
+            return [pscustomobject]@{ ExitCode=$LASTEXITCODE; Output=$output }
+          }
+
+          function Assert-HiddenShimDriftRejected {
+            param(
+              [Parameter(Mandatory)][string]$RelativePath,
+              [Parameter(Mandatory)][string]$ShimPath,
+              [Parameter(Mandatory)][string]$LauncherPath,
+              [Parameter(Mandatory)][string]$SelfTestEnvironment,
+              [Parameter(Mandatory)][string]$ExpectedMessage
+            )
+            $original=[IO.File]::ReadAllBytes($ShimPath)
+            $sentinel=Join-Path $env:RUNNER_TEMP ('hms-preauth-sentinel-'+[guid]::NewGuid().ToString('N')+'.txt')
+            $oldEnv=[Environment]::GetEnvironmentVariable($SelfTestEnvironment,'Process')
+            try{
+              & git -C $root update-index --skip-worktree -- $RelativePath
+              if($LASTEXITCODE -ne 0){throw "Could not mark $RelativePath skip-worktree."}
+              $escaped=$sentinel.Replace("'","''")
+              $prefix="Set-Content -LiteralPath '$escaped' -Value 'UNREVIEWED_PREAUTH_EXECUTED' -Encoding UTF8`n"
+              $mutated=(New-Object Text.UTF8Encoding($false)).GetBytes($prefix) + $original
+              [IO.File]::WriteAllBytes($ShimPath,$mutated)
+              $status=((& git -C $root status --porcelain=v1 --untracked-files=all)-join "`n")
+              if($LASTEXITCODE -ne 0){throw 'git status failed during hidden-drift premise.'}
+              if($status -match [regex]::Escape($RelativePath)){throw "skip-worktree premise failed; ordinary status exposed $RelativePath."}
+              [Environment]::SetEnvironmentVariable($SelfTestEnvironment,'1','Process')
+              $result=Invoke-CmdLauncher -Path $LauncherPath
+              if($result.ExitCode -eq 0){throw "Launcher accepted hidden drift in $RelativePath."}
+              if($result.Output -notmatch [regex]::Escape($ExpectedMessage)){throw "Launcher rejected drift for an unexpected reason. Output: $($result.Output)"}
+              if(Test-Path -LiteralPath $sentinel){throw "Unreviewed code in $RelativePath executed before outer authentication."}
+            }
+            finally{
+              [Environment]::SetEnvironmentVariable($SelfTestEnvironment,$oldEnv,'Process')
+              [IO.File]::WriteAllBytes($ShimPath,$original)
+              & git -C $root update-index --no-skip-worktree -- $RelativePath 2>$null
+              Remove-Item -LiteralPath $sentinel -Force -ErrorAction SilentlyContinue
+            }
+            $after=((& git -C $root status --porcelain=v1 --untracked-files=all)-join "`n")
+            if($LASTEXITCODE -ne 0 -or -not[string]::IsNullOrWhiteSpace($after)){throw "Repository did not return to clean state after $RelativePath launcher regression: $after"}
+          }
+
+          Assert-HiddenShimDriftRejected -RelativePath 'manager/HmsSuperpowersManager.ps1' -ShimPath $managerShim -LauncherPath $compat -SelfTestEnvironment 'HMS_MANAGER_SELFTEST' -ExpectedMessage 'Manager launcher rejected uncommitted shim bytes.'
+          Write-Host 'PASS: compatibility Manager launcher rejects skip-worktree-hidden shim drift before any injected pre-auth code executes.'
+
+          Assert-HiddenShimDriftRejected -RelativePath 'manager/HmsModelSettings.ps1' -ShimPath $modelShim -LauncherPath $modelLauncher -SelfTestEnvironment 'HMS_MODEL_SETTINGS_SELFTEST' -ExpectedMessage 'Model Settings launcher rejected uncommitted shim bytes.'
+          Write-Host 'PASS: Model Settings launcher rejects skip-worktree-hidden shim drift before any injected pre-auth code executes.'
+          Write-Host 'PASS: documented HMS Manager compatibility and Model Settings launchers are exact-head outer-bootstrap qualified.'

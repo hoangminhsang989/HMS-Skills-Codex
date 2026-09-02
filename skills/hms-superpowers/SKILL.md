@@ -1,11 +1,26 @@
 ---
 name: hms-superpowers
-description: Use when working on an HMS project, continuing an HMS checkpoint, or when the user explicitly requests the HMS Superpowers workflow for implementation, debugging, review, integration, or release work.
+description: Use when working on an HMS project, continuing an HMS checkpoint, or when the user requests the unified HMS workflow for implementation, debugging, review, integration, UI work, or release work.
 ---
 
-# HMS Superpowers
+# HMS Core Orchestration Module
 
-Use this skill as the HMS orchestration entry point.
+This source is compiled into the single public `$hms-superpowers` skill. Inside the generated bundle it becomes `references/hms/hms-superpowers/MODULE.md`; it is not a separately invoked child skill.
+
+## Primary ownership
+
+HMS Core exclusively owns:
+
+- authority and checkpoint selection;
+- mutation permission and fail-closed decisions;
+- scope locking;
+- model-floor/escalation requirements;
+- evidence requirements;
+- independent-review criteria;
+- integration/release authorization;
+- durable checkpoint and handoff state.
+
+HMS Core does not choose an enabled runtime model directly. The always-internal `references/model-router/MODULE.md` classifies risk and emits the exact required floor; the always-internal `references/model-dispatcher/MODULE.md` maps that floor onto the model pool configured by Model Settings.
 
 ## Precedence
 
@@ -14,36 +29,128 @@ Always preserve this order:
 1. owner instruction;
 2. latest valid HMS checkpoint or frozen authority;
 3. HMS fail-closed and safety rules;
-4. HMS adaptive model-routing policy;
-5. HMS project-specific skills;
-6. upstream Superpowers;
-7. Codex defaults.
+4. HMS model risk floor and dedicated model-dispatcher contract;
+5. HMS project-specific product/UI authority;
+6. explicit Three-Level Delivery governance when the owner specifically requests that mode for the current slice;
+7. enabled Superpowers engineering method;
+8. enabled derived/advisory modules such as CodeGraph context, GPT Taste, and Impeccable;
+9. Codex defaults.
 
-A lower layer cannot silently override a higher one.
+A lower layer cannot silently override a higher one. CodeGraph output is derived repository context, never mutation authority or a replacement for committed bytes and fresh runtime evidence.
 
-## Start procedure
+## Task / module / model dispatch
 
-1. Invoke `$hms-authority-loader` when the task depends on prior HMS state.
-2. Establish current repository/runtime identity before a material mutation.
-3. Invoke `$hms-authority-gate` before changing production state.
-4. Invoke `$hms-scope-lock` for implementation or remediation work.
-5. Invoke `$hms-model-router` for non-trivial work and obey the strongest available routing mechanism. If the runtime cannot switch model/effort itself, report the required route instead of pretending it switched.
-6. Use upstream Superpowers process skills when applicable.
-7. Use `$hms-evidence-gate` before any PASS/completion claim.
-8. Add `$hms-independent-review` for architecture, security, trust-boundary, critical blocker, release, or final-stage gates.
-9. Use `$hms-release-gate` before merge/push/release when those actions are in scope.
-10. Use `$hms-handoff` after every material checkpoint.
+Treat non-trivial work as bounded task slices rather than assigning one model to the entire project.
+
+Before each material slice:
+
+1. assign exactly one enabled primary work-module owner;
+2. load `references/model-router/MODULE.md` and establish `RISK_CLASS` plus exact `REQUIRED_MODEL_FLOOR`;
+3. apply any higher-authority escalation by raising that floor, never lowering it;
+4. pass both values unchanged to `references/model-dispatcher/MODULE.md` and its resolver;
+5. list only the supporting enabled modules needed for that slice;
+6. bind the slice to an evidence, review, or release gate;
+7. re-dispatch whenever task type, uncertainty, blast radius, trust boundary, or release significance changes.
+
+Use this compact record when routing is material or changes:
+
+```text
+TASK_SLICE=<bounded work>
+PRIMARY_MODULE=<hms|superpowers|taste|impeccable>
+RISK_CLASS=<class>
+REQUIRED_MODEL_FLOOR=<LUNA_LOW_RISK|TERRA_MEDIUM_OR_STRONGER|TERRA_HIGH_OR_STRONGER|SOL_HIGH|SOL_XHIGH|SOL_MAX|SOL_MAX_AND_INDEPENDENT_REVIEW>
+ASSIGNED_MODEL=<gpt-5.6-luna|gpt-5.6-terra|gpt-5.6-sol|none>
+EFFORT=<maximum-available-for-luna|medium|high|xhigh|max|none>
+REASSIGNED=<true|false>
+SUPPORTING_MODULES=<enabled modules or none>
+COMPLETION_GATE=<gate>
+```
+
+The model pool is controlled independently from work-module ON/OFF state by `%USERPROFILE%\.codex\hms-composite\model-settings.json` through the Model Settings popup.
+
+Safe fallback is upward only:
+
+- Luna OFF -> Luna-class work may move to Terra, then Sol;
+- Terra OFF -> Terra-class work may move to Sol;
+- Sol OFF -> Sol-required work becomes `NO_ENABLED_MODEL_SATISFIES_REQUIRED_FLOOR`;
+- all models OFF -> every material model-routed slice is blocked.
+
+Never downgrade a mandatory capability floor merely to keep work moving. A stronger enabled model may satisfy a lower floor when authority permits.
+
+Model choice and module ownership are independent. GPT Taste does not automatically imply Sol, and Superpowers does not automatically imply Terra. Responsibility chooses the work module; risk/authority chooses the floor; the model dispatcher chooses the enabled model.
+
+If the required primary work module is disabled, report `MODULE_REQUIRED=<module>` and stop that material slice unless higher authority explicitly defines a fallback. Do not impersonate disabled HMS, Superpowers, Taste, or Impeccable responsibilities. If no enabled model satisfies the required floor, stop that slice. Never claim a runtime model switch without observable evidence.
+
+## Internal module routing
+
+Do not invoke child skills by `$name`. Load only the needed internal `MODULE.md` reference from the generated composite.
+
+For ordinary HMS work:
+
+1. Load `references/model-router/MODULE.md` and `references/model-dispatcher/MODULE.md` for every non-trivial model-routed slice; pass the exact required floor directly to the bundled resolver.
+2. Load `references/hms/hms-authority-loader/MODULE.md` when prior HMS state matters.
+3. Establish current repository/runtime identity before material mutation.
+4. Load `references/hms/hms-authority-gate/MODULE.md` before changing production state.
+5. Load `references/hms/hms-scope-lock/MODULE.md` for implementation or remediation.
+6. For material UI work, load `references/hms/hms-ui-design-authority/MODULE.md` before any design or production UI decision.
+7. When structural repository context is materially useful, load `references/hms/codegraph-context/MODULE.md`; CodeGraph remains an MCP/tool layer, not a public skill.
+8. When the owner explicitly requests Three-Level Delivery, load `references/hms/three-level-delivery/MODULE.md`; never infer that mode merely from task size or duration.
+9. If Superpowers is enabled, load only the relevant engineering-method reference under `references/superpowers/`.
+10. If UI advisors are enabled and UI authority leaves discretion, use `references/taste/MODULE.md` for visual direction and `references/impeccable/MODULE.md` for UI audit/polish. They are sequential advisors, not parallel owners.
+11. Load `references/hms/hms-evidence-gate/MODULE.md` before a PASS/completion claim.
+12. Load `references/hms/hms-independent-review/MODULE.md` for architecture, security, trust-boundary, critical-blocker, release, or final-stage gates.
+13. Load `references/hms/hms-release-gate/MODULE.md` before merge/push/release when those actions are in scope.
+14. Load `references/hms/hms-handoff/MODULE.md` after each material checkpoint.
+
+When HMS Core itself is OFF, its `references/hms/...` gates are absent and must not be invoked. The always-internal model router/dispatcher remain available for model assignment, but they do not inherit HMS governance/release authority.
+
+## One-primary-owner rule
+
+Every task slice has exactly one enabled primary work owner:
+
+- HMS Core: governance and final arbitration;
+- Superpowers: engineering method and implementation workflow;
+- GPT Taste: visual direction and aesthetic critique;
+- Impeccable: UI quality audit and polish.
+
+The Model Router and Model Dispatcher are not work-owner modules. They classify/assign model capability only.
+
+Supporting modules may advise, but they cannot independently redefine the same decision. Never allow Taste and Impeccable to run competing redesigns, and never allow two modules to mutate the same files or authority artifact concurrently.
+
+## UI sequence
+
+Apply only enabled modules, sequentially, inside the current owner/project UI authority:
+
+1. owner/project UI authority fixes the constraints; HMS UI authority participates only when HMS Core is enabled;
+2. GPT Taste proposes or critiques unresolved visual direction only when Taste is enabled;
+3. Impeccable audits and polishes the accepted direction only when Impeccable is enabled;
+4. Superpowers owns implementation method only when Superpowers is enabled;
+5. HMS Core owns HMS evidence, independent-review criteria, and release gates only when HMS Core is enabled.
+
+A frozen Penpot/DESIGN.md/tokens/component mapping contract cannot be silently replaced by Taste, Impeccable, upstream brainstorming, or agent preference.
+
+## Three-Level Delivery adaptation
+
+Three-Level Delivery is explicit opt-in governance inside an already-authorized HMS slice. Its canonical source is pinned in `delivery-tools.lock.json`. The internal HMS adapter must verify the exact source pin and canonical freshness gate before target mutation. A newer upstream version is `UPDATE_REQUIRED`, not permission to self-update.
+
+Inside a valid slice, Three-Level Delivery locks the approved slice, CodeGraph supplies bounded structural context, Superpowers supplies technical method, and Three-Level Delivery records evidence/state and stops at the Owner gate. The HMS release gate remains separately authoritative for merge, push, deployment, privilege, machine-state, or physical execution boundaries.
+
+## CodeGraph adaptation
+
+The HMS-managed CodeGraph release is pinned by exact tag/commit and Windows asset SHA-256 in `delivery-tools.lock.json`. Codex MCP registration must point to the exact HMS-managed binary path. A pre-existing `codegraph` MCP registration with a different command is a conflict and must never be overwritten silently.
+
+Require exact-checkout/worktree graph identity. Reject graph state borrowed from another worktree. If a governing workflow requires CodeGraph and it is unavailable, preserve the non-PASS state rather than silently substituting grep or guesswork.
 
 ## Superpowers adaptation
 
-Do not rerun brainstorming merely because upstream prefers it when an approved/frozen HMS product definition already resolves the design question. Brainstorm only genuinely unresolved choices.
+Do not rerun brainstorming merely because upstream prefers it when an approved/frozen HMS definition already resolves the design question. Brainstorm only genuinely unresolved choices.
 
-Use upstream systematic debugging when root cause is unknown. Use upstream worktree discipline for material mutations. Use TDD for deterministic production logic. For OS/kernel/UAC/service/native-I/O/hardware-dependent behavior, require the strongest appropriate deterministic harness plus real runtime evidence rather than inventing artificial unit tests.
+Use systematic debugging when root cause is unknown, worktree discipline for material mutations, and TDD for deterministic production logic. For OS/kernel/UAC/service/native-I/O/hardware-dependent behavior, require the strongest appropriate deterministic harness plus real runtime evidence rather than artificial unit evidence.
 
 ## Parallelism
 
-Parallel read-only analysis is allowed when concerns are independent. Do not allow concurrent agents to mutate the same files, authority artifact, or trust boundary.
+Parallel read-only analysis is allowed for independent concerns. No two modules or agents may concurrently mutate the same files, authority artifact, or trust boundary. When Three-Level Delivery is active, its stricter single-writable-checkout and one-Writer topology wins.
 
 ## Completion rule
 
-Evidence over claims. Authority over improvisation. Fail closed over assumption.
+One public skill. One enabled primary work owner per task slice. One always-internal risk classifier. One always-internal model dispatcher. Direct required-floor handoff. Upward-only safe fallback. Evidence over claims. Authority over improvisation. Fail closed over assumption.

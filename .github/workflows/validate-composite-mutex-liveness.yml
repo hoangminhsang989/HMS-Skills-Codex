@@ -1,0 +1,213 @@
+name: Validate HMS composite mutex liveness
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  windows-mutex-liveness:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Isolate mutex primitive implementation and public wrapper liveness
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedSha = $env:CANDIDATE_SHA.ToLowerInvariant()
+          $actualSha = (& git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $actualSha -ne $expectedSha) {
+            throw "Workflow checkout identity mismatch. Expected $expectedSha, found $actualSha"
+          }
+
+          $buildMutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
+          $builderPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.ps1'
+          $implementationPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.impl.ps1'
+
+          function Drain-JobsUntilTerminal {
+            param(
+              [Parameter(Mandatory)][object[]]$Jobs,
+              [Parameter(Mandatory)][string]$Label,
+              [Parameter(Mandatory)][int]$TimeoutSeconds
+            )
+            $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+            while ([DateTime]::UtcNow -lt $deadline) {
+              foreach ($job in $Jobs) { Receive-Job -Job $job -ErrorAction Stop | Write-Host }
+              if (@($Jobs | Where-Object { $_.State -notin @('Completed','Failed','Stopped') }).Count -eq 0) { break }
+              Start-Sleep -Milliseconds 200
+            }
+            foreach ($job in $Jobs) { Receive-Job -Job $job -ErrorAction Stop | Write-Host }
+            $nonCompleted = @($Jobs | Where-Object { $_.State -ne 'Completed' })
+            if ($nonCompleted.Count -ne 0) {
+              $states = (($Jobs | ForEach-Object { "Id=$($_.Id):$($_.State)" }) -join ', ')
+              throw "$Label did not complete within ${TimeoutSeconds}s. $states"
+            }
+            Write-Host "PASS: $Label completed within ${TimeoutSeconds}s."
+          }
+
+          function Remove-TestJobs {
+            param([object[]]$Jobs)
+            foreach ($job in @($Jobs)) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+          }
+
+          function Assert-ExternalMutexAcquire {
+            param([Parameter(Mandatory)][string]$Label)
+            $probe = Start-Job -ScriptBlock {
+              param($MutexName,$ProbeLabel)
+              $ErrorActionPreference = 'Stop'
+              Write-Output "HMS_MUTEX_PROBE_WAIT label=$ProbeLabel pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+              $mutex = New-Object System.Threading.Mutex($false, $MutexName)
+              $owned = $false
+              try {
+                try { $owned = $mutex.WaitOne([TimeSpan]::FromSeconds(10)) }
+                catch [System.Threading.AbandonedMutexException] { $owned = $true }
+                if (-not $owned) { throw "Timed out acquiring composite build mutex from external process: $MutexName" }
+                Write-Output "HMS_MUTEX_PROBE_ACQUIRED label=$ProbeLabel pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+              }
+              finally {
+                if ($owned) {
+                  $mutex.ReleaseMutex()
+                  $owned = $false
+                  Write-Output "HMS_MUTEX_PROBE_RELEASED label=$ProbeLabel pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+                }
+                $mutex.Dispose()
+              }
+            } -ArgumentList $buildMutexName,$Label
+            try { Drain-JobsUntilTerminal -Jobs @($probe) -Label "external mutex probe after $Label" -TimeoutSeconds 20 }
+            finally { Remove-TestJobs -Jobs @($probe) }
+          }
+
+          $mutexJobScript = {
+            param($MutexName,$Label,$HoldMilliseconds)
+            $ErrorActionPreference = 'Stop'
+            Write-Output "HMS_MUTEX_WAIT label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+            $mutex = New-Object System.Threading.Mutex($false, $MutexName)
+            $owned = $false
+            try {
+              try { $owned = $mutex.WaitOne([TimeSpan]::FromSeconds(10)) }
+              catch [System.Threading.AbandonedMutexException] { $owned = $true }
+              if (-not $owned) { throw "Mutex-only child timed out: $Label" }
+              Write-Output "HMS_MUTEX_ACQUIRED label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+              Start-Sleep -Milliseconds $HoldMilliseconds
+            }
+            finally {
+              if ($owned) {
+                $mutex.ReleaseMutex()
+                $owned = $false
+                Write-Output "HMS_MUTEX_RELEASED label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+              }
+              $mutex.Dispose()
+            }
+          }
+
+          $implementationJobScript = {
+            param($Implementation,$Install,$Output,$Skills,$Label)
+            $ErrorActionPreference = 'Stop'
+            Write-Output "HMS_IMPL_JOB_START label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+            & $Implementation `
+              -InstallRoot $Install `
+              -OutputRoot $Output `
+              -SkillsRoot $Skills `
+              -Hms $false `
+              -Superpowers $false `
+              -Taste $false `
+              -Impeccable $false
+            Write-Output "HMS_IMPL_JOB_RETURN label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+          }
+
+          $wrapperJobScript = {
+            param($Builder,$Install,$Output,$Skills,$Label)
+            $ErrorActionPreference = 'Stop'
+            Write-Output "HMS_WRAPPER_JOB_START label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+            & $Builder `
+              -InstallRoot $Install `
+              -OutputRoot $Output `
+              -SkillsRoot $Skills `
+              -Hms $false `
+              -Superpowers $false `
+              -Taste $false `
+              -Impeccable $false
+            Write-Output "HMS_WRAPPER_JOB_RETURN label=$Label pid=$PID utc=$([DateTime]::UtcNow.ToString('o'))"
+          }
+
+          $runnerHome = $env:USERPROFILE
+          $originalHome = $env:HOME
+          $originalCodexHome = $env:CODEX_HOME
+          $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-mutex-isolation-' + [guid]::NewGuid().ToString('N'))
+          try {
+            $env:HOME = $runnerHome
+            $env:CODEX_HOME = Join-Path $runnerHome '.codex'
+
+            # Baseline lifecycle and post-lifecycle probe stay lightweight and independent of external UI modules.
+            & "$env:GITHUB_WORKSPACE\install.ps1" `
+              -InstallRoot $env:GITHUB_WORKSPACE `
+              -SkipSuperpowers `
+              -SkipTaste `
+              -SkipImpeccable `
+              -SkipCodeGraph `
+              -SkipThreeLevelDelivery
+            Assert-ExternalMutexAcquire -Label 'install lifecycle'
+
+            # Phase M: prove two Start-Job child processes can serialize the exact named Mutex primitive itself.
+            $mutexJobs = @()
+            try {
+              $mutexJobs += Start-Job -ScriptBlock $mutexJobScript -ArgumentList $buildMutexName,'mutex-a',500
+              $mutexJobs += Start-Job -ScriptBlock $mutexJobScript -ArgumentList $buildMutexName,'mutex-b',500
+              Drain-JobsUntilTerminal -Jobs $mutexJobs -Label 'two-process mutex-only serialization' -TimeoutSeconds 15
+            }
+            finally { Remove-TestJobs -Jobs $mutexJobs }
+            Assert-ExternalMutexAcquire -Label 'mutex-only pair'
+
+            # Phase I: bypass the public trust/bootstrap wrapper and execute the implementation directly.
+            # Same OutputRoot/SkillsRoot intentionally preserves the serialized activation target while removing support-blob materialization.
+            $implOutput = Join-Path $tempRoot 'implementation-shared-output'
+            $implSkills = Join-Path $tempRoot 'implementation-shared-skills'
+            $implJobs = @()
+            try {
+              $implJobs += Start-Job -ScriptBlock $implementationJobScript -ArgumentList $implementationPath,$env:GITHUB_WORKSPACE,$implOutput,$implSkills,'impl-a'
+              $implJobs += Start-Job -ScriptBlock $implementationJobScript -ArgumentList $implementationPath,$env:GITHUB_WORKSPACE,$implOutput,$implSkills,'impl-b'
+              Drain-JobsUntilTerminal -Jobs $implJobs -Label 'two-process direct implementation OFF/OFF build' -TimeoutSeconds 45
+            }
+            finally { Remove-TestJobs -Jobs $implJobs }
+            Assert-ExternalMutexAcquire -Label 'direct implementation pair'
+
+            # Phase WD: execute two public wrappers concurrently but with distinct targets.
+            # If this fails while Phase I passes, shared output/Junction state is excluded and the public bootstrap/support path is isolated.
+            $distinctJobs = @()
+            try {
+              $distinctJobs += Start-Job -ScriptBlock $wrapperJobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,(Join-Path $tempRoot 'wrapper-a-output'),(Join-Path $tempRoot 'wrapper-a-skills'),'wrapper-distinct-a'
+              $distinctJobs += Start-Job -ScriptBlock $wrapperJobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,(Join-Path $tempRoot 'wrapper-b-output'),(Join-Path $tempRoot 'wrapper-b-skills'),'wrapper-distinct-b'
+              Drain-JobsUntilTerminal -Jobs $distinctJobs -Label 'two-process public wrapper distinct-target OFF/OFF build' -TimeoutSeconds 60
+            }
+            finally { Remove-TestJobs -Jobs $distinctJobs }
+            Assert-ExternalMutexAcquire -Label 'public wrapper distinct-target pair'
+
+            # Phase WS: original public-wrapper reproducer with one shared target, still OFF/OFF so no discovery Junction transition is involved.
+            $sharedOutput = Join-Path $tempRoot 'wrapper-shared-output'
+            $sharedSkills = Join-Path $tempRoot 'wrapper-shared-skills'
+            $sharedJobs = @()
+            try {
+              $sharedJobs += Start-Job -ScriptBlock $wrapperJobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$sharedOutput,$sharedSkills,'wrapper-shared-a'
+              $sharedJobs += Start-Job -ScriptBlock $wrapperJobScript -ArgumentList $builderPath,$env:GITHUB_WORKSPACE,$sharedOutput,$sharedSkills,'wrapper-shared-b'
+              Drain-JobsUntilTerminal -Jobs $sharedJobs -Label 'two-process public wrapper shared-target OFF/OFF build' -TimeoutSeconds 60
+            }
+            finally { Remove-TestJobs -Jobs $sharedJobs }
+            Assert-ExternalMutexAcquire -Label 'public wrapper shared-target pair'
+
+            Write-Host 'PASS: mutex primitive, direct implementation, distinct-target wrapper, and shared-target wrapper all satisfy bounded Windows cross-process liveness.'
+          }
+          finally {
+            if (Test-Path -LiteralPath $tempRoot) { Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue }
+            $env:HOME = $originalHome
+            $env:CODEX_HOME = $originalCodexHome
+          }

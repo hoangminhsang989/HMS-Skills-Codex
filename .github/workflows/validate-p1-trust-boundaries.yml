@@ -1,0 +1,341 @@
+name: Validate HMS P1 trust boundaries
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  windows-p1-trust-boundaries:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Qualify literal bootstrap and destructive quarantine boundaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $expectedSha = $env:CANDIDATE_SHA.ToLowerInvariant()
+          $actualSha = ((& git -C $env:GITHUB_WORKSPACE rev-parse HEAD) -join '').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $actualSha -ne $expectedSha) {
+            throw "Workflow checkout identity mismatch. Expected $expectedSha, found $actualSha"
+          }
+
+          $builderPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.ps1'
+          $implPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Build-HmsCompositeSkill.impl.ps1'
+          $uninstallPath = Join-Path $env:GITHUB_WORKSPACE 'uninstall.ps1'
+          $managerShimPath = Join-Path $env:GITHUB_WORKSPACE 'manager\HmsSuperpowersManager.ps1'
+          $managerImplPath = Join-Path $env:GITHUB_WORKSPACE 'manager\HmsSuperpowersManager.utf8.ps1'
+          $deliveryPath = Join-Path $env:GITHUB_WORKSPACE 'scripts\Sync-DeliveryTools.ps1'
+          foreach ($path in @($builderPath,$implPath,$uninstallPath,$managerShimPath,$managerImplPath,$deliveryPath)) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$errors) | Out-Null
+            if (@($errors).Count -ne 0) { throw "PowerShell parser rejected $path : $((@($errors) | ForEach-Object Message) -join ' | ')" }
+          }
+
+          $builderText = [IO.File]::ReadAllText($builderPath)
+          $implText = [IO.File]::ReadAllText($implPath)
+          $uninstallText = [IO.File]::ReadAllText($uninstallPath)
+          $managerShimText = [IO.File]::ReadAllText($managerShimPath)
+          $managerImplText = [IO.File]::ReadAllText($managerImplPath)
+          $deliveryText = [IO.File]::ReadAllText($deliveryPath)
+          foreach ($literal in @(
+            'hash-object --no-filters -- $resolvedCandidate',
+            'hash-object --no-filters -- $PSCommandPath'
+          )) {
+            if ($builderText -notmatch [regex]::Escape($literal)) { throw "Public bootstrap is missing literal-byte trust primitive: $literal" }
+          }
+          if ($builderText -match 'hash-object\s+"--path=\$relative"' -or $builderText -match 'hash-object\s+"--path=\$selfRelative"') {
+            throw 'Public bootstrap still authorizes executable bytes through Git clean/path filters.'
+          }
+          foreach ($literal in @(
+            'function Add-OwnedCompositeTreeRecords',
+            '[AllowEmptyString()][string]$LogicalPrefix',
+            '[Array]::Sort($sorted, [StringComparer]::Ordinal)',
+            'Reserve-OwnedCompositeRollbackBackup',
+            'Assert-OwnedCompositeIdentity -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha',
+            'Remove-OwnedCompositeIdentityQuarantine -Path $FinalRoot -ExpectedTreeSha256 $candidateCompositeTreeSha',
+            'Restore-OwnedCompositeRollbackBackup -BackupPath $backup -ReservedPath $reservedBackup -FinalPath $FinalRoot -ExpectedTreeSha256 $previousCompositeTreeSha',
+            '.hms-composite-rollback-reserved-',
+            '.hms-composite-deleting-'
+          )) {
+            if ($implText -notmatch [regex]::Escape($literal)) { throw "Composite builder is missing quarantine trust boundary: $literal" }
+          }
+          foreach ($literal in @(
+            'Remove-VerifiedCompositeRoot',
+            '.hms-composite-removing-',
+            '$assertOwnedCompositeRoot = ${function:Assert-OwnedCompositeRoot}',
+            '$validator={param($p) & $assertOwnedCompositeRoot -Path $p}.GetNewClosure()'
+          )) {
+            if ($uninstallText -notmatch [regex]::Escape($literal)) { throw "Uninstaller is missing composite quarantine trust boundary: $literal" }
+          }
+          if ($uninstallText -match [regex]::Escape("Remove-VerifiedDirectory -Path `$compositeRoot")) {
+            throw 'Uninstaller still recursively deletes the composite through the preflight pathname.'
+          }
+          foreach ($literal in @('Composite builder public shim','$__HmsVerifiedBuilderScriptBlock_v1','$__HmsVerifiedBuilderBlob_v1','-TrustedBootstrapBlob $__HmsVerifiedBuilderBlob_v1')) {
+            if ($managerShimText -notmatch [regex]::Escape($literal)) { throw "Manager is missing authenticated builder snapshot contract: $literal" }
+          }
+          if ($managerImplText -match [regex]::Escape("scripts\Test-HmsSkills.ps1")) { throw 'Production Manager still executes the developer validation suite.' }
+          foreach ($literal in @('Open-HmsDeliveryFileGuard -Path $markerPath -Label ''Existing CodeGraph transaction marker''','Move-HmsDeliveryFileGuard -Guard $existingGuard -Destination $oldReserved -Label ''Previous CodeGraph marker reservation''','Move-HmsDeliveryFileGuard -Guard $candidateGuard -Destination $markerPath -Label ''Candidate CodeGraph marker publication''')) {
+            if ($deliveryText -notmatch [regex]::Escape($literal)) { throw "Delivery tools are missing atomic marker publication contract: $literal" }
+          }
+          if ($deliveryText -match [regex]::Escape('$Identity | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $markerPath')) { throw 'CodeGraph marker publication regressed to direct canonical-path Set-Content.' }
+          Write-Host 'PASS: Manager builder execution and production Validate are authenticated/non-developer, and CodeGraph marker publication is atomic.'
+
+          Write-Host 'PASS: committed source contains literal bootstrap hashing and explicit composite quarantine/revalidation boundaries.'
+
+          # P1 regression 1: prove the historical Git-clean-filter forgery premise, then prove the
+          # public bootstrap rejects the altered literal bytes even though --path would authorize them.
+          $selfRelative = 'scripts/Build-HmsCompositeSkill.ps1'
+          $expectedSelf = ((& git -C $env:GITHUB_WORKSPACE rev-parse "$expectedSha`:$selfRelative") -join '').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $expectedSelf -notmatch '^[0-9a-f]{40}$') { throw 'Could not resolve committed public-bootstrap blob.' }
+          $infoAttributes = Join-Path $env:GITHUB_WORKSPACE '.git\info\attributes'
+          $hadAttributes = Test-Path -LiteralPath $infoAttributes
+          $originalAttributes = if ($hadAttributes) { [IO.File]::ReadAllText($infoAttributes) } else { $null }
+          $originalBuilder = [IO.File]::ReadAllBytes($builderPath)
+          try {
+            & git -C $env:GITHUB_WORKSPACE config filter.hms-bootstrap-mask.clean "git cat-file blob $expectedSelf"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not configure adversarial bootstrap clean filter.' }
+            [IO.File]::WriteAllText($infoAttributes, "$selfRelative filter=hms-bootstrap-mask`n", (New-Object System.Text.UTF8Encoding($false)))
+            [IO.File]::AppendAllText($builderPath, "`n# HMS_P1_FILTER_FORGERY_SENTINEL`n", (New-Object System.Text.UTF8Encoding($false)))
+
+            $filtered = ((& git -C $env:GITHUB_WORKSPACE hash-object "--path=$selfRelative" -- $builderPath) -join '').Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $filtered -cne $expectedSelf) {
+              throw "Adversarial clean-filter premise was not reproduced. Expected --path hash $expectedSelf, found $filtered"
+            }
+            $literal = ((& git -C $env:GITHUB_WORKSPACE hash-object --no-filters -- $builderPath) -join '').Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $literal -eq $expectedSelf) { throw 'Literal hash unexpectedly accepted altered public-bootstrap bytes.' }
+
+            $rejected = $false
+            $tempOutput = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-filter-output-' + [guid]::NewGuid().ToString('N'))
+            $tempSkills = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-filter-skills-' + [guid]::NewGuid().ToString('N'))
+            try {
+              & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -OutputRoot $tempOutput -SkillsRoot $tempSkills -Hms $false -Superpowers $false -Taste $false -Impeccable $false
+            }
+            catch {
+              if ($_.Exception.Message -match 'Public composite bootstrap bytes do not match HMS HEAD') { $rejected = $true }
+              else { throw }
+            }
+            finally {
+              Remove-Item -LiteralPath $tempOutput -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-Item -LiteralPath $tempSkills -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            if (-not $rejected) { throw 'Public bootstrap accepted altered bytes hidden behind a Git clean filter.' }
+          }
+          finally {
+            [IO.File]::WriteAllBytes($builderPath,$originalBuilder)
+            & git -C $env:GITHUB_WORKSPACE config --unset-all filter.hms-bootstrap-mask.clean 2>$null
+            if ($hadAttributes) { [IO.File]::WriteAllText($infoAttributes,$originalAttributes,(New-Object System.Text.UTF8Encoding($false))) }
+            else { Remove-Item -LiteralPath $infoAttributes -Force -ErrorAction SilentlyContinue }
+          }
+          Write-Host 'PASS: Git clean-filter forgery can fool --path hashing but cannot authorize altered public-bootstrap literal bytes.'
+
+          # P1 regression 2: replace FinalRoot after builder preflight but after staging starts.
+          # New code must quarantine the raced pathname, reject its missing ownership, and restore it;
+          # old code would activate the new stage and recursively delete the foreign backup.
+          $raceRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-builder-race-' + [guid]::NewGuid().ToString('N'))
+          $raceOutput = Join-Path $raceRoot 'output'
+          $raceSkills = Join-Path $raceRoot 'skills'
+          $finalRoot = Join-Path $raceOutput 'hms-superpowers'
+          $displacedOwned = Join-Path $raceOutput 'owned-displaced-by-test'
+          $foreignSentinel = Join-Path $finalRoot 'FOREIGN-PRESERVE.txt'
+          $watcher = $null
+          try {
+            & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -OutputRoot $raceOutput -SkillsRoot $raceSkills -Hms $false -Superpowers $false -Taste $false -Impeccable $false
+            if (-not (Test-Path -LiteralPath (Join-Path $finalRoot 'manifest.json'))) { throw 'Builder race baseline composite is missing.' }
+
+            $watcher = Start-Job -ScriptBlock {
+              param($OutputRoot,$FinalRoot,$Displaced,$ForeignSentinel)
+              $ErrorActionPreference='Stop'
+              $deadline=[DateTime]::UtcNow.AddSeconds(30)
+              while ([DateTime]::UtcNow -lt $deadline) {
+                $stage = @(Get-ChildItem -LiteralPath $OutputRoot -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.stage-*' })
+                if ($stage.Count -gt 0) { break }
+                Start-Sleep -Milliseconds 5
+              }
+              if (@(Get-ChildItem -LiteralPath $OutputRoot -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.stage-*' }).Count -eq 0) { throw 'Builder race watcher never observed staged materialization.' }
+              Rename-Item -LiteralPath $FinalRoot -NewName (Split-Path -Leaf $Displaced) -ErrorAction Stop
+              New-Item -ItemType Directory -Force -Path $FinalRoot | Out-Null
+              Set-Content -LiteralPath $ForeignSentinel -Value 'foreign replacement must survive' -Encoding UTF8
+            } -ArgumentList $raceOutput,$finalRoot,$displacedOwned,$foreignSentinel
+
+            $raceRejected = $false
+            try {
+              & $builderPath -InstallRoot $env:GITHUB_WORKSPACE -OutputRoot $raceOutput -SkillsRoot $raceSkills -Hms $false -Superpowers $false -Taste $false -Impeccable $false
+            }
+            catch {
+              if ($_.Exception.Message -match 'unowned composite|unexpected ownership|non-directory|reparse point') { $raceRejected = $true }
+              else { throw }
+            }
+            $null = Wait-Job -Job $watcher -Timeout 30
+            if ($watcher.State -ne 'Completed') { throw "Builder race watcher failed. State=$($watcher.State)" }
+            Receive-Job -Job $watcher -ErrorAction Stop | Out-Null
+            if (-not $raceRejected) { throw 'Builder did not fail closed after FinalRoot was replaced between preflight and quarantine rename.' }
+            if (-not (Test-Path -LiteralPath $foreignSentinel)) { throw 'Builder deleted or failed to restore the foreign FinalRoot replacement.' }
+            if (-not (Test-Path -LiteralPath (Join-Path $displacedOwned 'manifest.json'))) { throw 'Builder race setup lost the displaced previously-owned composite.' }
+            $leftovers = @(Get-ChildItem -LiteralPath $raceOutput -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '.backup-*' -or $_.Name -like '.hms-composite-deleting-*' })
+            if ($leftovers.Count -ne 0) { throw 'Builder race remediation left backup/deletion quarantine artifacts.' }
+          }
+          finally {
+            if ($null -ne $watcher) { Remove-Job -Job $watcher -Force -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $raceRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host 'PASS: builder revalidates the renamed previous composite and preserves a foreign FinalRoot replacement.'
+
+          # P1 regression 3: execute the actual uninstall composite-removal function in an isolated
+          # advanced-script harness. A replacement created after quarantine rename must survive at
+          # the original pathname while only the verified random quarantine is deleted.
+          $definitionStart=$uninstallText.IndexOf('$HmsRemote = ')
+          $definitionEnd=$uninstallText.IndexOf('$buildMutex = New-Object System.Threading.Mutex')
+          if($definitionStart -lt 0 -or $definitionEnd -le $definitionStart){throw 'Could not isolate uninstall pre-main production definitions.'}
+          $definitionText=$uninstallText.Substring($definitionStart,$definitionEnd-$definitionStart)
+          $harnessPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-uninstall-harness-' + [guid]::NewGuid().ToString('N') + '.ps1')
+          $harnessRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-p1-uninstall-root-' + [guid]::NewGuid().ToString('N'))
+          $harness = @"
+          [CmdletBinding(SupportsShouldProcess)]
+          param([Parameter(Mandatory)][string]`$TestHome)
+          Set-StrictMode -Version Latest
+          `$ErrorActionPreference='Stop'
+          `$env:USERPROFILE=`$TestHome
+          `$compositeRoot = Join-Path `$TestHome '.codex\hms-composite\hms-superpowers'
+          `$InstallRoot = Join-Path `$TestHome '.codex\hms-skills-codex'
+          $definitionText
+          New-Item -ItemType Directory -Force -Path `$compositeRoot | Out-Null
+          `$manifest=[ordered]@{schema_version=1;managed_by='HMS-Skills-Codex';artifact='hms-superpowers-composite';modules=[ordered]@{hms=`$false;superpowers=`$false;taste=`$false;impeccable=`$false}}
+          `$manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path `$compositeRoot 'manifest.json') -Encoding UTF8
+          Set-Content -LiteralPath (Join-Path `$compositeRoot 'OWNED.txt') -Value 'owned quarantine' -Encoding UTF8
+          `$foreignSentinel=Join-Path `$compositeRoot 'FOREIGN-PRESERVE.txt'
+          `$watcher=Start-Job -ScriptBlock {
+            param(`$Original,`$Sentinel)
+            `$ErrorActionPreference='Stop'
+            `$deadline=[DateTime]::UtcNow.AddSeconds(20)
+            while ((Test-Path -LiteralPath `$Original) -and [DateTime]::UtcNow -lt `$deadline) { Start-Sleep -Milliseconds 2 }
+            if (Test-Path -LiteralPath `$Original) { throw 'Composite quarantine rename was never observed.' }
+            New-Item -ItemType Directory -Force -Path `$Original | Out-Null
+            Set-Content -LiteralPath `$Sentinel -Value 'foreign replacement must survive' -Encoding UTF8
+          } -ArgumentList `$compositeRoot,`$foreignSentinel
+          try {
+            Remove-VerifiedCompositeRoot -Path `$compositeRoot -Action 'P1 regression composite removal'
+            `$null=Wait-Job -Job `$watcher -Timeout 20
+            if (`$watcher.State -ne 'Completed') { throw "Composite replacement watcher failed. State=`$(`$watcher.State)" }
+            Receive-Job -Job `$watcher -ErrorAction Stop | Out-Null
+            if (-not (Test-Path -LiteralPath `$foreignSentinel)) { throw 'Foreign replacement at original composite pathname was deleted.' }
+            `$parent=Split-Path -Parent `$compositeRoot
+            `$leftovers=@(Get-ChildItem -LiteralPath `$parent -Force -ErrorAction SilentlyContinue | Where-Object { `$_.Name -like '.hms-composite-removing-*' })
+            if (`$leftovers.Count -ne 0) { throw 'Composite uninstall quarantine left residue.' }
+          }
+          finally { Remove-Job -Job `$watcher -Force -ErrorAction SilentlyContinue }
+          "@ 
+          [IO.File]::WriteAllText($harnessPath,$harness,(New-Object System.Text.UTF8Encoding($false)))
+          try {
+            & $harnessPath -TestHome $harnessRoot
+            if ($LASTEXITCODE -ne 0) { throw "Composite uninstall harness failed with exit code $LASTEXITCODE." }
+          }
+          finally {
+            Remove-Item -LiteralPath $harnessPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $harnessRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host 'PASS: uninstall composite deletion quarantines/revalidates the exact owned root and preserves a foreign replacement pathname.'
+
+          # P1 regression 4: modified builder bytes must be rejected before injected pre-auth code can execute.
+          $managerSentinel = Join-Path ([IO.Path]::GetTempPath()) ('hms-manager-builder-sentinel-' + [guid]::NewGuid().ToString('N') + '.txt')
+          $originalBuilderBytes = [IO.File]::ReadAllBytes($builderPath)
+          try {
+              $sentinelLiteral = $managerSentinel.Replace("'", "''")
+              $originalBuilderText = (New-Object Text.UTF8Encoding($false,$true)).GetString($originalBuilderBytes)
+              $mutatedBuilder = "[IO.File]::WriteAllText('$sentinelLiteral','UNREVIEWED_BUILDER_EXECUTED')`n" + $originalBuilderText
+              [IO.File]::WriteAllText($builderPath,$mutatedBuilder,(New-Object Text.UTF8Encoding($false)))
+              $blocked = $false
+              try { & $managerShimPath -SelfTest }
+              catch {
+                  if ($_.Exception.Message -match 'Composite builder public shim literal bytes do not match HMS HEAD') { $blocked = $true }
+                  else { throw }
+              }
+              if (-not $blocked) { throw 'Manager accepted modified composite builder bytes.' }
+              if (Test-Path -LiteralPath $managerSentinel) { throw 'Modified builder executed pre-auth code before Manager rejection.' }
+          }
+          finally {
+              [IO.File]::WriteAllBytes($builderPath,$originalBuilderBytes)
+              Remove-Item -LiteralPath $managerSentinel -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host 'PASS: Manager rejects altered builder bytes before injected pre-auth code can execute.'
+
+          # P1 regression 5: failed publication of an existing CodeGraph marker must preserve old bytes exactly.
+          $markerProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-codegraph-marker-atomic-' + [guid]::NewGuid().ToString('N'))
+          try {
+              & {
+                  param($DeliveryPath,$ProbeRoot)
+                  . $DeliveryPath -SkipCodeGraph -SkipThreeLevelDelivery
+                  $bundle = Join-Path $ProbeRoot 'current'
+                  New-Item -ItemType Directory -Force -Path $bundle | Out-Null
+                  [IO.File]::WriteAllText((Join-Path $bundle 'payload.txt'),'owned payload',(New-Object Text.UTF8Encoding($false)))
+                  $tree = Get-CodeGraphBundleTreeSha256 -Path $bundle
+                  $sha = ('a' * 64) -join ''
+                  $oldIdentity = New-CodeGraphBundleIdentity -TransactionId ('1' * 32 -join '') -Role 'candidate' -Version '1.0.0' -Tag 'v1.0.0' -Commit ('b' * 40 -join '') -Asset 'codegraph.zip' -Sha256 $sha -BundleTreeSha256 $tree
+                  Write-CodeGraphBundleMarker -Path $bundle -Identity $oldIdentity
+                  Assert-CodeGraphTransactionBundle -Path $bundle -Identity $oldIdentity
+                  $marker = Join-Path $bundle $CodeGraphBundleMarkerName
+                  $before = [Convert]::ToBase64String([IO.File]::ReadAllBytes($marker))
+                  $newIdentity = New-CodeGraphBundleIdentity -TransactionId ('2' * 32 -join '') -Role 'backup' -Version '1.0.0' -Tag 'v1.0.0' -Commit ('b' * 40 -join '') -Asset 'codegraph.zip' -Sha256 $sha -BundleTreeSha256 $tree
+                  $guard = [IO.File]::Open($marker,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+                  $failed = $false
+                  try { Write-CodeGraphBundleMarker -Path $bundle -Identity $newIdentity -ExpectedPreviousIdentity $oldIdentity }
+                  catch { $failed = $true }
+                  finally { $guard.Dispose() }
+                  if (-not $failed) { throw 'Atomic marker regression did not force a publication failure.' }
+                  $after = [Convert]::ToBase64String([IO.File]::ReadAllBytes($marker))
+                  if ($after -cne $before) { throw 'Failed atomic marker publication changed the previous canonical marker bytes.' }
+                  Assert-CodeGraphTransactionBundle -Path $bundle -Identity $oldIdentity
+              } $deliveryPath $markerProbeRoot
+          }
+          finally {
+              Remove-Item -LiteralPath $markerProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host 'PASS: failed existing-marker publication preserves the exact previous CodeGraph marker and identity.'
+
+          Write-Host 'PASS: all five remediated P1 trust boundaries are qualified on exact candidate HEAD.'
+
+      - name: Qualify fresh-review V9 exact-object activation boundaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Set-StrictMode -Version Latest
+          $builder=Join-Path $env:GITHUB_WORKSPACE 'scripts\\Build-HmsCompositeSkill.ps1'
+          $impl=Join-Path $env:GITHUB_WORKSPACE 'scripts\\Build-HmsCompositeSkill.impl.ps1'
+          $delivery=Join-Path $env:GITHUB_WORKSPACE 'scripts\\Sync-DeliveryTools.ps1'
+          $model=Join-Path $env:GITHUB_WORKSPACE 'manager\\HmsModelSettings.utf8.ps1'
+          $modelShim=Join-Path $env:GITHUB_WORKSPACE 'manager\\HmsModelSettings.ps1'
+          $it=[IO.File]::ReadAllText($impl);$dt=[IO.File]::ReadAllText($delivery);$mt=[IO.File]::ReadAllText($model)
+          foreach($literal in @('Move-OwnedCompositeStageToFinal','Move-HmsCompositeDirectoryGuard -Guard $previousGuard','Composite stage discovery publication')){if($it -notmatch [regex]::Escape($literal)){throw "Missing V9 composite exact-object contract: $literal"}}
+          if($it -match [regex]::Escape('Rename-Item -LiteralPath $stage -NewName (Split-Path -Leaf $FinalRoot)')){throw 'Composite stage activation still uses the mutable stage pathname.'}
+          foreach($literal in @('Open-CodeGraphVerifiedArchive','Get-CodeGraphArchiveLogicalTreeSha256','Move-HmsDeliveryDirectoryGuard -Guard $currentGuard','Move-CodeGraphCandidateToCurrent','archive-derived logical tree')){if($dt -notmatch [regex]::Escape($literal)){throw "Missing V9 CodeGraph trust contract: $literal"}}
+          foreach($bad in @('Move-Item -LiteralPath $CurrentPath -Destination $BackupPath','Move-Item -LiteralPath $candidate -Destination $current','Assert-CodeGraphVersion -CommandPath $candidateCommand')){if($dt -match [regex]::Escape($bad)){throw "CodeGraph retains superseded mutable/executable transition: $bad"}}
+          $reader=[regex]::Match($mt,'(?s)function Read-ModelState-Unserialized \{.*?\n\}').Value
+          foreach($literal in @('Open-HmsModelSettingsFileGuard','Read-ModelStateFromGuard')){if($reader -notmatch [regex]::Escape($literal)){throw "Model Settings reader missing exact guard contract: $literal"}}
+          if($reader -match [regex]::Escape('[IO.File]::ReadAllText')){throw 'Model Settings reader still reopens canonical pathname after regular-file validation.'}
+
+          # Composite stage guard: while the exact DELETE-capable stage root handle is live,
+          # a second process must be unable to rename/replace that staged object.
+          $r=Join-Path $env:RUNNER_TEMP ('hms-v9-stage-'+[guid]::NewGuid().ToString('N'));$o=Join-Path $r 'out';$s=Join-Path $r 'skills';$signal=Join-Path $r 'ready.txt';New-Item -ItemType Directory -Force -Path $r|Out-Null
+          $job=Start-Job -ScriptBlock {param($b,$repo,$o,$s,$sig);$env:HMS_TEST_STAGE_ACTIVATION_GUARD_READY=$sig;& $b -InstallRoot $repo -OutputRoot $o -SkillsRoot $s -Hms $false -Superpowers $false -Taste $false -Impeccable $false} -ArgumentList $builder,$env:GITHUB_WORKSPACE,$o,$s,$signal
+          try{$deadline=[DateTime]::UtcNow.AddSeconds(40);while(-not(Test-Path -LiteralPath $signal)-and[DateTime]::UtcNow-lt$deadline){Start-Sleep -Milliseconds 50};if(-not(Test-Path -LiteralPath $signal)){throw 'Stage guard probe never became ready.'};$stage=[IO.File]::ReadAllText($signal);$blocked=$false;try{Rename-Item -LiteralPath $stage -NewName 'foreign-stage-swap' -ErrorAction Stop}catch{$blocked=$true};if(-not$blocked){throw 'Exact stage guard allowed hostile stage rename.'};$null=Wait-Job $job -Timeout 60;if($job.State-ne'Completed'){throw "Stage build probe failed: $($job.State)"};Receive-Job $job -ErrorAction Stop|Out-Null}finally{Remove-Job $job -Force -ErrorAction SilentlyContinue;Remove-Item $r -Recurse -Force -ErrorAction SilentlyContinue}
+
+          . $delivery -SkipCodeGraph -SkipThreeLevelDelivery
+          # Exact verified archive: holding authority must block replacement, and archive-derived
+          # logical tree must equal extracted immutable contents.
+          $r=Join-Path $env:RUNNER_TEMP ('hms-v9-zip-'+[guid]::NewGuid().ToString('N'));$src=Join-Path $r 'codegraph-win32-x64';$bin=Join-Path $src 'bin';$zip=Join-Path $r 'cg.zip';$x=Join-Path $r 'x';New-Item -ItemType Directory -Force -Path $bin|Out-Null;[IO.File]::WriteAllText((Join-Path $bin 'codegraph.cmd'),'@echo off',[Text.Encoding]::ASCII);[IO.File]::WriteAllText((Join-Path $src 'payload.txt'),'immutable',[Text.Encoding]::UTF8);Compress-Archive -Path $src -DestinationPath $zip; $sha=(Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant();$a=Open-CodeGraphVerifiedArchive -Path $zip -ExpectedSha256 $sha -Architecture 'x64'
+          try{$blocked=$false;try{Move-Item -LiteralPath $zip -Destination (Join-Path $r 'swap.zip') -ErrorAction Stop}catch{$blocked=$true};if(-not$blocked){throw 'Verified archive authority allowed pathname replacement.'};Expand-Archive $zip -DestinationPath $x; $inner=Join-Path $x 'codegraph-win32-x64';$tree=Get-CodeGraphBundleTreeSha256 -Path $inner;if($tree-cne[string]$a.ExpectedTreeSha256){throw 'Archive-derived tree did not match extracted immutable tree.'}}finally{$a.Stream.Dispose();Remove-Item $r -Recurse -Force -ErrorAction SilentlyContinue}
+
+          # Model Settings direct production self-test exercises the guarded read/write resolver path.
+          & $modelShim -SelfTest
+          Write-Host 'PASS: V9 fresh-review exact-object stage/CodeGraph/archive/Model-Settings boundaries qualified.'

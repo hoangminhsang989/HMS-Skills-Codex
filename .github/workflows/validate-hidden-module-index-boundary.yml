@@ -1,0 +1,112 @@
+name: Validate HMS hidden module index boundary
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  windows-hidden-module-index:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Reject hidden committed module before live enumeration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $expectedSha = $env:CANDIDATE_SHA.ToLowerInvariant()
+          $workspace = $env:GITHUB_WORKSPACE
+          $actualSha = ((& git -C $workspace rev-parse HEAD) -join '').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $actualSha -cne $expectedSha) {
+            throw "Workflow checkout identity mismatch. Expected $expectedSha, found $actualSha"
+          }
+
+          $builder = Join-Path $workspace 'scripts\Build-HmsCompositeSkill.ps1'
+          $relative = 'skills/hms-independent-review/SKILL.md'
+          $skill = Join-Path $workspace ($relative -replace '/', '\')
+          if (-not (Test-Path -LiteralPath $skill -PathType Leaf)) {
+            throw "Regression fixture is missing committed child skill: $relative"
+          }
+
+          $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-hidden-module-index-' + [guid]::NewGuid().ToString('N'))
+          $outputRoot = Join-Path $testRoot 'output'
+          $skillsRoot = Join-Path $testRoot 'agents\skills'
+          $manifestPath = Join-Path $outputRoot 'hms-superpowers\manifest.json'
+          $flagSet = $false
+          try {
+            # Positive baseline proves this exact HEAD can build the full HMS collection normally.
+            & $builder -InstallRoot $workspace -OutputRoot $outputRoot -SkillsRoot $skillsRoot -Hms $true -Superpowers $false -Taste $false -Impeccable $false
+            if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw 'Hidden-module regression baseline did not create a manifest.' }
+            $manifestHashBefore = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+            $baselineModule = Join-Path $outputRoot 'hms-superpowers\references\hms\hms-independent-review\MODULE.md'
+            if (-not (Test-Path -LiteralPath $baselineModule -PathType Leaf)) { throw 'Baseline composite omitted hms-independent-review before adversarial mutation.' }
+
+            & git -C $workspace update-index --skip-worktree -- $relative
+            if ($LASTEXITCODE -ne 0) { throw 'Could not mark regression child skill skip-worktree.' }
+            $flagSet = $true
+            Remove-Item -LiteralPath $skill -Force
+            if (Test-Path -LiteralPath $skill) { throw 'Could not remove hidden-index regression child skill from live worktree.' }
+
+            $status = ((& git -C $workspace status --porcelain=v1 --untracked-files=all) -join "`n").Trim()
+            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect worktree after hidden-index mutation.' }
+            if (-not [string]::IsNullOrWhiteSpace($status)) {
+              throw "Regression premise failed: ordinary Git status exposed skip-worktree deletion: $status"
+            }
+
+            $flagLine = ((& git -C $workspace ls-files -v -- $relative) -join '').Trim()
+            if ($LASTEXITCODE -ne 0 -or $flagLine -notmatch '^S ') {
+              throw "Regression premise failed: skip-worktree flag was not observable through ls-files -v: $flagLine"
+            }
+
+            $rejected = $false
+            try {
+              & $builder -InstallRoot $workspace -OutputRoot $outputRoot -SkillsRoot $skillsRoot -Hms $true -Superpowers $false -Taste $false -Impeccable $false
+            }
+            catch {
+              if ($_.Exception.Message -match 'enumerated skill-tree files use skip-worktree/assume-unchanged index flags') {
+                $rejected = $true
+              }
+              else {
+                throw
+              }
+            }
+            if (-not $rejected) {
+              throw 'Builder silently accepted a committed HMS child module hidden from live enumeration by skip-worktree.'
+            }
+
+            $manifestHashAfter = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
+            if ($manifestHashAfter -cne $manifestHashBefore) {
+              throw 'Hidden-index rejection mutated the previously active composite manifest.'
+            }
+            if (-not (Test-Path -LiteralPath $baselineModule -PathType Leaf)) {
+              throw 'Hidden-index rejection damaged the previously active independent-review module.'
+            }
+
+            Write-Host 'PASS: skip-worktree can hide a committed child SKILL.md from ordinary status/live enumeration, and the builder rejects it before composite activation.'
+          }
+          finally {
+            if ($flagSet) {
+              & git -C $workspace update-index --no-skip-worktree -- $relative 2>$null
+            }
+            & git -C $workspace restore --worktree -- $relative 2>$null
+            if (Test-Path -LiteralPath $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+
+          if (-not (Test-Path -LiteralPath $skill -PathType Leaf)) { throw 'Regression cleanup did not restore committed child skill.' }
+          $finalStatus = ((& git -C $workspace status --porcelain=v1 --untracked-files=all) -join "`n").Trim()
+          if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($finalStatus)) {
+            throw "Regression cleanup did not restore a clean worktree: $finalStatus"
+          }
+          Write-Host 'PASS: hidden module index regression cleanup restored exact candidate worktree state.'

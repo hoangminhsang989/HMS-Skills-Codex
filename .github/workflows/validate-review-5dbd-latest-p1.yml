@@ -1,0 +1,309 @@
+name: Validate HMS latest CodeGraph rollback P1 boundaries
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  windows-latest-codegraph-rollback-p1:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+
+      - name: Qualify production catch enclosure and exact rollback identities
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Set-StrictMode -Version Latest
+          $workspace=$env:GITHUB_WORKSPACE
+          $expected=$env:CANDIDATE_SHA.ToLowerInvariant()
+          $actual=((& git -C $workspace rev-parse HEAD)-join '').Trim().ToLowerInvariant()
+          if($LASTEXITCODE -ne 0 -or $actual -cne $expected){throw "Workflow checkout identity mismatch. Expected $expected, found $actual"}
+
+          $delivery=Join-Path $workspace 'scripts\Sync-DeliveryTools.ps1'
+          $composite=Join-Path $workspace 'scripts\Build-HmsCompositeSkill.impl.ps1'
+
+          function Parse-CheckedAst {
+            param([Parameter(Mandatory)][string]$Path)
+            $tokens=$null;$errors=$null
+            $ast=[Management.Automation.Language.Parser]::ParseFile($Path,[ref]$tokens,[ref]$errors)
+            if(@($errors).Count){throw "PowerShell parser rejected $Path : $((@($errors)|ForEach-Object Message)-join ' | ')"}
+            return $ast
+          }
+
+          function Get-OneFunctionAst {
+            param($Ast,[Parameter(Mandatory)][string]$Name)
+            $nodes=@($Ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $Name},$true))
+            if($nodes.Count -ne 1){throw "Expected one function '$Name', found $($nodes.Count)."}
+            return $nodes[0]
+          }
+
+          function Get-FunctionText {
+            param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string[]]$Names)
+            $ast=Parse-CheckedAst -Path $Path
+            $texts=@()
+            foreach($name in $Names){$texts+=(Get-OneFunctionAst -Ast $ast -Name $name).Extent.Text}
+            return ($texts -join "`r`n`r`n")
+          }
+
+          $deliveryAst=Parse-CheckedAst -Path $delivery
+          $deliveryText=[IO.File]::ReadAllText($delivery)
+          foreach($literal in @(
+            'function Add-CodeGraphBundleTreeRecords',
+            'function Get-CodeGraphBundleTreeSha256',
+            'bundle_transaction_id',
+            'bundle_tree_sha256',
+            'function Assert-CodeGraphBundleAgainstManifest',
+            'HMS_TEST_FAIL_CODEGRAPH_AFTER_BACKUP_RENAME',
+            '$previousIdentity = Move-CodeGraphCurrentToRollbackBackup',
+            'Write-CodeGraphBundleMarker -Path $CurrentPath -Identity $PreviousIdentity',
+            'Repair-CodeGraphRollbackState -CurrentPath $current -BackupPath $backup',
+            '$assertCodeGraphTransactionBundle = ${function:Assert-CodeGraphTransactionBundle}',
+            '$validator={param($p) & $assertCodeGraphTransactionBundle -Path $p -Identity $Identity}.GetNewClosure()'
+          )){if($deliveryText -notmatch [regex]::Escape($literal)){throw "Latest CodeGraph rollback contract is missing: $literal"}}
+
+          # Structural proof for review P2: find the production Move command, walk its AST parents to the
+          # exact enclosing try statement, and prove that same try owns a catch which invokes Repair.
+          $sync=Get-OneFunctionAst -Ast $deliveryAst -Name 'Sync-CodeGraphBundle'
+          $moves=@($sync.Body.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Move-CodeGraphCurrentToRollbackBackup'},$true))
+          if($moves.Count -ne 1){throw "Expected exactly one production Move-CodeGraphCurrentToRollbackBackup command, found $($moves.Count)."}
+          $cursor=$moves[0].Parent
+          $enclosingTry=$null
+          while($null -ne $cursor){
+            if($cursor -is [Management.Automation.Language.TryStatementAst]){$enclosingTry=$cursor;break}
+            $cursor=$cursor.Parent
+          }
+          if($null -eq $enclosingTry){throw 'Production current-to-backup transition is not enclosed by a TryStatementAst.'}
+          if($moves[0].Extent.StartOffset -lt $enclosingTry.Body.Extent.StartOffset -or $moves[0].Extent.EndOffset -gt $enclosingTry.Body.Extent.EndOffset){
+            throw 'Production current-to-backup transition is not inside the body of its enclosing try statement.'
+          }
+          $repairs=@()
+          foreach($clause in @($enclosingTry.CatchClauses)){
+            $repairs+=@($clause.Body.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Repair-CodeGraphRollbackState'},$true))
+          }
+          if($repairs.Count -lt 1){throw 'The exact try enclosing current-to-backup transition has no catch invoking Repair-CodeGraphRollbackState.'}
+
+          # V9 trust contract: no persisted, renamed, or freshly extracted CodeGraph launcher may execute
+          # before publication. Locked release bytes plus the archive-derived logical tree authenticate
+          # the candidate, and exact directory handles carry that identity across activation.
+          foreach($name in @('Assert-CodeGraphBundleAgainstManifest','Move-CodeGraphCurrentToRollbackBackup','Assert-CodeGraphTransactionBundle')){
+            $fn=Get-OneFunctionAst -Ast $deliveryAst -Name $name
+            $bad=@($fn.Body.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Assert-CodeGraphVersion'},$true))
+            if($bad.Count -ne 0){throw "Previous-bundle trust function '$name' executes CodeGraph version bytes."}
+          }
+          $versionCalls=@($sync.Body.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Assert-CodeGraphVersion'},$true))
+          if($versionCalls.Count -ne 0){throw 'Sync-CodeGraphBundle executes extracted CodeGraph bytes before trusted publication.'}
+
+          $archiveFn=Get-OneFunctionAst -Ast $deliveryAst -Name 'Open-CodeGraphVerifiedArchive'
+          $archiveText=$archiveFn.Extent.Text
+          foreach($literal in @(
+            'New-Object IO.FileStream($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)',
+            'Get-FileHash -LiteralPath $Path -Algorithm SHA256',
+            '$tree = Get-CodeGraphArchiveLogicalTreeSha256 -ArchivePath $Path -Architecture $Architecture',
+            'return [pscustomobject]@{ Stream=$stream; ExpectedTreeSha256=$tree; AssetSha256=$actual }'
+          )){if($archiveText -notmatch [regex]::Escape($literal)){throw "Verified CodeGraph archive contract is missing: $literal"}}
+
+          $candidateMove=Get-OneFunctionAst -Ast $deliveryAst -Name 'Move-CodeGraphCandidateToCurrent'
+          $candidateMoveText=$candidateMove.Extent.Text
+          foreach($literal in @(
+            'Open-HmsDeliveryDirectoryGuard -Path $CandidatePath -Label ''CodeGraph candidate activation''',
+            'Move-HmsDeliveryDirectoryGuard -Guard $guard -Destination $CurrentPath -Label ''CodeGraph candidate activation''',
+            'Assert-CodeGraphTransactionBundle -Path $CurrentPath -Identity $Identity'
+          )){if($candidateMoveText -notmatch [regex]::Escape($literal)){throw "Exact CodeGraph candidate activation contract is missing: $literal"}}
+
+          $syncText=$sync.Extent.Text
+          foreach($literal in @(
+            '$archiveAuthority = Open-CodeGraphVerifiedArchive -Path $zip -ExpectedSha256 $expectedSha -Architecture $arch',
+            '$actualCandidateTree = Get-CodeGraphBundleTreeSha256 -Path $candidate',
+            '$candidateTreeSha = [string]$archiveAuthority.ExpectedTreeSha256',
+            '$candidateActivationGuard = Move-CodeGraphCandidateToCurrent -CandidatePath $candidate -CurrentPath $current -Identity $candidateIdentity'
+          )){if($syncText -notmatch [regex]::Escape($literal)){throw "V9 CodeGraph immutable-candidate contract is missing: $literal"}}
+
+          $compositeAst=Parse-CheckedAst -Path $composite
+          $compositeText=[IO.File]::ReadAllText($composite)
+          foreach($literal in @(
+            'function Add-OwnedCompositeTreeRecords',
+            'function Get-OwnedCompositeTreeSha256',
+            'function Reserve-OwnedCompositeRollbackBackup',
+            'function Restore-OwnedCompositeRollbackBackup',
+            '$reservedBackup = Reserve-OwnedCompositeRollbackBackup -Path $backup -ExpectedTreeSha256 $previousCompositeTreeSha',
+            'Restore-OwnedCompositeRollbackBackup -BackupPath $backup -ReservedPath $reservedBackup -FinalPath $FinalRoot -ExpectedTreeSha256 $previousCompositeTreeSha',
+            'Remove-OwnedCompositeIdentityQuarantine -Path $FinalRoot -ExpectedTreeSha256 $candidateCompositeTreeSha'
+          )){if($compositeText -notmatch [regex]::Escape($literal)){throw "Composite rollback identity contract is missing: $literal"}}
+
+          $deliveryLiteral=$delivery.Replace("'","''")
+          $deliveryDefs=". '$deliveryLiteral' -SkipCodeGraph -SkipThreeLevelDelivery"
+          $compositeDefinitionStart=$compositeText.IndexOf('$CompositeName = ')
+          $compositeDefinitionEnd=$compositeText.IndexOf('$stageId = $null')
+          if($compositeDefinitionStart -lt 0 -or $compositeDefinitionEnd -le $compositeDefinitionStart){throw 'Could not isolate composite pre-main production definitions.'}
+          $compositeDefs=$compositeText.Substring($compositeDefinitionStart,$compositeDefinitionEnd-$compositeDefinitionStart)
+
+          $harness=Join-Path $env:RUNNER_TEMP ('hms-latest-rollback-identity-'+[guid]::NewGuid().ToString('N')+'.ps1')
+          $root=Join-Path $env:RUNNER_TEMP ('hms-latest-rollback-identity-root-'+[guid]::NewGuid().ToString('N'))
+          $script=@"
+          param([string]`$Root)
+          Set-StrictMode -Version Latest
+          `$ErrorActionPreference='Stop'
+          `$ManagedBy='HMS-Skills-Codex'
+          `$Artifact='hms-superpowers-composite'
+          `$CodeGraphBundleMarkerName='.hms-codegraph-bundle.json'
+          $deliveryDefs
+          `$InstallRoot=`$Root
+          `$OutputRoot=`$Root
+          `$SkillsRoot=`$Root
+          $compositeDefs
+
+          function New-TestCodeGraphBundle{
+            param([string]`$Path,`$Identity,[string]`$CommandText)
+            New-Item -ItemType Directory -Force -Path (Join-Path `$Path 'bin')|Out-Null
+            if([string]::IsNullOrWhiteSpace(`$CommandText)){`$CommandText="@echo off`r`necho " + [string]`$Identity.version + "`r`n"}
+            [IO.File]::WriteAllText((Join-Path `$Path 'bin\codegraph.cmd'),`$CommandText,[Text.Encoding]::ASCII)
+            Write-CodeGraphBundleMarker -Path `$Path -Identity `$Identity
+            Assert-CodeGraphTransactionBundle -Path `$Path -Identity `$Identity
+          }
+
+          function New-CodeGraphManifestFromIdentity{
+            param(`$Identity)
+            return [ordered]@{
+              managed_by='HMS-Skills-Codex'
+              version=[string]`$Identity.version
+              tag=[string]`$Identity.tag
+              commit=[string]`$Identity.commit
+              asset=[string]`$Identity.asset
+              sha256=[string]`$Identity.sha256
+              bundle_transaction_id=[string]`$Identity.transaction_id
+              bundle_tree_sha256=[string]`$Identity.bundle_tree_sha256
+            }
+          }
+
+          function New-TestCompositeBundle{
+            param([string]`$Path,[string]`$SkillText)
+            New-Item -ItemType Directory -Force -Path `$Path|Out-Null
+            [ordered]@{managed_by='HMS-Skills-Codex';artifact='hms-superpowers-composite'}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path `$Path 'manifest.json') -Encoding UTF8
+            [IO.File]::WriteAllText((Join-Path `$Path 'SKILL.md'),`$SkillText,(New-Object Text.UTF8Encoding(`$false)))
+          }
+
+          New-Item -ItemType Directory -Force -Path `$Root|Out-Null
+
+          # Scenario 1: production previous-current qualification and post-rename rollback never execute the
+          # persisted launcher. Repair restores the original candidate-role transaction marker, so the old
+          # manifest and active bundle remain mutually authenticatable after rollback.
+          `$case1=Join-Path `$Root 'post-rename-no-exec';New-Item -ItemType Directory -Force -Path `$case1|Out-Null
+          `$CodeGraphManifest=Join-Path `$case1 'hms-codegraph-install.json'
+          `$current1=Join-Path `$case1 'current';`$backup1=Join-Path `$case1 'backup';`$sentinel1=Join-Path `$case1 'EXECUTED.txt'
+          `$previous1=New-CodeGraphBundleIdentity -TransactionId '11111111111111111111111111111111' -Role 'candidate' -Version 'old1' -Tag 'v-old1' -Commit 'c-old1' -Asset 'a-old1' -Sha256 's-old1'
+          `$cmd1="@echo off`r`necho executed>```"`$sentinel1```"`r`necho old1`r`n"
+          New-TestCodeGraphBundle -Path `$current1 -Identity `$previous1 -CommandText `$cmd1
+          `$oldManifest1=New-CodeGraphManifestFromIdentity -Identity `$previous1
+          `$backup1id=New-CodeGraphBundleIdentity -TransactionId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' -Role 'backup' -Version 'old1' -Tag 'v-old1' -Commit 'c-old1' -Asset 'a-old1' -Sha256 's-old1' -BundleTreeSha256 ([string]`$previous1.bundle_tree_sha256)
+          `$returned1=Move-CodeGraphCurrentToRollbackBackup -CurrentPath `$current1 -BackupPath `$backup1 -ExistingManifest `$oldManifest1 -BackupIdentity `$backup1id
+          if(Test-Path -LiteralPath `$sentinel1){throw 'Persisted previous CodeGraph launcher was executed during qualification or post-rename validation.'}
+          if(Test-Path -LiteralPath `$current1){throw 'Current remained after successful previous-to-backup transition.'}
+          Assert-CodeGraphTransactionBundle -Path `$backup1 -Identity `$backup1id
+          if([string]`$returned1.transaction_id -cne [string]`$previous1.transaction_id -or [string]`$returned1.role -cne 'candidate'){throw 'Move helper did not return the exact previous candidate identity.'}
+          `$candidate1=New-CodeGraphBundleIdentity -TransactionId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' -Role 'candidate' -Version 'new1' -Tag 'v-new1' -Commit 'c-new1' -Asset 'a-new1' -Sha256 's-new1'
+          `$r1=Repair-CodeGraphRollbackState -CurrentPath `$current1 -BackupPath `$backup1 -CandidateIdentity `$candidate1 -BackupIdentity `$backup1id -PreviousIdentity `$returned1 -ManifestPublished `$false -PublishedManifest `$null -PreviousManifestBytes `$null -HadPrevious `$true
+          if(@(`$r1.RollbackErrors).Count -ne 0 -or `$r1.CurrentBundleState -cne 'previous' -or -not `$r1.BackupActivated){throw "Post-rename rollback did not restore previous identity cleanly: `$(@(`$r1.RollbackErrors)-join ' | ')"}
+          Assert-CodeGraphTransactionBundle -Path `$current1 -Identity `$previous1
+          if(Test-Path -LiteralPath `$sentinel1){throw 'Previous launcher was executed during rollback restoration.'}
+
+          # Scenario 2: a foreign process replaces current after root-manifest capture and copies the genuine
+          # marker. Tree mismatch must reject it before execution and before the bundle is remarked as backup.
+          `$case2=Join-Path `$Root 'foreign-current-before-remark';New-Item -ItemType Directory -Force -Path `$case2|Out-Null
+          `$current2=Join-Path `$case2 'current';`$legit2=Join-Path `$case2 'legit';`$backup2=Join-Path `$case2 'backup';`$sentinel2=Join-Path `$case2 'EXECUTED.txt'
+          `$previous2=New-CodeGraphBundleIdentity -TransactionId '22222222222222222222222222222222' -Role 'candidate' -Version 'old2' -Tag 'v-old2' -Commit 'c-old2' -Asset 'a-old2' -Sha256 's-old2'
+          New-TestCodeGraphBundle -Path `$current2 -Identity `$previous2 -CommandText "@echo off`r`necho old2`r`n"
+          `$oldManifest2=New-CodeGraphManifestFromIdentity -Identity `$previous2
+          Move-Item -LiteralPath `$current2 -Destination `$legit2
+          New-Item -ItemType Directory -Force -Path (Join-Path `$current2 'bin')|Out-Null
+          [IO.File]::WriteAllText((Join-Path `$current2 'bin\codegraph.cmd'),("@echo off`r`necho executed>```"`$sentinel2```"`r`necho foreign`r`n"),[Text.Encoding]::ASCII)
+          Copy-Item -LiteralPath (Join-Path `$legit2 `$CodeGraphBundleMarkerName) -Destination (Join-Path `$current2 `$CodeGraphBundleMarkerName)
+          `$markerBefore2=[Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path `$current2 `$CodeGraphBundleMarkerName)))
+          `$backup2id=New-CodeGraphBundleIdentity -TransactionId 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -Role 'backup' -Version 'old2' -Tag 'v-old2' -Commit 'c-old2' -Asset 'a-old2' -Sha256 's-old2' -BundleTreeSha256 ([string]`$previous2.bundle_tree_sha256)
+          `$failed2=`$false
+          try{Move-CodeGraphCurrentToRollbackBackup -CurrentPath `$current2 -BackupPath `$backup2 -ExistingManifest `$oldManifest2 -BackupIdentity `$backup2id}catch{`$failed2=`$true}
+          if(-not `$failed2){throw 'Foreign current replacement was accepted despite tree mismatch.'}
+          if(Test-Path -LiteralPath `$sentinel2){throw 'Foreign current launcher executed before authentication failed.'}
+          if(Test-Path -LiteralPath `$backup2){throw 'Foreign current was renamed into rollback backup.'}
+          `$markerAfter2=[Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path `$current2 `$CodeGraphBundleMarkerName)))
+          if(`$markerAfter2 -cne `$markerBefore2){throw 'Foreign current received a new HMS rollback marker before authentication.'}
+
+          # Scenario 3: once Repair has reserved the exact previous bundle, a foreign object may occupy the
+          # predictable backup pathname. Candidate deletion/restoration must use only the reserved identity;
+          # the foreign replacement stays untouched and the restored current marker matches old manifest bytes.
+          `$case3=Join-Path `$Root 'foreign-backup-after-reservation';New-Item -ItemType Directory -Force -Path `$case3|Out-Null
+          `$CodeGraphManifest=Join-Path `$case3 'hms-codegraph-install.json'
+          `$current3=Join-Path `$case3 'current';`$backup3=Join-Path `$case3 'backup'
+          `$candidate3=New-CodeGraphBundleIdentity -TransactionId 'cccccccccccccccccccccccccccccccc' -Role 'candidate' -Version 'new3' -Tag 'v-new3' -Commit 'c-new3' -Asset 'a-new3' -Sha256 's-new3'
+          New-TestCodeGraphBundle -Path `$current3 -Identity `$candidate3 -CommandText "@echo off`r`necho new3`r`n"
+          `$previous3=New-CodeGraphBundleIdentity -TransactionId '33333333333333333333333333333333' -Role 'candidate' -Version 'old3' -Tag 'v-old3' -Commit 'c-old3' -Asset 'a-old3' -Sha256 's-old3'
+          `$backup3id=New-CodeGraphBundleIdentity -TransactionId 'cccccccccccccccccccccccccccccccc' -Role 'backup' -Version 'old3' -Tag 'v-old3' -Commit 'c-old3' -Asset 'a-old3' -Sha256 's-old3'
+          New-TestCodeGraphBundle -Path `$backup3 -Identity `$backup3id -CommandText "@echo off`r`necho old3`r`n"
+          `$previous3['bundle_tree_sha256']=[string]`$backup3id.bundle_tree_sha256
+          `$newManifest3=New-CodeGraphManifestFromIdentity -Identity `$candidate3
+          `$oldManifest3=New-CodeGraphManifestFromIdentity -Identity `$previous3
+          `$oldBytes3=(New-Object Text.UTF8Encoding(`$false)).GetBytes((`$oldManifest3|ConvertTo-Json -Compress))
+          [IO.File]::WriteAllText(`$CodeGraphManifest,(`$newManifest3|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
+          `$candidateManifestGuard3=Open-HmsDeliveryFileGuard -Path `$CodeGraphManifest -Label 'Latest rollback candidate manifest 3'
+          `$script:InjectedBackupPath=`$backup3
+          `$script:InjectedForeignSentinel=Join-Path `$backup3 'FOREIGN.txt'
+          `$removeAfterReserve={
+            param(`$Path,`$Identity)
+            New-Item -ItemType Directory -Force -Path `$script:InjectedBackupPath|Out-Null
+            [IO.File]::WriteAllText(`$script:InjectedForeignSentinel,'foreign',[Text.Encoding]::ASCII)
+            Remove-CodeGraphTransactionBundle -Path `$Path -Identity `$Identity
+          }
+          `$r3=Repair-CodeGraphRollbackState -CurrentPath `$current3 -BackupPath `$backup3 -CandidateIdentity `$candidate3 -BackupIdentity `$backup3id -PreviousIdentity `$previous3 -ManifestPublished `$true -PublishedManifest `$newManifest3 -CandidateManifestGuard `$candidateManifestGuard3 -PreviousManifestBytes `$oldBytes3 -HadPrevious `$true -CandidateRemovalAction `$removeAfterReserve
+          if(@(`$r3.RollbackErrors).Count -ne 0 -or `$r3.CurrentBundleState -cne 'previous' -or -not `$r3.BackupActivated -or -not `$r3.CandidateRemovalCompleted){throw "Reserved-backup rollback failed: `$(@(`$r3.RollbackErrors)-join ' | ')"}
+          Assert-CodeGraphTransactionBundle -Path `$current3 -Identity `$previous3
+          if(-not(Test-Path -LiteralPath `$script:InjectedForeignSentinel)){throw 'Foreign replacement at original backup pathname was moved or deleted.'}
+          if([Convert]::ToBase64String([IO.File]::ReadAllBytes(`$CodeGraphManifest)) -cne [Convert]::ToBase64String(`$oldBytes3)){throw 'Previous manifest bytes were not restored with previous transaction identity.'}
+
+          # Scenario 4: pre-rename qualification failure cannot move the live previous bundle.
+          `$case4=Join-Path `$Root 'pre-rename-auth-failure';New-Item -ItemType Directory -Force -Path `$case4|Out-Null
+          `$current4=Join-Path `$case4 'current';`$backup4=Join-Path `$case4 'backup'
+          `$previous4=New-CodeGraphBundleIdentity -TransactionId '44444444444444444444444444444444' -Role 'candidate' -Version 'old4' -Tag 'v-old4' -Commit 'c-old4' -Asset 'a-old4' -Sha256 's-old4'
+          New-TestCodeGraphBundle -Path `$current4 -Identity `$previous4 -CommandText "@echo off`r`necho old4`r`n"
+          `$manifest4=New-CodeGraphManifestFromIdentity -Identity `$previous4
+          `$backup4id=New-CodeGraphBundleIdentity -TransactionId 'dddddddddddddddddddddddddddddddd' -Role 'backup' -Version 'old4' -Tag 'v-old4' -Commit 'c-old4' -Asset 'a-old4' -Sha256 's-old4' -BundleTreeSha256 ([string]`$previous4.bundle_tree_sha256)
+          `$marker4=Join-Path `$current4 `$CodeGraphBundleMarkerName
+          Remove-Item -LiteralPath `$marker4 -Force
+          New-Item -ItemType Directory -Force -Path `$marker4|Out-Null
+          `$failed4=`$false
+          try{Move-CodeGraphCurrentToRollbackBackup -CurrentPath `$current4 -BackupPath `$backup4 -ExistingManifest `$manifest4 -BackupIdentity `$backup4id}catch{`$failed4=`$true}
+          if(-not `$failed4){throw 'Injected pre-rename authentication failure did not fail.'}
+          if(-not(Test-Path -LiteralPath `$current4)){throw 'Current was renamed despite pre-rename authentication failure.'}
+          if(Test-Path -LiteralPath `$backup4){throw 'Backup pathname appeared despite pre-rename authentication failure.'}
+
+          # Scenario 5: composite rollback moves the exact old tree to a random reservation before candidate
+          # deletion. A foreign object at predictable backup cannot become FinalRoot and is never deleted.
+          `$case5=Join-Path `$Root 'composite-reservation';New-Item -ItemType Directory -Force -Path `$case5|Out-Null
+          `$cBackup=Join-Path `$case5 'backup';`$cFinal=Join-Path `$case5 'hms-superpowers'
+          New-TestCompositeBundle -Path `$cBackup -SkillText 'OLD_EXACT_COMPOSITE'
+          `$oldTree=Get-OwnedCompositeTreeSha256 -Path `$cBackup
+          `$reserved=Reserve-OwnedCompositeRollbackBackup -Path `$cBackup -ExpectedTreeSha256 `$oldTree
+          if(-not(Test-Path -LiteralPath `$reserved) -or (Split-Path -Leaf `$reserved) -notmatch '^\.hms-composite-rollback-reserved-[0-9a-f]{32}$'){throw 'Composite previous bundle was not moved to a random rollback reservation.'}
+          New-TestCompositeBundle -Path `$cBackup -SkillText 'FOREIGN_COMPOSITE'
+          `$foreignSentinel=Join-Path `$cBackup 'FOREIGN.txt';[IO.File]::WriteAllText(`$foreignSentinel,'foreign',[Text.Encoding]::ASCII)
+          New-TestCompositeBundle -Path `$cFinal -SkillText 'NEW_CANDIDATE'
+          `$candidateTree=Get-OwnedCompositeTreeSha256 -Path `$cFinal
+          Remove-OwnedCompositeIdentityQuarantine -Path `$cFinal -ExpectedTreeSha256 `$candidateTree
+          Restore-OwnedCompositeRollbackBackup -BackupPath `$cBackup -ReservedPath `$reserved -FinalPath `$cFinal -ExpectedTreeSha256 `$oldTree
+          Assert-OwnedCompositeIdentity -Path `$cFinal -ExpectedTreeSha256 `$oldTree
+          if(-not(Test-Path -LiteralPath `$foreignSentinel)){throw 'Foreign composite backup replacement was moved or deleted.'}
+          if((Get-Content -LiteralPath (Join-Path `$cFinal 'SKILL.md') -Raw) -cne 'OLD_EXACT_COMPOSITE'){throw 'Foreign composite backup became FinalRoot instead of the reserved exact previous tree.'}
+
+          Write-Host 'PASS: exact AST catch enclosure, no previous-launcher execution, CodeGraph transaction restoration, and composite random-reservation rollback are qualified.'
+          "@
+          [IO.File]::WriteAllText($harness,$script,(New-Object Text.UTF8Encoding($false)))
+          try{& $harness -Root $root}finally{Remove-Item -LiteralPath $harness -Force -ErrorAction SilentlyContinue;Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue}

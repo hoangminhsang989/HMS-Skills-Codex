@@ -1,0 +1,17 @@
+{
+  "taste": {
+    "repository": "https://github.com/Leonxlnx/taste-skill.git",
+    "commit": "ccbc15639c97057cbfcf32ecebc38ef716e4bb37",
+    "skill_path": "skills/gpt-tasteskill",
+    "skill_name": "gpt-taste",
+    "codex_discovery_name": "taste-skill:gpt-taste"
+  },
+  "impeccable": {
+    "repository": "https://github.com/pbakaus/impeccable.git",
+    "commit": "b0594c72d18006b5865c70eb3a97e8b04064e600",
+    "skill_path": ".agents/skills/impeccable",
+    "skill_name": "impeccable",
+    "codex_discovery_name": "impeccable:impeccable",
+    "skill_version": "4.1.2"
+  }
+}
