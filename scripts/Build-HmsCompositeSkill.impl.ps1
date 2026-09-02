@@ -286,6 +286,18 @@ function Assert-OwnedCompositeRoot {
     if ([string]$manifest.managed_by -cne $ManagedBy -or [string]$manifest.artifact -cne $Artifact) { throw "Refusing to replace composite directory with unexpected ownership: $Path" }
 }
 
+function Get-HmsCompositeFileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    $stream = New-Object IO.FileStream($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','').ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+}
 function Add-OwnedCompositeTreeRecords {
     param(
         [Parameter(Mandatory)][string]$Directory,
@@ -301,7 +313,7 @@ function Add-OwnedCompositeTreeRecords {
             Add-OwnedCompositeTreeRecords -Directory $item.FullName -LogicalPrefix $logical -Records $Records
             continue
         }
-        $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $hash = Get-HmsCompositeFileSha256 -Path $item.FullName
         $Records.Add($logical + "`t" + $hash)
     }
 }
