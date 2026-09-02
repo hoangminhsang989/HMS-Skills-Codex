@@ -21,7 +21,7 @@ def non_windows_block(label_expr: str) -> str:
         timeout_error = "$Label git cat-file timed out after 10 seconds."
         failed_prefix = "$Label git cat-file failed"
         stderr_prefix = "$Label git cat-file produced unexpected stderr"
-    return f'''        $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop
+    return f'''        $gitCommand = @((Get-Command git -CommandType Application -ErrorAction Stop))[0]
         $gitPath = [string]$gitCommand.Source
         if ([string]::IsNullOrWhiteSpace($gitPath) -or -not (Test-Path -LiteralPath $gitPath -PathType Leaf)) {{ throw "Resolved git executable does not exist: $gitPath" }}
         $psi = New-Object Diagnostics.ProcessStartInfo
