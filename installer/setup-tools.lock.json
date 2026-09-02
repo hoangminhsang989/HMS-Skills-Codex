@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "mingit": {
+    "repository": "git-for-windows/git",
+    "tag": "v2.55.0.windows.5",
+    "asset": "MinGit-2.55.0.5-64-bit.zip",
+    "sha256": "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e"
+  },
+  "codex": {
+    "repository": "openai/codex",
+    "tag": "rust-v0.152.1",
+    "asset": "codex-x86_64-pc-windows-msvc.exe.zip",
+    "archive_sha256": "11634c7da0aadf53dff3ec0bad9fd3715371afff189becac433270b21cf299c9",
+    "exe_sha256": "01b0fd4167393e004b9174c77ae5f8570486118e19dc4216cfc62a62a74b6ee6"
+  }
+}
