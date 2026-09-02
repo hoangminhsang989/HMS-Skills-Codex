@@ -1,0 +1,243 @@
+name: TMP author lifecycle blob reader remediation 3537
+
+on:
+  push:
+    branches:
+      - remediate/lifecycle-blob-reader-3537
+
+permissions:
+  contents: write
+
+jobs:
+  windows-author:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    env:
+      BASE_SHA: 3537c42f4ce8672491d51f077e5de3854bb5d354
+      AUTHOR_WORKFLOW: .github/workflows/tmp-author-lifecycle-blob-reader-3537.yml
+    steps:
+      - name: Checkout author branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: remediate/lifecycle-blob-reader-3537
+          fetch-depth: 2
+
+      - name: Bind exact source blobs and apply timeout-safe reader
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          $head = ((& git -C $root rev-parse HEAD) -join '').Trim().ToLowerInvariant()
+          $parent = ((& git -C $root rev-parse HEAD^) -join '').Trim().ToLowerInvariant()
+          if ($parent -cne $env:BASE_SHA) { throw "Author parent mismatch. Expected $env:BASE_SHA, found $parent" }
+
+          $expectedBlobs = [ordered]@{
+            'install.ps1' = 'e96a4a7e6bb9e8422ba1f27fd4ca4cfa566b0c72'
+            'update.ps1' = '80b335c1943b3148479ca4c57d57a4bf9f984efa'
+            'scripts/Initialize-HmsLifecycleTrust.ps1' = '992c0f9e103123c3a75e66a9b45eb682a9c7ba42'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actual = ((& git -C $root rev-parse "HEAD:$($entry.Key)") -join '').Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $actual -cne [string]$entry.Value) {
+              throw "Source blob mismatch for $($entry.Key). Expected $($entry.Value), found $actual"
+            }
+          }
+
+          $patcher = Join-Path $env:RUNNER_TEMP 'patch-lifecycle-blob-reader.py'
+          @'
+from pathlib import Path
+
+root = Path.cwd()
+
+old_bootstrap = r'''    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = 'git'
+    $psi.Arguments = "cat-file blob $expected"
+    $psi.WorkingDirectory = $RepoRoot
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = New-Object Diagnostics.Process
+    $proc.StartInfo = $psi
+    if (-not $proc.Start()) { throw 'Could not start git cat-file for lifecycle trust bootstrap.' }
+    $memory = New-Object IO.MemoryStream
+    try {
+        $proc.StandardOutput.BaseStream.CopyTo($memory)
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) { throw "Lifecycle trust bootstrap git cat-file failed: $stderr" }
+        $bytes = $memory.ToArray()
+    }
+    finally { $memory.Dispose(); $proc.Dispose() }
+'''
+
+new_bootstrap = r'''    $gitExe = @((Get-Command git.exe -CommandType Application -ErrorAction Stop))[0].Source
+    $cmdExe = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+    $stdoutPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-lifecycle-blob-' + [guid]::NewGuid().ToString('N') + '.bin')
+    $stderrPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-lifecycle-blob-' + [guid]::NewGuid().ToString('N') + '.err')
+    foreach ($commandPath in @($gitExe,$cmdExe,$RepoRoot,$stdoutPath,$stderrPath)) {
+        if ([string]::IsNullOrWhiteSpace($commandPath) -or $commandPath -match '["%\r\n]') {
+            throw "Lifecycle trust bootstrap command path is unsafe for exact cmd.exe redirection: $commandPath"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $gitExe -PathType Leaf)) { throw "Resolved git.exe does not exist: $gitExe" }
+    if (-not (Test-Path -LiteralPath $cmdExe -PathType Leaf)) { throw "Trusted cmd.exe does not exist: $cmdExe" }
+
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $cmdExe
+    $psi.Arguments = ('/d /q /v:off /s /c ""{0}" -C "{1}" cat-file blob {2} > "{3}" 2> "{4}""' -f $gitExe,$RepoRoot,$expected,$stdoutPath,$stderrPath)
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $proc = New-Object Diagnostics.Process
+    $proc.StartInfo = $psi
+    try {
+        if (-not $proc.Start()) { throw 'Could not start trusted cmd.exe for lifecycle trust bootstrap.' }
+        if (-not $proc.WaitForExit(10000)) {
+            try { $proc.Kill() } catch {}
+            throw 'Lifecycle trust bootstrap git cat-file timed out after 10 seconds.'
+        }
+        $stderr = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { [IO.File]::ReadAllText($stderrPath) } else { '' }
+        if ($proc.ExitCode -ne 0) { throw "Lifecycle trust bootstrap git cat-file failed: $stderr" }
+        if (-not (Test-Path -LiteralPath $stdoutPath -PathType Leaf)) { throw 'Lifecycle trust bootstrap output file was not created.' }
+        if (-not [string]::IsNullOrEmpty($stderr)) { throw "Lifecycle trust bootstrap git cat-file produced unexpected stderr: $stderr" }
+        $bytes = [IO.File]::ReadAllBytes($stdoutPath)
+    }
+    finally {
+        $proc.Dispose()
+        Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+    }
+'''
+
+old_helper = r'''    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = 'git'
+    $psi.Arguments = "cat-file blob $expected"
+    $psi.WorkingDirectory = $RepoRoot
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = New-Object Diagnostics.Process
+    $proc.StartInfo = $psi
+    if (-not $proc.Start()) { throw "$Label could not start git cat-file." }
+    $memory = New-Object IO.MemoryStream
+    try {
+        $proc.StandardOutput.BaseStream.CopyTo($memory)
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0) { throw "$Label git cat-file failed: $stderr" }
+        $bytes = $memory.ToArray()
+    }
+    finally {
+        $memory.Dispose()
+        $proc.Dispose()
+    }
+'''
+
+new_helper = r'''    $gitExe = @((Get-Command git.exe -CommandType Application -ErrorAction Stop))[0].Source
+    $cmdExe = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+    $stdoutPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-committed-blob-' + [guid]::NewGuid().ToString('N') + '.bin')
+    $stderrPath = Join-Path ([IO.Path]::GetTempPath()) ('hms-committed-blob-' + [guid]::NewGuid().ToString('N') + '.err')
+    foreach ($commandPath in @($gitExe,$cmdExe,$RepoRoot,$stdoutPath,$stderrPath)) {
+        if ([string]::IsNullOrWhiteSpace($commandPath) -or $commandPath -match '["%\r\n]') {
+            throw "$Label command path is unsafe for exact cmd.exe redirection: $commandPath"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $gitExe -PathType Leaf)) { throw "$Label resolved git.exe does not exist: $gitExe" }
+    if (-not (Test-Path -LiteralPath $cmdExe -PathType Leaf)) { throw "$Label trusted cmd.exe does not exist: $cmdExe" }
+
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $cmdExe
+    $psi.Arguments = ('/d /q /v:off /s /c ""{0}" -C "{1}" cat-file blob {2} > "{3}" 2> "{4}""' -f $gitExe,$RepoRoot,$expected,$stdoutPath,$stderrPath)
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $proc = New-Object Diagnostics.Process
+    $proc.StartInfo = $psi
+    try {
+        if (-not $proc.Start()) { throw "$Label could not start trusted cmd.exe for git cat-file." }
+        if (-not $proc.WaitForExit(10000)) {
+            try { $proc.Kill() } catch {}
+            throw "$Label git cat-file timed out after 10 seconds."
+        }
+        $stderr = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { [IO.File]::ReadAllText($stderrPath) } else { '' }
+        if ($proc.ExitCode -ne 0) { throw "$Label git cat-file failed: $stderr" }
+        if (-not (Test-Path -LiteralPath $stdoutPath -PathType Leaf)) { throw "$Label git cat-file output file was not created." }
+        if (-not [string]::IsNullOrEmpty($stderr)) { throw "$Label git cat-file produced unexpected stderr: $stderr" }
+        $bytes = [IO.File]::ReadAllBytes($stdoutPath)
+    }
+    finally {
+        $proc.Dispose()
+        Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+    }
+'''
+
+def replace_exact(path: Path, old: str, new: str, label: str) -> None:
+    raw = path.read_bytes()
+    text = raw.decode('utf-8')
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f'{label}: expected exactly one old block, found {count}')
+    updated = text.replace(old, new, 1)
+    path.write_bytes(updated.encode('utf-8'))
+
+replace_exact(root / 'install.ps1', old_bootstrap, new_bootstrap, 'install bootstrap')
+replace_exact(root / 'update.ps1', old_bootstrap, new_bootstrap, 'update bootstrap')
+replace_exact(root / 'scripts' / 'Initialize-HmsLifecycleTrust.ps1', old_helper, new_helper, 'committed blob helper')
+print('PATCH_3_OF_3_EXACT_BLOCKS=PASS')
+'@ | Set-Content -LiteralPath $patcher -Encoding utf8
+
+          Push-Location $root
+          try {
+            & python $patcher
+            if ($LASTEXITCODE -ne 0) { throw "Mechanical patcher failed with exit $LASTEXITCODE" }
+          }
+          finally { Pop-Location }
+
+          Remove-Item -LiteralPath (Join-Path $root $env:AUTHOR_WORKFLOW) -Force
+
+          $files = @('install.ps1','update.ps1','scripts/Initialize-HmsLifecycleTrust.ps1')
+          foreach ($relative in $files) {
+            $path = Join-Path $root $relative
+            $tokens = $null
+            $parseErrors = $null
+            $null = [Management.Automation.Language.Parser]::ParseFile($path,[ref]$tokens,[ref]$parseErrors)
+            if (@($parseErrors).Count -ne 0) {
+              throw "PowerShell parse failed for ${relative}: $((@($parseErrors) | ForEach-Object Message) -join '; ')"
+            }
+          }
+          Write-Host 'PARSER_3_OF_3=PASS'
+
+          & git -C $root diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff --check failed.' }
+
+          & git -C $root add -A -- install.ps1 update.ps1 scripts/Initialize-HmsLifecycleTrust.ps1 $env:AUTHOR_WORKFLOW
+          if ($LASTEXITCODE -ne 0) { throw 'git add failed.' }
+          $tree = ((& git -C $root write-tree) -join '').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $tree -notmatch '^[0-9a-f]{40}$') { throw 'Unable to write staged tree.' }
+          $changedFromBase = @(& git -C $root diff --name-only $env:BASE_SHA $tree)
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to compare staged tree to base candidate.' }
+          $expectedPaths = @('install.ps1','scripts/Initialize-HmsLifecycleTrust.ps1','update.ps1')
+          $actualPaths = @($changedFromBase | Sort-Object)
+          if (($actualPaths -join "`n") -cne ($expectedPaths -join "`n")) {
+            throw "Final staged tree scope mismatch. Expected [$($expectedPaths -join ', ')], found [$($actualPaths -join ', ')]"
+          }
+          Write-Host "FINAL_TREE_SCOPE=PASS_EXACT_3"
+          Write-Host "FINAL_STAGED_TREE=$tree"
+
+      - name: Commit exact three-file remediation and remove author workflow
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          & git -C $root config user.name 'github-actions[bot]'
+          & git -C $root config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          & git -C $root commit -m 'Fix committed blob retrieval in child lifecycle jobs'
+          if ($LASTEXITCODE -ne 0) { throw 'git commit failed.' }
+          $commit = ((& git -C $root rev-parse HEAD) -join '').Trim().ToLowerInvariant()
+          $tree = ((& git -C $root rev-parse 'HEAD^{tree}') -join '').Trim().ToLowerInvariant()
+          Write-Host "TEMP_REMEDIATION_COMMIT=$commit"
+          Write-Host "TEMP_REMEDIATION_TREE=$tree"
+          & git -C $root push origin HEAD:refs/heads/remediate/lifecycle-blob-reader-3537
+          if ($LASTEXITCODE -ne 0) { throw 'git push failed.' }
+          Write-Host 'TEMP_REMEDIATION_PUSH=PASS'
