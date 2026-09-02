@@ -437,11 +437,23 @@ function Get-CodeGraphArchiveLogicalTreeSha256 {
     finally { $archive.Dispose() }
 }
 
+function Get-HmsDeliveryFileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    $stream = New-Object IO.FileStream($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','').ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
+}
 function Open-CodeGraphVerifiedArchive {
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$ExpectedSha256,[Parameter(Mandatory)][string]$Architecture)
     $stream = New-Object IO.FileStream($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
     try {
-        $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actual = Get-HmsDeliveryFileSha256 -Path $Path
         if ($actual -cne $ExpectedSha256) { throw "CodeGraph release asset SHA-256 mismatch. Expected $ExpectedSha256, found $actual" }
         $tree = Get-CodeGraphArchiveLogicalTreeSha256 -ArchivePath $Path -Architecture $Architecture
         return [pscustomobject]@{ Stream=$stream; ExpectedTreeSha256=$tree; AssetSha256=$actual }
@@ -522,7 +534,7 @@ function Add-CodeGraphBundleTreeRecords {
             continue
         }
         if ([string]::IsNullOrEmpty($LogicalPrefix) -and [string]$item.Name -ceq $CodeGraphBundleMarkerName) { continue }
-        $hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        $hash = Get-HmsDeliveryFileSha256 -Path $item.FullName
         $Records.Add($logical + "`t" + $hash)
     }
 }
