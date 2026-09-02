@@ -299,7 +299,7 @@ function Resolve-HmsCodex {
         $finalExe = Join-Path $stage 'codex.exe'
         if ($sourceExe -cne $finalExe) { Copy-Item -LiteralPath $sourceExe -Destination $finalExe }
         Assert-HmsSha256 -Path $finalExe -Expected ([string]$Lock.exe_sha256)
-        if (-not (Test-HmsPinnedCodexExecutable -Path $finalExe -ExpectedSha256 ([string]$Lock.exe_sha256)) { throw 'Pinned Codex fallback failed its executable/version smoke check.' }
+        if (-not (Test-HmsPinnedCodexExecutable -Path $finalExe -ExpectedSha256 ([string]$Lock.exe_sha256))) { throw 'Pinned Codex fallback failed its executable/version smoke check.' }
         Write-HmsSupportMarker -Directory $stage -Kind 'codex' -Tag ([string]$Lock.tag) -Asset ([string]$Lock.asset) -ArtifactSha256 ([string]$Lock.archive_sha256)
         Invoke-HmsAtomicSupportActivation -StagedDirectory $stage -TargetDirectory $target -Kind 'codex'
         return (Join-Path $target 'codex.exe')
