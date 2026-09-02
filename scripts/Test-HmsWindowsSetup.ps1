@@ -69,6 +69,19 @@ if ($Scope -in @('All','Lifecycle')) {
         throw 'Lifecycle shim must not execute mutable lifecycle scripts through powershell -File.'
     }
 
+    $installPath = Join-Path $RepoRoot 'install.ps1'
+    $installText = [IO.File]::ReadAllText($installPath)
+    $canonicalSyncLiteral = 'Sync-Repository -Remote $HmsRemote -Path $InstallRoot'
+    if ([regex]::Matches($installText,[regex]::Escape($canonicalSyncLiteral)).Count -ne 1) {
+        throw 'Direct install.ps1 must retain exactly one canonical HMS synchronization call.'
+    }
+    Assert-TextContains -Path $installPath -Pattern 'Assert-BranchMatchesFetchedRef' -Message 'Direct install.ps1 must retain canonical fetched-branch equality enforcement.'
+    Assert-TextContains -Path $lifecycleShimPath -Pattern 'function\s+Get-HmsTrustedRepairScriptBlock' -Message 'Lifecycle shim must define authenticated repair-only install transform.'
+    Assert-TextContains -Path $lifecycleShimPath -Pattern 'HmsTrustedLifecycleHead' -Message 'Authenticated repair transform must bind the exact trusted lifecycle HEAD.'
+    if ([regex]::Matches($lifecycleShimText,[regex]::Escape($canonicalSyncLiteral)).Count -ne 1) {
+        throw 'Authenticated repair transform must target exactly one canonical install synchronization call.'
+    }
+
     if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
         $gitCommand = @((Get-Command git.exe -CommandType Application -ErrorAction Stop))[0]
         $gitExe = [string]$gitCommand.Source
