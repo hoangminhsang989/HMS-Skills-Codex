@@ -41,6 +41,29 @@ $installPath = Join-Path $RepoRoot 'install.ps1'
 $updatePath = Join-Path $RepoRoot 'update.ps1'
 $installText = [IO.File]::ReadAllText($installPath)
 $updateText = [IO.File]::ReadAllText($updatePath)
+$trustPath = Join-Path $RepoRoot 'scripts\Initialize-HmsLifecycleTrust.ps1'
+$trustText = [IO.File]::ReadAllText($trustPath)
+foreach ($source in @(
+    [pscustomobject]@{ Name='install.ps1'; Text=$installText },
+    [pscustomobject]@{ Name='update.ps1'; Text=$updateText },
+    [pscustomobject]@{ Name='scripts/Initialize-HmsLifecycleTrust.ps1'; Text=$trustText }
+)) {
+    if ([string]$source.Text -match [regex]::Escape('try { $proc.WaitForExit() } catch {}')) {
+        throw "$($source.Name) reintroduced an unbounded post-kill WaitForExit()."
+    }
+    foreach ($required in @(
+        '$terminatedAfterKill = $false',
+        '$proc.WaitForExit(2000)',
+        'if (-not $terminatedAfterKill)',
+        '$proc.StandardOutput.BaseStream.Dispose()',
+        '$proc.StandardError.Dispose()'
+    )) {
+        if ([string]$source.Text -notmatch [regex]::Escape($required)) {
+            throw "$($source.Name) is missing bounded post-kill lifecycle contract: $required"
+        }
+    }
+}
+Write-Host 'PASS: non-Windows committed-blob post-kill wait is bounded and pipe handles are closed on failed termination.'
 foreach ($text in @($installText,$updateText)) {
     foreach ($required in @(
         'Get-HmsLifecycleTrustBootstrap',
