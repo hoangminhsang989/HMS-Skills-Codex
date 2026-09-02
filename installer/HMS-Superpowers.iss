@@ -50,15 +50,87 @@ Name: "{group}\Uninstall HMS Superpowers"; Filename: "{uninstallexe}"; Check: Bo
 Name: "{autodesktop}\HMS Superpowers"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon; Check: BootstrapReady
 
 [Code]
+const
+  FILE_ATTRIBUTE_DIRECTORY = $10;
+  FILE_ATTRIBUTE_REPARSE_POINT = $400;
+  INVALID_FILE_ATTRIBUTES = $FFFFFFFF;
+
 var
   BootstrapSucceeded: Boolean;
 
 function SetProcessEnvironmentVariable(Name: String; Value: String): Boolean;
   external 'SetEnvironmentVariableW@kernel32.dll stdcall';
+function GetFileAttributesW(lpFileName: String): Cardinal;
+  external 'GetFileAttributesW@kernel32.dll stdcall';
 
 function BootstrapReady(): Boolean;
 begin
   Result := BootstrapSucceeded;
+end;
+
+function IsReparsePoint(const Path: String): Boolean;
+var
+  Attributes: Cardinal;
+begin
+  Attributes := GetFileAttributesW(Path);
+  if Attributes = INVALID_FILE_ATTRIBUTES then
+    RaiseException('Unable to inspect Setup-owned path attributes: ' + Path);
+  Result := (Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0;
+end;
+
+procedure AssertTreeHasNoReparsePoints(const Directory: String);
+var
+  FindRec: TFindRec;
+  Child: String;
+begin
+  if IsReparsePoint(Directory) then
+    RaiseException('Refusing support cleanup through a reparse-point directory: ' + Directory);
+
+  if FindFirst(AddBackslash(Directory) + '*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          Child := AddBackslash(Directory) + FindRec.Name;
+          if (FindRec.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
+            RaiseException('Refusing support cleanup because a reparse point exists: ' + Child);
+          if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+            AssertTreeHasNoReparsePoints(Child);
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+procedure AssertOwnedSupportDirectory(const Directory: String; const Kind: String);
+var
+  MarkerPath: String;
+  MarkerText: AnsiString;
+begin
+  if not DirExists(Directory) then
+    RaiseException('Expected Setup-owned support directory is missing: ' + Directory);
+  AssertTreeHasNoReparsePoints(Directory);
+
+  MarkerPath := AddBackslash(Directory) + '.hms-owned-support-v1.json';
+  if (not FileExists(MarkerPath)) or IsReparsePoint(MarkerPath) then
+    RaiseException('Setup-owned support marker is missing or unsafe: ' + MarkerPath);
+  if not LoadStringFromFile(MarkerPath, MarkerText) then
+    RaiseException('Unable to read Setup-owned support marker: ' + MarkerPath);
+  if (Pos('"owner"', MarkerText) = 0) or
+     (Pos('HMS Superpowers', MarkerText) = 0) or
+     (Pos('"kind"', MarkerText) = 0) or
+     (Pos(Kind, MarkerText) = 0) then
+    RaiseException('Setup-owned support marker identity mismatch: ' + MarkerPath);
+end;
+
+procedure RemoveVerifiedSupportDirectory(const Directory: String; const Kind: String);
+begin
+  AssertOwnedSupportDirectory(Directory, Kind);
+  if not DelTree(Directory, True, True, True) then
+    RaiseException('Unable to remove verified Setup-owned support directory: ' + Directory);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -154,8 +226,33 @@ begin
     RaiseException('Authenticated HMS lifecycle uninstall failed with exit code ' + IntToStr(ResultCode) + '.');
 end;
 
+procedure RemoveSetupOwnedSupportTools();
+var
+  SupportRoot: String;
+  GitRoot: String;
+  CodexRoot: String;
+begin
+  SupportRoot := ExpandConstant('{app}\support');
+  GitRoot := AddBackslash(SupportRoot) + 'git';
+  CodexRoot := AddBackslash(SupportRoot) + 'codex';
+
+  if not DirExists(SupportRoot) then
+    RaiseException('Setup-owned support root is missing; refusing ambiguous uninstall cleanup.');
+  if IsReparsePoint(SupportRoot) then
+    RaiseException('Setup-owned support root is a reparse point; refusing cleanup.');
+
+  RemoveVerifiedSupportDirectory(GitRoot, 'mingit');
+  RemoveVerifiedSupportDirectory(CodexRoot, 'codex');
+
+  if not RemoveDir(SupportRoot) then
+    RaiseException('Setup-owned support root contains unexpected residual entries; refusing broader deletion: ' + SupportRoot);
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
+  begin
     RunHmsLifecycleUninstall();
+    RemoveSetupOwnedSupportTools();
+  end;
 end;
