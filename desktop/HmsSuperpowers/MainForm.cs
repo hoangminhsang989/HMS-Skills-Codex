@@ -44,8 +44,9 @@ internal sealed class MainForm : Form
             Dock = DockStyle.Fill,
             Padding = new Padding(14),
             ColumnCount = 1,
-            RowCount = 4
+            RowCount = 5
         };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -106,14 +107,6 @@ internal sealed class MainForm : Form
         root.Controls.Add(actions, 0, 2);
         root.Controls.Add(_logBox, 0, 3);
         root.Controls.Add(footer, 0, 4);
-
-        root.RowCount = 5;
-        root.RowStyles.Clear();
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         Controls.Add(root);
     }
@@ -187,7 +180,7 @@ internal sealed class MainForm : Form
         }
     }
 
-    private async Task UninstallAsync()
+    private Task UninstallAsync()
     {
         var choice = MessageBox.Show(
             this,
@@ -199,21 +192,12 @@ internal sealed class MainForm : Form
 
         if (choice != DialogResult.Yes)
         {
-            return;
+            return Task.CompletedTask;
         }
 
-        HmsProcessResult? result = null;
-        await RunExclusiveAsync(async (progress, token) =>
-        {
-            result = await _processRunner.RunLifecycleAsync(HmsLifecycleAction.Uninstall, progress, token);
-            return result;
-        });
-
-        if (result?.Succeeded == true)
-        {
-            _processRunner.StartRegisteredUninstaller();
-            Close();
-        }
+        _processRunner.StartRegisteredUninstaller();
+        Close();
+        return Task.CompletedTask;
     }
 
     private async Task RefreshStatusAsync()

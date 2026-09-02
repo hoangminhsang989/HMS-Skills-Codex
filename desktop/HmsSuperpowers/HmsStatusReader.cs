@@ -64,7 +64,7 @@ internal sealed class HmsStatusReader
             : "-";
 
         var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var compositeManifest = Path.Combine(userProfile, ".codex", "hms-composite", "manifest.json");
+        var compositeManifest = Path.Combine(userProfile, ".codex", "hms-composite", "hms-superpowers", "manifest.json");
         var publicSkill = Path.Combine(userProfile, ".agents", "skills", "hms-superpowers", "SKILL.md");
 
         var gitState = gitReady ? "HMS MinGit: ready" : "HMS MinGit: missing";

@@ -1,0 +1,287 @@
+name: Validate HMS Windows setup and menu
+
+on:
+  push:
+    branches:
+      - stage/hms-superpowers-v0.3.0-windows-setup-menu
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  CANDIDATE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+  AUTHORITY_SOURCE_REF: refs/heads/stage/hms-superpowers-v0.3.0-windows-setup-menu
+  DOTNET_SDK_VERSION: '10.0.400'
+  INNO_VERSION: '7.1.0'
+  INNO_URL: https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe
+  INNO_SHA256: 0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f
+
+jobs:
+  windows-setup-menu:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 1
+
+      - name: Prove exact checkout and canonical candidate ref
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:CANDIDATE_SHA.ToLowerInvariant()) {
+            throw "Windows setup checkout mismatch. Expected $env:CANDIDATE_SHA, found $actual"
+          }
+          $tree = (& git rev-parse 'HEAD^{tree}').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $tree -notmatch '^[0-9a-f]{40}$') {
+            throw "Unable to capture exact candidate tree: $tree"
+          }
+          $remoteLine = ((& git ls-remote origin $env:AUTHORITY_SOURCE_REF) -join "`n").Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($remoteLine)) {
+            throw "Unable to resolve canonical candidate source ref $env:AUTHORITY_SOURCE_REF"
+          }
+          $remoteSha = (($remoteLine -split '\s+')[0]).ToLowerInvariant()
+          if ($remoteSha -ne $actual) {
+            throw "Canonical candidate ref moved away from exact workflow HEAD. Expected $actual, found $remoteSha"
+          }
+          "CANDIDATE_TREE=$tree" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "PASS: exact Windows candidate identity HEAD=$actual TREE=$tree"
+
+      - name: Run full HMS static qualification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./scripts/Test-HmsSkills.ps1
+
+      - name: Install pinned .NET SDK 10.0.400
+        uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.0.0
+        with:
+          dotnet-version: '10.0.400'
+
+      - name: Restore build and publish self-contained WinForms menu
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdk = (& dotnet --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $sdk -cne $env:DOTNET_SDK_VERSION) {
+            throw "Unexpected .NET SDK. Expected $env:DOTNET_SDK_VERSION, found $sdk"
+          }
+          dotnet restore desktop/HmsSuperpowers/HmsSuperpowers.csproj --locked-mode
+          if ($LASTEXITCODE -ne 0) { throw 'dotnet restore --locked-mode failed.' }
+          dotnet build desktop/HmsSuperpowers/HmsSuperpowers.csproj -c Release --no-restore
+          if ($LASTEXITCODE -ne 0) { throw 'WinForms Release build failed.' }
+          dotnet publish desktop/HmsSuperpowers/HmsSuperpowers.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true --no-restore
+          if ($LASTEXITCODE -ne 0) { throw 'WinForms self-contained publish failed.' }
+          $menuExe = Join-Path $env:GITHUB_WORKSPACE 'desktop\HmsSuperpowers\bin\Release\net10.0-windows\win-x64\publish\HMS-Superpowers.exe'
+          if (-not (Test-Path -LiteralPath $menuExe -PathType Leaf)) { throw "Published menu EXE is missing: $menuExe" }
+          Write-Host 'PASS: self-contained HMS WinForms menu built from exact candidate.'
+
+      - name: Acquire and verify pinned Inno Setup 7.1.0 x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $download = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.0-x64.exe'
+          Invoke-WebRequest -UseBasicParsing -Uri $env:INNO_URL -OutFile $download
+          $hash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -cne $env:INNO_SHA256) {
+            throw "Inno Setup SHA-256 mismatch. Expected $env:INNO_SHA256, found $hash"
+          }
+          $innoHome = Join-Path $env:RUNNER_TEMP 'inno-7.1.0'
+          $proc = Start-Process -FilePath $download -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',("/DIR=$innoHome")) -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "Pinned Inno Setup installer failed with exit code $($proc.ExitCode)." }
+          $iscc = Join-Path $innoHome 'ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) { throw "Pinned ISCC.exe is missing: $iscc" }
+          "INNO_HOME=$innoHome" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "PASS: Inno Setup $env:INNO_VERSION x64 verified by SHA-256 before execution."
+
+      - name: Generate exact candidate setup authority
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:CANDIDATE_SHA -notmatch '^[0-9a-fA-F]{40}$' -or $env:CANDIDATE_TREE -notmatch '^[0-9a-f]{40}$') {
+            throw 'Candidate authority HEAD/tree environment is malformed.'
+          }
+          $remoteLine = ((& git ls-remote origin $env:AUTHORITY_SOURCE_REF) -join "`n").Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($remoteLine)) {
+            throw 'Unable to re-resolve candidate source ref immediately before packaging.'
+          }
+          $remoteSha = (($remoteLine -split '\s+')[0]).ToLowerInvariant()
+          if ($remoteSha -cne $env:CANDIDATE_SHA.ToLowerInvariant()) {
+            throw "Candidate source ref moved during qualification. Expected $env:CANDIDATE_SHA, found $remoteSha"
+          }
+          $generated = Join-Path $env:GITHUB_WORKSPACE 'installer\generated'
+          New-Item -ItemType Directory -Path $generated -Force | Out-Null
+          $authority = [ordered]@{
+            schema_version = 1
+            product_version = '0.3.0'
+            mode = 'candidate'
+            repository = 'https://github.com/hoangminhsang989/HMS-Skills-Codex.git'
+            source_ref = $env:AUTHORITY_SOURCE_REF
+            commit = $env:CANDIDATE_SHA.ToLowerInvariant()
+            tree = $env:CANDIDATE_TREE.ToLowerInvariant()
+            release_tag = $null
+          }
+          $json = $authority | ConvertTo-Json -Depth 5
+          [IO.File]::WriteAllText((Join-Path $generated 'setup-authority.json'), $json, (New-Object Text.UTF8Encoding($false)))
+          Write-Host "PASS: setup authority generated for exact candidate $env:CANDIDATE_SHA."
+
+      - name: Compile exact Windows Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = Join-Path $env:INNO_HOME 'ISCC.exe'
+          & $iscc 'installer\HMS-Superpowers.iss'
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE." }
+          $setupExe = Join-Path $env:GITHUB_WORKSPACE 'artifacts\windows-setup\HMS-Superpowers-Setup-v0.3.0.exe'
+          if (-not (Test-Path -LiteralPath $setupExe -PathType Leaf)) { throw "Compiled Setup is missing: $setupExe" }
+          "SETUP_EXE=$setupExe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host 'PASS: Inno Setup compiled the exact HMS candidate.'
+
+      - name: Capture binary identities
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $menuExe = Join-Path $env:GITHUB_WORKSPACE 'desktop\HmsSuperpowers\bin\Release\net10.0-windows\win-x64\publish\HMS-Superpowers.exe'
+          $setupHash = (Get-FileHash -LiteralPath $env:SETUP_EXE -Algorithm SHA256).Hash.ToLowerInvariant()
+          $menuHash = (Get-FileHash -LiteralPath $menuExe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($setupHash -notmatch '^[0-9a-f]{64}$' -or $menuHash -notmatch '^[0-9a-f]{64}$') { throw 'Binary SHA-256 capture failed.' }
+          Write-Host "SETUP_SHA256=$setupHash"
+          Write-Host "MENU_SHA256=$menuHash"
+
+      - name: Assert fresh per-user HMS Setup state
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $appRoot = Join-Path $env:LOCALAPPDATA 'Programs\HMS Superpowers'
+          $repoRoot = Join-Path $env:USERPROFILE '.codex\hms-skills-codex'
+          $publicSkill = Join-Path $env:USERPROFILE '.agents\skills\hms-superpowers'
+          foreach ($path in @($appRoot,$repoRoot,$publicSkill)) {
+            if (Test-Path -LiteralPath $path) { throw "Windows Setup smoke requires fresh HMS state, but path already exists: $path" }
+          }
+          Write-Host 'PASS: hosted runner starts with fresh HMS per-user state.'
+
+      - name: Install HMS Setup silently and prove installed state
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setupLog = Join-Path $env:RUNNER_TEMP 'hms-setup-install.log'
+          $proc = Start-Process -FilePath $env:SETUP_EXE -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',("/LOG=$setupLog")) -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            if (Test-Path -LiteralPath $setupLog) { Get-Content -LiteralPath $setupLog -Tail 250 | Write-Host }
+            throw "HMS Setup failed with exit code $($proc.ExitCode)."
+          }
+
+          $appRoot = Join-Path $env:LOCALAPPDATA 'Programs\HMS Superpowers'
+          $repoRoot = Join-Path $env:USERPROFILE '.codex\hms-skills-codex'
+          $gitExe = Join-Path $appRoot 'support\git\cmd\git.exe'
+          $codexExe = Join-Path $appRoot 'support\codex\codex.exe'
+          $installedMenu = Join-Path $appRoot 'HMS-Superpowers.exe'
+          $uninstaller = Join-Path $appRoot 'unins000.exe'
+          $desktopShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'HMS Superpowers.lnk'
+          $groupRoot = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\HMS Superpowers'
+          $startMenuShortcut = Join-Path $groupRoot 'HMS Superpowers.lnk'
+          $uninstallShortcut = Join-Path $groupRoot 'Uninstall HMS Superpowers.lnk'
+          foreach ($path in @($gitExe,$codexExe,$installedMenu,$uninstaller,$desktopShortcut,$startMenuShortcut,$uninstallShortcut)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Installed HMS artifact is missing: $path" }
+          }
+          if (-not (Test-Path -LiteralPath $repoRoot -PathType Container)) { throw 'Canonical HMS source checkout was not created.' }
+
+          $origin = (& $gitExe -C $repoRoot remote get-url origin).Trim()
+          if ($LASTEXITCODE -ne 0 -or ($origin.TrimEnd('/') -replace '\.git$','').ToLowerInvariant() -cne 'https://github.com/hoangminhsang989/hms-skills-codex') {
+            throw "Unexpected installed HMS origin: $origin"
+          }
+          $head = (& $gitExe -C $repoRoot rev-parse HEAD).Trim().ToLowerInvariant()
+          $tree = (& $gitExe -C $repoRoot rev-parse 'HEAD^{tree}').Trim().ToLowerInvariant()
+          if ($head -cne $env:CANDIDATE_SHA.ToLowerInvariant()) { throw "Installed HMS HEAD mismatch: $head" }
+          if ($tree -cne $env:CANDIDATE_TREE.ToLowerInvariant()) { throw "Installed HMS tree mismatch: $tree" }
+          $status = ((& $gitExe -C $repoRoot status --porcelain=v1 --untracked-files=all) -join "`n").Trim()
+          if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($status)) { throw "Installed HMS checkout is not clean: $status" }
+
+          $compositeManifest = Join-Path $env:USERPROFILE '.codex\hms-composite\hms-superpowers\manifest.json'
+          if (-not (Test-Path -LiteralPath $compositeManifest -PathType Leaf)) { throw 'HMS composite manifest is missing after Setup.' }
+          $skillsRoot = Join-Path $env:USERPROFILE '.agents\skills'
+          $publicSkills = @(Get-ChildItem -LiteralPath $skillsRoot -Directory -Force | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'SKILL.md') -PathType Leaf })
+          if ($publicSkills.Count -ne 1 -or $publicSkills[0].Name -cne 'hms-superpowers') {
+            throw "Expected exactly one HMS public skill; found: $($publicSkills.Name -join ', ')"
+          }
+          Write-Host "PASS: fresh Setup installed exact HMS candidate with one public hms-superpowers skill."
+
+      - name: Launch installed self-contained menu smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $menu = Join-Path $env:LOCALAPPDATA 'Programs\HMS Superpowers\HMS-Superpowers.exe'
+          $proc = Start-Process -FilePath $menu -PassThru
+          Start-Sleep -Seconds 4
+          try {
+            if ($proc.HasExited) { throw "Installed HMS menu exited unexpectedly with code $($proc.ExitCode)." }
+            Write-Host 'PASS: installed self-contained HMS menu remained live during launch smoke.'
+          }
+          finally {
+            if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          }
+
+      - name: Run authenticated repair and diagnostics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $appRoot = Join-Path $env:LOCALAPPDATA 'Programs\HMS Superpowers'
+          $repoRoot = Join-Path $env:USERPROFILE '.codex\hms-skills-codex'
+          $launcher = Join-Path $repoRoot 'HMS-Lifecycle.cmd'
+          $oldPath = $env:PATH
+          $env:PATH = (Join-Path $appRoot 'support\git\cmd') + ';' + (Join-Path $appRoot 'support\codex') + ';' + $oldPath
+          try {
+            & $launcher repair
+            if ($LASTEXITCODE -ne 0) { throw "Authenticated HMS repair failed with exit code $LASTEXITCODE." }
+          }
+          finally { $env:PATH = $oldPath }
+
+          $gitExe = Join-Path $appRoot 'support\git\cmd\git.exe'
+          $status = ((& $gitExe -C $repoRoot status --porcelain=v1 --untracked-files=all) -join "`n").Trim()
+          if ($LASTEXITCODE -ne 0 -or -not [string]::IsNullOrWhiteSpace($status)) { throw "Repair left HMS source dirty: $status" }
+          $head = (& $gitExe -C $repoRoot rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($head -cne $env:CANDIDATE_SHA.ToLowerInvariant()) { throw "Repair changed HMS candidate identity: $head" }
+          $manifest = Join-Path $env:USERPROFILE '.codex\hms-composite\hms-superpowers\manifest.json'
+          $publicSkill = Join-Path $env:USERPROFILE '.agents\skills\hms-superpowers\SKILL.md'
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf) -or -not (Test-Path -LiteralPath $publicSkill -PathType Leaf)) {
+            throw 'Repair diagnostics failed to prove composite/public discovery state.'
+          }
+          Write-Host 'PASS: authenticated repair and read-only system diagnostics succeeded.'
+
+      - name: Run registered uninstaller and prove non-destructive source retention
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $appRoot = Join-Path $env:LOCALAPPDATA 'Programs\HMS Superpowers'
+          $repoRoot = Join-Path $env:USERPROFILE '.codex\hms-skills-codex'
+          $uninstaller = Join-Path $appRoot 'unins000.exe'
+          $desktopShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'HMS Superpowers.lnk'
+          $groupRoot = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\HMS Superpowers'
+          $uninstallLog = Join-Path $env:RUNNER_TEMP 'hms-setup-uninstall.log'
+
+          $proc = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',("/LOG=$uninstallLog")) -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            if (Test-Path -LiteralPath $uninstallLog) { Get-Content -LiteralPath $uninstallLog -Tail 250 | Write-Host }
+            throw "Registered HMS uninstaller failed with exit code $($proc.ExitCode)."
+          }
+
+          if (Test-Path -LiteralPath (Join-Path $appRoot 'HMS-Superpowers.exe')) { throw 'Uninstall left the Setup-owned menu EXE.' }
+          if (Test-Path -LiteralPath (Join-Path $appRoot 'support')) { throw 'Uninstall left Setup-owned support tools.' }
+          if (Test-Path -LiteralPath $desktopShortcut) { throw 'Uninstall left the Desktop shortcut.' }
+          if (Test-Path -LiteralPath $groupRoot) { throw 'Uninstall left the HMS Start Menu group.' }
+          if (-not (Test-Path -LiteralPath $repoRoot -PathType Container)) { throw 'Normal uninstall removed HMS source unexpectedly.' }
+
+          $head = (& git -C $repoRoot rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $head -cne $env:CANDIDATE_SHA.ToLowerInvariant()) { throw "Preserved HMS source identity mismatch after uninstall: $head" }
+          $compositeManifest = Join-Path $env:USERPROFILE '.codex\hms-composite\hms-superpowers\manifest.json'
+          if (-not (Test-Path -LiteralPath $compositeManifest -PathType Leaf)) { throw 'Normal uninstall removed HMS composite state unexpectedly.' }
+          $publicSkill = Join-Path $env:USERPROFILE '.agents\skills\hms-superpowers'
+          if (Test-Path -LiteralPath $publicSkill) { throw 'Normal uninstall left HMS public discovery enabled.' }
+          Write-Host 'PASS: registered uninstaller removed Setup-owned app/support/shortcuts while preserving HMS source/state.'
