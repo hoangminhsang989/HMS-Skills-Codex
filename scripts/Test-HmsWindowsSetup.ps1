@@ -62,7 +62,7 @@ if ($Scope -in @('All','Lifecycle')) {
     Assert-TextContains -Path $lifecycleShimPath -Pattern 'TrustedRepoRoot' -Message 'Lifecycle shim must receive trusted repository root.'
     Assert-TextContains -Path $lifecycleShimPath -Pattern 'TrustedHead' -Message 'Lifecycle shim must receive trusted HEAD.'
     Assert-TextContains -Path $lifecycleShimPath -Pattern 'TrustedBootstrapBlob' -Message 'Lifecycle shim must receive trusted bootstrap blob.'
-    Assert-TextContains -Path $lifecycleShimPath -Pattern 'cat-file -t' -Message 'Lifecycle shim must prove target script object type.'
+    Assert-TextContains -Path $lifecycleShimPath -Pattern "cat-file'\s*,\s*'-t" -Message 'Lifecycle shim must prove target script object type.'
     Assert-TextContains -Path $lifecycleShimPath -Pattern '\[ScriptBlock\]::Create' -Message 'Lifecycle shim must execute authenticated target bytes in memory.'
     $lifecycleShimText = [IO.File]::ReadAllText($lifecycleShimPath)
     if ($lifecycleShimText -match '(?i)powershell(?:\.exe)?[^\r\n]*-File[^\r\n]*(install|update|uninstall)\.ps1') {
