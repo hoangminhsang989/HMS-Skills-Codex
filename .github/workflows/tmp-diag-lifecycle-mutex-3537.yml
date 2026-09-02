@@ -21,7 +21,7 @@ jobs:
           ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 1
 
-      - name: Compare child-job git invocation modes
+      - name: Compare child-job git invocation modes with exact git.exe
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -30,19 +30,25 @@ jobs:
           $head = $env:CANDIDATE_SHA.ToLowerInvariant()
           $blob = ((& git -C $root rev-parse "$head`:$relative" 2>$null) -join '').Trim().ToLowerInvariant()
           if ($LASTEXITCODE -ne 0 -or $blob -notmatch '^[0-9a-f]{40}$') { throw 'Bootstrap blob lookup failed.' }
-          $gitExe = (Get-Command git -CommandType Application -ErrorAction Stop).Source
+          $gitExe = @((Get-Command git.exe -CommandType Application -ErrorAction Stop))[0].Source
+          if (-not (Test-Path -LiteralPath $gitExe -PathType Leaf)) { throw "Exact git.exe not found: $gitExe" }
           Write-Host "BOOTSTRAP_BLOB=$blob"
           Write-Host "GIT_EXE=$gitExe"
 
           function Invoke-DiagJob {
-            param([Parameter(Mandatory)][string]$Label,[Parameter(Mandatory)][scriptblock]$Body,[Parameter(Mandatory)][object[]]$Args,[int]$TimeoutSeconds=15)
+            param(
+              [Parameter(Mandatory)][string]$Label,
+              [Parameter(Mandatory)][scriptblock]$Body,
+              [Parameter(Mandatory)][object[]]$Args,
+              [int]$TimeoutSeconds = 15
+            )
             $job = Start-Job -ScriptBlock $Body -ArgumentList $Args
             try {
               $null = Wait-Job $job -Timeout $TimeoutSeconds
               $output = @(Receive-Job $job -ErrorAction Continue 2>&1)
               $output | ForEach-Object { Write-Host $_ }
               Write-Host ("{0}_STATE={1}" -f $Label,$job.State)
-              return [pscustomobject]@{ State=$job.State; Output=$output }
+              return [pscustomobject]@{ State = $job.State; Output = $output }
             }
             finally {
               if ($job.State -in @('Running','NotStarted')) { Stop-Job $job -ErrorAction SilentlyContinue }
@@ -50,86 +56,76 @@ jobs:
             }
           }
 
-          $native = Invoke-DiagJob -Label 'NATIVE' -Args @($root,$blob,$gitExe) -Body {
+          $nativeMeta = Invoke-DiagJob -Label 'NATIVE_META' -Args @($root,$blob,$gitExe) -Body {
             param($RepoRoot,$Blob,$GitExe)
-            $ErrorActionPreference='Stop'
-            Write-Output ('NATIVE_CMD={0}' -f (Get-Command git -CommandType Application -ErrorAction Stop).Source)
+            $ErrorActionPreference = 'Stop'
+            Write-Output ('NATIVE_META_CMD={0}' -f $GitExe)
+            $type = ((& $GitExe -C $RepoRoot cat-file -t $Blob 2>&1) -join '').Trim()
+            if ($LASTEXITCODE -ne 0) { throw ('native cat-file -t failed: ' + $type) }
+            Write-Output ('NATIVE_META_TYPE={0}' -f $type)
             $size = ((& $GitExe -C $RepoRoot cat-file -s $Blob 2>&1) -join '').Trim()
-            Write-Output ('NATIVE_SIZE={0}' -f $size)
-            $tmp = Join-Path $env:TEMP ('hms-native-' + [guid]::NewGuid().ToString('N') + '.bin')
-            try {
-              $psi = New-Object Diagnostics.ProcessStartInfo
-              $psi.FileName = $env:ComSpec
-              $psi.Arguments = ('/d /s /c ""{0}" -C "{1}" cat-file blob {2} > "{3}""' -f $GitExe,$RepoRoot,$Blob,$tmp)
-              $psi.UseShellExecute=$false
-              $psi.CreateNoWindow=$true
-              $p=New-Object Diagnostics.Process
-              $p.StartInfo=$psi
-              try {
-                if (-not $p.Start()) { throw 'cmd redirect start failed' }
-                if (-not $p.WaitForExit(10000)) { try { $p.Kill($true) } catch {}; throw 'cmd redirect timeout' }
-                Write-Output ('NATIVE_REDIRECT_EXIT={0}' -f $p.ExitCode)
-                Write-Output ('NATIVE_REDIRECT_BYTES={0}' -f (Get-Item -LiteralPath $tmp).Length)
-              }
-              finally { $p.Dispose() }
-            }
-            finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+            if ($LASTEXITCODE -ne 0) { throw ('native cat-file -s failed: ' + $size) }
+            Write-Output ('NATIVE_META_SIZE={0}' -f $size)
           }
 
-          $pathDotNet = Invoke-DiagJob -Label 'DOTNET_PATH' -Args @($root,$blob) -Body {
-            param($RepoRoot,$Blob)
-            $ErrorActionPreference='Stop'
-            $psi=New-Object Diagnostics.ProcessStartInfo
-            $psi.FileName='git'
-            $psi.Arguments="-C `"$RepoRoot`" cat-file blob $Blob"
-            $psi.UseShellExecute=$false
-            $psi.RedirectStandardOutput=$true
-            $psi.RedirectStandardError=$true
-            $psi.CreateNoWindow=$true
-            $p=New-Object Diagnostics.Process
-            $p.StartInfo=$psi
-            $m=New-Object IO.MemoryStream
-            try {
-              if (-not $p.Start()) { throw 'DOTNET_PATH start failed' }
-              Write-Output ('DOTNET_PATH_MAINMODULE={0}' -f $p.MainModule.FileName)
-              $ot=$p.StandardOutput.BaseStream.CopyToAsync($m)
-              $et=$p.StandardError.ReadToEndAsync()
-              if (-not $p.WaitForExit(10000)) { try { $p.Kill($true) } catch {}; throw 'DOTNET_PATH timeout' }
-              $ot.GetAwaiter().GetResult(); $err=$et.GetAwaiter().GetResult()
-              Write-Output ('DOTNET_PATH_EXIT={0}' -f $p.ExitCode)
-              Write-Output ('DOTNET_PATH_BYTES={0}' -f $m.Length)
-              Write-Output ('DOTNET_PATH_STDERR={0}' -f $err.Length)
+          $redirectPath = Join-Path $env:RUNNER_TEMP ('hms-cmd-blob-' + [guid]::NewGuid().ToString('N') + '.bin')
+          try {
+            $cmdRedirect = Invoke-DiagJob -Label 'CMD_REDIRECT' -Args @($root,$blob,$gitExe,$redirectPath) -Body {
+              param($RepoRoot,$Blob,$GitExe,$OutputPath)
+              $ErrorActionPreference = 'Stop'
+              $cmdLine = ('"{0}" -C "{1}" cat-file blob {2} > "{3}"' -f $GitExe,$RepoRoot,$Blob,$OutputPath)
+              Write-Output ('CMD_REDIRECT_LINE={0}' -f $cmdLine)
+              & $env:ComSpec /d /s /c $cmdLine
+              $exit = $LASTEXITCODE
+              Write-Output ('CMD_REDIRECT_EXIT={0}' -f $exit)
+              if ($exit -ne 0) { throw "cmd redirected git cat-file failed with exit $exit" }
+              if (-not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) { throw 'cmd redirected output file missing.' }
+              Write-Output ('CMD_REDIRECT_BYTES={0}' -f (Get-Item -LiteralPath $OutputPath).Length)
             }
-            finally { $m.Dispose(); $p.Dispose() }
+            if ($cmdRedirect.State -eq 'Completed' -and (Test-Path -LiteralPath $redirectPath -PathType Leaf)) {
+              $roundTripBlob = ((& $gitExe -C $root hash-object -- $redirectPath 2>$null) -join '').Trim().ToLowerInvariant()
+              Write-Host "CMD_REDIRECT_HASH_OBJECT=$roundTripBlob"
+              Write-Host ('CMD_REDIRECT_EXACT_BLOB={0}' -f ($roundTripBlob -eq $blob))
+            }
+          }
+          finally {
+            Remove-Item -LiteralPath $redirectPath -Force -ErrorAction SilentlyContinue
           }
 
-          $absDotNet = Invoke-DiagJob -Label 'DOTNET_ABS' -Args @($root,$blob,$gitExe) -Body {
+          $dotnetAbs = Invoke-DiagJob -Label 'DOTNET_ABS' -Args @($root,$blob,$gitExe) -Body {
             param($RepoRoot,$Blob,$GitExe)
-            $ErrorActionPreference='Stop'
-            $psi=New-Object Diagnostics.ProcessStartInfo
-            $psi.FileName=$GitExe
-            $psi.Arguments="-C `"$RepoRoot`" cat-file blob $Blob"
-            $psi.UseShellExecute=$false
-            $psi.RedirectStandardOutput=$true
-            $psi.RedirectStandardError=$true
-            $psi.CreateNoWindow=$true
-            $p=New-Object Diagnostics.Process
-            $p.StartInfo=$psi
-            $m=New-Object IO.MemoryStream
+            $ErrorActionPreference = 'Stop'
+            $psi = New-Object Diagnostics.ProcessStartInfo
+            $psi.FileName = $GitExe
+            $psi.Arguments = "-C `"$RepoRoot`" cat-file blob $Blob"
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.CreateNoWindow = $true
+            $proc = New-Object Diagnostics.Process
+            $proc.StartInfo = $psi
+            $memory = New-Object IO.MemoryStream
             try {
-              if (-not $p.Start()) { throw 'DOTNET_ABS start failed' }
-              Write-Output ('DOTNET_ABS_MAINMODULE={0}' -f $p.MainModule.FileName)
-              $ot=$p.StandardOutput.BaseStream.CopyToAsync($m)
-              $et=$p.StandardError.ReadToEndAsync()
-              if (-not $p.WaitForExit(10000)) { try { $p.Kill($true) } catch {}; throw 'DOTNET_ABS timeout' }
-              $ot.GetAwaiter().GetResult(); $err=$et.GetAwaiter().GetResult()
-              Write-Output ('DOTNET_ABS_EXIT={0}' -f $p.ExitCode)
-              Write-Output ('DOTNET_ABS_BYTES={0}' -f $m.Length)
-              Write-Output ('DOTNET_ABS_STDERR={0}' -f $err.Length)
+              if (-not $proc.Start()) { throw 'DOTNET_ABS start failed' }
+              Write-Output ('DOTNET_ABS_MAINMODULE={0}' -f $proc.MainModule.FileName)
+              $stdoutTask = $proc.StandardOutput.BaseStream.CopyToAsync($memory)
+              $stderrTask = $proc.StandardError.ReadToEndAsync()
+              if (-not $proc.WaitForExit(10000)) {
+                try { $proc.Kill($true) } catch {}
+                throw 'DOTNET_ABS timeout'
+              }
+              $stdoutTask.GetAwaiter().GetResult()
+              $stderr = $stderrTask.GetAwaiter().GetResult()
+              Write-Output ('DOTNET_ABS_EXIT={0}' -f $proc.ExitCode)
+              Write-Output ('DOTNET_ABS_BYTES={0}' -f $memory.Length)
+              Write-Output ('DOTNET_ABS_STDERR={0}' -f $stderr.Length)
             }
-            finally { $m.Dispose(); $p.Dispose() }
+            finally {
+              $memory.Dispose()
+              $proc.Dispose()
+            }
           }
 
-          Write-Host ('SUMMARY_NATIVE={0}' -f $native.State)
-          Write-Host ('SUMMARY_DOTNET_PATH={0}' -f $pathDotNet.State)
-          Write-Host ('SUMMARY_DOTNET_ABS={0}' -f $absDotNet.State)
+          Write-Host ('SUMMARY_NATIVE_META={0}' -f $nativeMeta.State)
+          Write-Host ('SUMMARY_CMD_REDIRECT={0}' -f $cmdRedirect.State)
+          Write-Host ('SUMMARY_DOTNET_ABS={0}' -f $dotnetAbs.State)
