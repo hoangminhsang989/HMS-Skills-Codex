@@ -31,11 +31,30 @@ jobs:
           $oldCodexHome = $env:CODEX_HOME
           $mutexName = 'Local\HMS-Skills-Codex-CompositeBuild-v1'
 
-          function Add-ExactMarker {
-            param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Needle,[Parameter(Mandatory)][string]$Replacement,[Parameter(Mandatory)][string]$Label)
+          function Insert-ExactMarkerAfter {
+            param(
+              [Parameter(Mandatory)][string]$Source,
+              [Parameter(Mandatory)][string]$Needle,
+              [Parameter(Mandatory)][string]$Marker,
+              [Parameter(Mandatory)][string]$Label
+            )
             $count = [regex]::Matches($Source,[regex]::Escape($Needle)).Count
             if ($count -ne 1) { throw ('Instrument anchor {0} expected exactly once, found {1}.' -f $Label,$count) }
-            return $Source.Replace($Needle,$Replacement)
+            $nl = if ($Source.Contains("`r`n")) { "`r`n" } else { "`n" }
+            return $Source.Replace($Needle,($Needle + $nl + "    Write-Output '$Marker'"))
+          }
+
+          function Insert-ExactMarkerBefore {
+            param(
+              [Parameter(Mandatory)][string]$Source,
+              [Parameter(Mandatory)][string]$Needle,
+              [Parameter(Mandatory)][string]$Marker,
+              [Parameter(Mandatory)][string]$Label
+            )
+            $count = [regex]::Matches($Source,[regex]::Escape($Needle)).Count
+            if ($count -ne 1) { throw ('Instrument anchor {0} expected exactly once, found {1}.' -f $Label,$count) }
+            $nl = if ($Source.Contains("`r`n")) { "`r`n" } else { "`n" }
+            return $Source.Replace($Needle,("    Write-Output '$Marker'" + $nl + $Needle))
           }
 
           try {
@@ -64,36 +83,24 @@ jobs:
             Add-Content -LiteralPath $tastePath -Value "`n<!-- HMS DIAG dirty Taste -->"
 
             $source = Get-Content -LiteralPath (Join-Path $root 'update.ps1') -Raw
-            $source = Add-ExactMarker -Source $source -Label 'after-mutex' `
-              -Needle '    if (-not $mutexOwned) { throw "Timed out waiting for composite build lock: $BuildMutexName" }' `
-              -Replacement "    if (-not `$mutexOwned) { throw \"Timed out waiting for composite build lock: `$BuildMutexName\" }`r`n    Write-Output 'DIAG_UPDATE_AFTER_MUTEX'"
-            $source = Add-ExactMarker -Source $source -Label 'after-first-index-check' `
-              -Needle "    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }`r`n    Assert-NoHiddenIndexState -Path `$InstallRoot" `
-              -Replacement "    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'git.exe is required but was not found in PATH.' }`r`n    Assert-NoHiddenIndexState -Path `$InstallRoot`r`n    Write-Output 'DIAG_UPDATE_AFTER_INDEX_CHECK'"
-            $source = Add-ExactMarker -Source $source -Label 'pre-head' `
-              -Needle '    $preUpdateHead = Get-HmsCanonicalHead -Path $InstallRoot' `
-              -Replacement "    `$preUpdateHead = Get-HmsCanonicalHead -Path `$InstallRoot`r`n    Write-Output 'DIAG_UPDATE_AFTER_PRE_HEAD'"
-            $source = Add-ExactMarker -Source $source -Label 'pre-bootstrap' `
-              -Needle '    $preTrustBootstrap = Get-HmsLifecycleTrustBootstrap -RepoRoot $InstallRoot -Head $preUpdateHead' `
-              -Replacement "    `$preTrustBootstrap = Get-HmsLifecycleTrustBootstrap -RepoRoot `$InstallRoot -Head `$preUpdateHead`r`n    Write-Output 'DIAG_UPDATE_AFTER_PRE_BOOTSTRAP'"
-            $source = Add-ExactMarker -Source $source -Label 'pre-dot-source' `
-              -Needle '    . $preTrustBootstrap.ScriptBlock' `
-              -Replacement "    . `$preTrustBootstrap.ScriptBlock`r`n    Write-Output 'DIAG_UPDATE_AFTER_PRE_DOTSOURCE'"
-            $source = Add-ExactMarker -Source $source -Label 'pre-reader' `
-              -Needle "    `$preReaderSnapshot = Get-HmsCommittedScriptSnapshot -RepoRoot `$InstallRoot -Head `$preUpdateHead -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Label 'Pre-update composite module-state reader'" `
-              -Replacement "    `$preReaderSnapshot = Get-HmsCommittedScriptSnapshot -RepoRoot `$InstallRoot -Head `$preUpdateHead -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Label 'Pre-update composite module-state reader'`r`n    Write-Output 'DIAG_UPDATE_AFTER_PRE_READER'"
-            $source = Add-ExactMarker -Source $source -Label 'module-state' `
-              -Needle '    $state = Get-ModuleState -ReaderScript $preReaderSnapshot.ScriptBlock' `
-              -Replacement "    `$state = Get-ModuleState -ReaderScript `$preReaderSnapshot.ScriptBlock`r`n    Write-Output 'DIAG_UPDATE_AFTER_MODULE_STATE'"
-            $source = Add-ExactMarker -Source $source -Label 'taste-preflight' `
-              -Needle "    if (-not `$SkipTaste) { Assert-ExistingPinnedSourceClean -Path `$TasteRoot -Label 'GPT Taste' }" `
-              -Replacement "    Write-Output 'DIAG_UPDATE_BEFORE_TASTE_PREFLIGHT'`r`n    if (-not `$SkipTaste) { Assert-ExistingPinnedSourceClean -Path `$TasteRoot -Label 'GPT Taste' }`r`n    Write-Output 'DIAG_UPDATE_AFTER_TASTE_PREFLIGHT'"
+            $source = Insert-ExactMarkerAfter -Source $source -Label 'after-mutex' -Marker 'DIAG_UPDATE_AFTER_MUTEX' -Needle '    if (-not $mutexOwned) { throw "Timed out waiting for composite build lock: $BuildMutexName" }'
+            $source = Insert-ExactMarkerAfter -Source $source -Label 'pre-head' -Marker 'DIAG_UPDATE_AFTER_PRE_HEAD' -Needle '    $preUpdateHead = Get-HmsCanonicalHead -Path $InstallRoot'
+            $source = Insert-ExactMarkerAfter -Source $source -Label 'pre-bootstrap' -Marker 'DIAG_UPDATE_AFTER_PRE_BOOTSTRAP' -Needle '    $preTrustBootstrap = Get-HmsLifecycleTrustBootstrap -RepoRoot $InstallRoot -Head $preUpdateHead'
+            $source = Insert-ExactMarkerAfter -Source $source -Label 'pre-dot-source' -Marker 'DIAG_UPDATE_AFTER_PRE_DOTSOURCE' -Needle '    . $preTrustBootstrap.ScriptBlock'
+            $readerNeedle = "    `$preReaderSnapshot = Get-HmsCommittedScriptSnapshot -RepoRoot `$InstallRoot -Head `$preUpdateHead -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Label 'Pre-update composite module-state reader'"
+            $source = Insert-ExactMarkerAfter -Source $source -Label 'pre-reader' -Marker 'DIAG_UPDATE_AFTER_PRE_READER' -Needle $readerNeedle
+            $source = Insert-ExactMarkerAfter -Source $source -Label 'module-state' -Marker 'DIAG_UPDATE_AFTER_MODULE_STATE' -Needle '    $state = Get-ModuleState -ReaderScript $preReaderSnapshot.ScriptBlock'
+            $tasteNeedle = "    if (-not `$SkipTaste) { Assert-ExistingPinnedSourceClean -Path `$TasteRoot -Label 'GPT Taste' }"
+            $source = Insert-ExactMarkerBefore -Source $source -Label 'taste-preflight-before' -Marker 'DIAG_UPDATE_BEFORE_TASTE_PREFLIGHT' -Needle $tasteNeedle
+            $source = Insert-ExactMarkerAfter -Source $source -Label 'taste-preflight-after' -Marker 'DIAG_UPDATE_AFTER_TASTE_PREFLIGHT' -Needle $tasteNeedle
 
             $instrumentedUpdate = Join-Path $env:RUNNER_TEMP 'update-instrumented.ps1'
             [IO.File]::WriteAllText($instrumentedUpdate,$source,(New-Object Text.UTF8Encoding($false)))
+            $tokens = $null
             $parseErrors = $null
-            $null = [Management.Automation.Language.Parser]::ParseFile($instrumentedUpdate,[ref]$null,[ref]$parseErrors)
+            $null = [Management.Automation.Language.Parser]::ParseFile($instrumentedUpdate,[ref]$tokens,[ref]$parseErrors)
             if (@($parseErrors).Count -ne 0) { throw ('Instrumented updater parse errors: ' + (($parseErrors | ForEach-Object Message) -join '; ')) }
+            Write-Host 'DIAG_INSTRUMENTED_UPDATE_PARSE_PASS'
 
             $parentMutex = New-Object System.Threading.Mutex($false,$mutexName)
             $parentOwned = $false
