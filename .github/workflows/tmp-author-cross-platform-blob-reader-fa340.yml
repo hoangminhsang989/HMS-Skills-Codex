@@ -54,10 +54,6 @@ jobs:
               }
             }
             Write-Host 'PARSER_3_OF_3=PASS'
-
-            ./scripts/Test-HmsSkills.ps1
-            if ($LASTEXITCODE -ne 0) { throw "Test-HmsSkills failed with exit $LASTEXITCODE" }
-            Write-Host 'LINUX_TEST_HMS_SKILLS=PASS'
           }
           finally { Pop-Location }
 
@@ -106,6 +102,30 @@ jobs:
           if ($commitTree -cne $tree -or $parent -cne $env:BASE_SHA) { throw 'Successor commit identity binding failed.' }
           Write-Host "FINAL_COMMIT=$commit"
           Write-Host "FINAL_PARENT=$parent"
+
+          # Permanent lifecycle regressions deliberately read committed HEAD blobs. Qualify the
+          # exact locally-created successor commit, not the mutable author-branch worktree.
+          & git -C $root checkout --detach --force $commit
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to checkout exact successor commit for qualification.' }
+          $qualifiedHead = ((& git -C $root rev-parse HEAD) -join '').Trim().ToLowerInvariant()
+          if ($qualifiedHead -cne $commit) { throw "Qualification HEAD mismatch. Expected $commit, found $qualifiedHead" }
+          Write-Host "QUALIFICATION_HEAD=$qualifiedHead"
+
+          Push-Location $root
+          try {
+            ./scripts/Test-HmsSkills.ps1
+            if ($LASTEXITCODE -ne 0) { throw "Test-HmsSkills failed with exit $LASTEXITCODE" }
+            Write-Host 'LINUX_TEST_HMS_SKILLS=PASS'
+          }
+          finally { Pop-Location }
+
+          foreach ($relative in $paths) {
+            $afterBlob = ((& git -C $root hash-object -- $relative) -join '').Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $afterBlob -cne $blobMap[$relative]) {
+              throw "Qualification mutated tracked production bytes: $relative"
+            }
+          }
+          Write-Host 'POST_QUALIFICATION_BLOBS=PASS_EXACT_3'
 
           $remoteHeadLine2 = ((& git -C $root ls-remote origin "refs/heads/$env:TARGET_BRANCH") -join '').Trim()
           $remoteHead2 = ($remoteHeadLine2 -split '\s+')[0].ToLowerInvariant()
