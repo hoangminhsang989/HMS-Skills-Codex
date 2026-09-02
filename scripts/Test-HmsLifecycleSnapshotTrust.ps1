@@ -78,7 +78,7 @@ $targets = @(
 )
 $original = @{}
 foreach ($relative in $targets) {
-    $path = Join-Path $RepoRoot ($relative -replace '/',[IO.Path]::DirectorySeparatorChar)
+    $path = Join-Path $RepoRoot $relative.Replace('/',[IO.Path]::DirectorySeparatorChar)
     $original[$relative] = [IO.File]::ReadAllBytes($path)
 }
 
@@ -106,12 +106,12 @@ try {
         'scripts/Sync-DeliveryTools.ps1',
         'scripts/Build-HmsCompositeSkill.ps1'
     )) {
-        $path = Join-Path $RepoRoot ($relative -replace '/',[IO.Path]::DirectorySeparatorChar)
+        $path = Join-Path $RepoRoot $relative.Replace('/',[IO.Path]::DirectorySeparatorChar)
         $existing = (New-Object Text.UTF8Encoding($false,$true)).GetString([byte[]]$original[$relative])
         [IO.File]::WriteAllText($path,("throw 'HMS_LIVE_HELPER_INJECTION_EXECUTED: $relative'`n" + $existing),(New-Object Text.UTF8Encoding($false)))
     }
     foreach ($relative in @('superpowers.lock.json','ui-skills.lock.json','delivery-tools.lock.json')) {
-        $path = Join-Path $RepoRoot ($relative -replace '/',[IO.Path]::DirectorySeparatorChar)
+        $path = Join-Path $RepoRoot $relative.Replace('/',[IO.Path]::DirectorySeparatorChar)
         [IO.File]::WriteAllText($path,'{"HMS_LIVE_LOCK_INJECTION":true}',(New-Object Text.UTF8Encoding($false)))
     }
 
@@ -152,7 +152,7 @@ finally {
     $env:HOME = $oldHome
     $env:USERPROFILE = $oldUserProfile
     foreach ($relative in $targets) {
-        $path = Join-Path $RepoRoot ($relative -replace '/',[IO.Path]::DirectorySeparatorChar)
+        $path = Join-Path $RepoRoot $relative.Replace('/',[IO.Path]::DirectorySeparatorChar)
         [IO.File]::WriteAllBytes($path,[byte[]]$original[$relative])
     }
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
