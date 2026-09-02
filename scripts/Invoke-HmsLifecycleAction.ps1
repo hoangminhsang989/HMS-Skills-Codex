@@ -24,7 +24,7 @@ function Get-HmsGitBlobSha1 {
     $memory = New-Object IO.MemoryStream
     try {
         $memory.Write($header,0,$header.Length)
-        if ($Bytes.Length -gt 0) { $memory.Write($Bytes,0,$Bytes.Length) }
+        if ($Bytes.Length -gt 0) { $memory.Write($Bytes,0,$bytes.Length) }
         $memory.Position = 0
         return (($sha.ComputeHash($memory) | ForEach-Object { $_.ToString('x2') }) -join '')
     }
@@ -119,6 +119,56 @@ function Get-HmsTrustedScriptBlock {
     return [ScriptBlock]::Create($source)
 }
 
+function Get-HmsTrustedRepairScriptBlock {
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-f]{40}$')]
+        [string]$TrustedLifecycleHead
+    )
+
+    $trustedInstall = Get-HmsTrustedScriptBlock -RelativePath 'install.ps1'
+    $source = [string]$trustedInstall.Ast.Extent.Text
+    if ($source -match '\bHmsTrustedLifecycleHead\b') {
+        throw 'Authenticated repair transform rejected an install source that already defines its private trusted-head parameter.'
+    }
+
+    $parameterTail = @'
+    [switch]$SkipThreeLevelDelivery
+)
+'@
+    $parameterReplacement = @'
+    [switch]$SkipThreeLevelDelivery,
+    [Parameter(Mandatory)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$HmsTrustedLifecycleHead
+)
+'@
+    $parameterMatches = [regex]::Matches($source,[regex]::Escape($parameterTail)).Count
+    if ($parameterMatches -ne 1) {
+        throw "Authenticated repair transform expected exactly one install parameter tail, found $parameterMatches."
+    }
+    $source = $source.Replace($parameterTail,$parameterReplacement)
+
+    $syncLiteral = '    Sync-Repository -Remote $HmsRemote -Path $InstallRoot'
+    $syncReplacement = @'
+    Assert-ExpectedOrigin -Path $InstallRoot -ExpectedRemote $HmsRemote
+    $repairStatus = & git -C $InstallRoot status --porcelain
+    if ($LASTEXITCODE -ne 0 -or $repairStatus) { throw "Authenticated lifecycle repair requires a clean HMS checkout: $InstallRoot" }
+    $repairBranch = Get-CurrentBranch -Path $InstallRoot
+    if ([string]$repairBranch -cne 'main') { throw "Authenticated lifecycle repair requires HMS main branch; found $repairBranch" }
+    $repairHead = Get-HmsCanonicalHead -Path $InstallRoot
+    if ($repairHead -cne $HmsTrustedLifecycleHead.ToLowerInvariant()) { throw "Authenticated lifecycle repair HEAD mismatch. Expected $HmsTrustedLifecycleHead, found $repairHead." }
+'@
+    $syncMatches = [regex]::Matches($source,[regex]::Escape($syncLiteral)).Count
+    if ($syncMatches -ne 1) {
+        throw "Authenticated repair transform expected exactly one canonical install synchronization call, found $syncMatches."
+    }
+    $source = $source.Replace($syncLiteral,$syncReplacement)
+
+    try { return [ScriptBlock]::Create($source) }
+    catch { throw "Authenticated repair transformed install.ps1 could not be parsed: $($_.Exception.Message)" }
+}
+
 $relativeTarget = switch ($Action) {
     'update' { 'update.ps1' }
     'repair' { 'install.ps1' }
@@ -126,5 +176,11 @@ $relativeTarget = switch ($Action) {
     default { throw "Unsupported lifecycle action: $Action" }
 }
 
-$targetScript = Get-HmsTrustedScriptBlock -RelativePath $relativeTarget
-& $targetScript -InstallRoot $repoRoot
+if ($Action -ceq 'repair') {
+    $targetScript = Get-HmsTrustedRepairScriptBlock -TrustedLifecycleHead $TrustedHead
+    & $targetScript -InstallRoot $repoRoot -HmsTrustedLifecycleHead $TrustedHead
+}
+else {
+    $targetScript = Get-HmsTrustedScriptBlock -RelativePath $relativeTarget
+    & $targetScript -InstallRoot $repoRoot
+}
