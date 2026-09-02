@@ -1,4 +1,5 @@
 name: Diagnose HMS setup bootstrap runtime v4
+# Retrigger after PS5.1-safe delivery SHA-256 remediation; diagnostic-only, no production semantics.
 
 on:
   push:
@@ -87,7 +88,7 @@ jobs:
             Write-Host "PROBE_REPO_BRANCH=$branch"
             $status = ((& $gitExe -C $repoRoot status --porcelain=v1 --untracked-files=all 2>$null) -join "`n").Trim()
             Write-Host "PROBE_REPO_STATUS=$status"
-            foreach ($relative in @('scripts/Invoke-HmsLifecycleAction.ps1','install.ps1','scripts/Initialize-HmsLifecycleTrust.ps1','scripts/Build-HmsCompositeSkill.ps1')) {
+            foreach ($relative in @('scripts/Invoke-HmsLifecycleAction.ps1','install.ps1','scripts/Initialize-HmsLifecycleTrust.ps1','scripts/Build-HmsCompositeSkill.ps1','scripts/Sync-DeliveryTools.ps1')) {
               $expected = ((& $gitExe -C $repoRoot rev-parse ($head + ':' + $relative) 2>$null) -join '').Trim().ToLowerInvariant()
               $live = Join-Path $repoRoot ($relative -replace '/', '\')
               $actual = if (Test-Path -LiteralPath $live -PathType Leaf) { ((& $gitExe hash-object --no-filters -- $live 2>$null) -join '').Trim().ToLowerInvariant() } else { '<missing>' }
