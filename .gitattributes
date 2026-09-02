@@ -10,3 +10,4 @@ scripts/Read-HmsCompositeModuleState.ps1 text eol=lf
 manager/HmsModelSettings.ps1 text eol=lf
 manager/HmsModelSettings.utf8.ps1 text eol=lf
 scripts/Resolve-HmsModelRoute.ps1 text eol=lf
+scripts/Invoke-HmsLifecycleAction.ps1 text eol=lf
