@@ -51,9 +51,9 @@ Name: "{autodesktop}\HMS Superpowers"; Filename: "{app}\{#MyAppExeName}"; Workin
 
 [Code]
 const
-  FILE_ATTRIBUTE_DIRECTORY = $10;
-  FILE_ATTRIBUTE_REPARSE_POINT = $400;
-  INVALID_FILE_ATTRIBUTES = $FFFFFFFF;
+  HMS_FILE_ATTRIBUTE_DIRECTORY = $10;
+  HMS_FILE_ATTRIBUTE_REPARSE_POINT = $400;
+  HMS_INVALID_FILE_ATTRIBUTES = $FFFFFFFF;
 
 var
   BootstrapSucceeded: Boolean;
@@ -73,9 +73,9 @@ var
   Attributes: Cardinal;
 begin
   Attributes := GetFileAttributesW(Path);
-  if Attributes = INVALID_FILE_ATTRIBUTES then
+  if Attributes = HMS_INVALID_FILE_ATTRIBUTES then
     RaiseException('Unable to inspect Setup-owned path attributes: ' + Path);
-  Result := (Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0;
+  Result := (Attributes and HMS_FILE_ATTRIBUTE_REPARSE_POINT) <> 0;
 end;
 
 procedure AssertTreeHasNoReparsePoints(const Directory: String);
@@ -93,9 +93,9 @@ begin
         if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
         begin
           Child := AddBackslash(Directory) + FindRec.Name;
-          if (FindRec.Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
+          if (FindRec.Attributes and HMS_FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
             RaiseException('Refusing support cleanup because a reparse point exists: ' + Child);
-          if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+          if (FindRec.Attributes and HMS_FILE_ATTRIBUTE_DIRECTORY) <> 0 then
             AssertTreeHasNoReparsePoints(Child);
         end;
       until not FindNext(FindRec);
