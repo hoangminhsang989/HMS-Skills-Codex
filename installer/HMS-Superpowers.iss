@@ -53,6 +53,9 @@ Name: "{autodesktop}\HMS Superpowers"; Filename: "{app}\{#MyAppExeName}"; Workin
 var
   BootstrapSucceeded: Boolean;
 
+function SetProcessEnvironmentVariable(Name: String; Value: String): Boolean;
+  external 'SetEnvironmentVariableW@kernel32.dll stdcall';
+
 function BootstrapReady(): Boolean;
 begin
   Result := BootstrapSucceeded;
@@ -111,4 +114,48 @@ begin
   end;
 
   BootstrapSucceeded := True;
+end;
+
+procedure RunHmsLifecycleUninstall();
+var
+  RepoRoot: String;
+  Launcher: String;
+  CmdExe: String;
+  OldPath: String;
+  ChildPath: String;
+  Params: String;
+  ResultCode: Integer;
+  Started: Boolean;
+begin
+  RepoRoot := AddBackslash(GetEnv('USERPROFILE')) + '.codex\hms-skills-codex';
+  Launcher := AddBackslash(RepoRoot) + 'HMS-Lifecycle.cmd';
+  CmdExe := ExpandConstant('{sys}\cmd.exe');
+
+  if (GetEnv('USERPROFILE') = '') or (not DirExists(RepoRoot)) or (not FileExists(Launcher)) then
+    RaiseException('HMS source/lifecycle authority is unavailable; refusing to remove Setup-owned files first.');
+  if not FileExists(CmdExe) then
+    RaiseException('Trusted Windows cmd.exe is unavailable; refusing HMS uninstall.');
+
+  OldPath := GetEnv('PATH');
+  ChildPath := ExpandConstant('{app}\support\git\cmd;{app}\support\codex;') + OldPath;
+  if not SetProcessEnvironmentVariable('PATH', ChildPath) then
+    RaiseException('Unable to prepare the process-local HMS support PATH for uninstall.');
+
+  try
+    Params := '/d /q /v:off /s /c ""' + Launcher + '" uninstall"';
+    Started := Exec(CmdExe, Params, RepoRoot, SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  finally
+    SetProcessEnvironmentVariable('PATH', OldPath);
+  end;
+
+  if not Started then
+    RaiseException('Authenticated HMS lifecycle uninstall could not be started; Setup-owned files were not removed.');
+  if ResultCode <> 0 then
+    RaiseException('Authenticated HMS lifecycle uninstall failed with exit code ' + IntToStr(ResultCode) + '.');
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    RunHmsLifecycleUninstall();
 end;
