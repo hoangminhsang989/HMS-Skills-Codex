@@ -214,6 +214,58 @@ if (`$result -notmatch 'fake-output') { throw "Invoke-HmsGit lost stdout from an
         }
     }
 
+    # Trusted delivery lifecycle code executes under Windows PowerShell 5.1 during Setup repair.
+    # It must not depend on Get-FileHash, which is absent on supported clean PS5.1 hosts.
+    $deliveryPath = Join-Path $RepoRoot 'scripts\Sync-DeliveryTools.ps1'
+    if (-not (Test-Path -LiteralPath $deliveryPath -PathType Leaf)) { throw 'Delivery lifecycle script is missing.' }
+    $deliveryTokens = $null
+    $deliveryParseErrors = $null
+    $deliveryAst = [System.Management.Automation.Language.Parser]::ParseFile($deliveryPath,[ref]$deliveryTokens,[ref]$deliveryParseErrors)
+    if ($deliveryParseErrors.Count -ne 0) { throw "Delivery lifecycle PowerShell parse failed: $($deliveryParseErrors[0].Message)" }
+    $deliveryHashFunctions = @($deliveryAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-HmsDeliveryFileSha256'
+    },$true))
+    if ($deliveryHashFunctions.Count -ne 1) {
+        throw "Trusted delivery lifecycle must define exactly one PS5.1-safe Get-HmsDeliveryFileSha256 helper; found $($deliveryHashFunctions.Count)."
+    }
+    $deliveryText = [IO.File]::ReadAllText($deliveryPath)
+    if ($deliveryText -match '(?i)\bGet-FileHash\b') {
+        throw 'Trusted delivery lifecycle must not depend on Get-FileHash because supported Windows PowerShell 5.1 hosts may not provide that cmdlet.'
+    }
+
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $hashTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('hms-ps51-delivery-hash-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $hashTestRoot | Out-Null
+        try {
+            $payload = Join-Path $hashTestRoot 'payload.bin'
+            $probe = Join-Path $hashTestRoot 'probe.ps1'
+            $stdout = Join-Path $hashTestRoot 'stdout.log'
+            $stderr = Join-Path $hashTestRoot 'stderr.log'
+            [IO.File]::WriteAllBytes($payload,[byte[]](0,1,2,3,4,5,255))
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try { $expected = (($sha.ComputeHash([IO.File]::ReadAllBytes($payload)) | ForEach-Object { $_.ToString('x2') }) -join '') }
+            finally { $sha.Dispose() }
+            $helperText = $deliveryHashFunctions[0].Extent.Text
+            $payloadLiteral = $payload.Replace("'","''")
+            $probeLines = @(
+                'Set-StrictMode -Version Latest',
+                '$ErrorActionPreference = ''Stop''',
+                $helperText,
+                ("`$actual = Get-HmsDeliveryFileSha256 -Path '{0}'" -f $payloadLiteral),
+                ("if (`$actual -cne '{0}') {{ throw ('PS5.1 delivery SHA-256 mismatch. Expected {0}, found ' + `$actual) }}" -f $expected)
+            )
+            [IO.File]::WriteAllLines($probe,[string[]]$probeLines,(New-Object Text.UTF8Encoding($false)))
+            $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+            $proc = Start-Process -FilePath $windowsPowerShell -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"' + $probe + '"')) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
+            if ($proc.ExitCode -ne 0) {
+                $failure = if (Test-Path -LiteralPath $stderr) { [IO.File]::ReadAllText($stderr).Trim() } else { '' }
+                throw "Trusted delivery SHA-256 helper must run under Windows PowerShell 5.1. Exit=$($proc.ExitCode) Error=$failure"
+            }
+        }
+        finally { Remove-Item -LiteralPath $hashTestRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
     if ($Scope -eq 'Bootstrap') {
         Write-Host 'PASS: HMS setup bootstrap static contract is satisfied.'
         return
