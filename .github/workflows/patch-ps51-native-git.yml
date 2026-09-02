@@ -111,6 +111,7 @@ jobs:
               count = text.count(old)
               if count != 1:
                   raise SystemExit(f'guarded replacement {index} expected exactly once, found {count}')
+              new = '\n'.join(line.rstrip() for line in new.split('\n'))
               text = text.replace(old, new, 1)
 
           path.write_text(text, encoding='utf-8', newline='\n')
