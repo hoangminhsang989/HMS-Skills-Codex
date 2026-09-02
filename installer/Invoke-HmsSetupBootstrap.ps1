@@ -340,9 +340,34 @@ function Invoke-HmsGit {
         [Parameter(Mandatory)][string[]]$Arguments,
         [Parameter(Mandatory)][string]$FailureMessage
     )
-    $output = @(& $GitExe -C $RepoRoot @Arguments 2>&1)
-    if ($LASTEXITCODE -ne 0) { throw ($FailureMessage + ' ' + (($output -join "`n").Trim())) }
-    return (($output -join "`n").Trim())
+    foreach ($argument in $Arguments) {
+        if ([string]$argument -match '[\s"\r\n]') { throw "Unsafe whitespace or quote in HMS Git argument: $argument" }
+    }
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $GitExe
+    $psi.WorkingDirectory = $RepoRoot
+    $psi.Arguments = ($Arguments -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = New-Object Diagnostics.Process
+    $proc.StartInfo = $psi
+    try {
+        if (-not $proc.Start()) { throw $FailureMessage }
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        $proc.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($proc.ExitCode -ne 0) {
+            $detail = (($stdout + "`n" + $stderr).Trim())
+            if ([string]::IsNullOrWhiteSpace($detail)) { throw $FailureMessage }
+            throw ($FailureMessage + ' ' + $detail)
+        }
+        return $stdout.Trim()
+    }
+    finally { $proc.Dispose() }
 }
 
 function Test-HmsGitAncestor {
@@ -392,10 +417,8 @@ function Reconcile-HmsCheckout {
             $null = Assert-HmsSafeDirectory -Path $parent -Label 'HMS install parent' -AllowCreate
             $null = New-Item -ItemType Directory -Path $repo
         }
-        & $GitExe init --initial-branch=main $repo 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'Unable to initialize the HMS checkout.' }
-        & $GitExe -C $repo remote add origin $CanonicalHmsRemote 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'Unable to configure the HMS origin.' }
+        $null = Invoke-HmsGit -GitExe $GitExe -RepoRoot $repo -Arguments @('init','--initial-branch=main') -FailureMessage 'Unable to initialize the HMS checkout.'
+        $null = Invoke-HmsGit -GitExe $GitExe -RepoRoot $repo -Arguments @('remote','add','origin',$CanonicalHmsRemote) -FailureMessage 'Unable to configure the HMS origin.'
     }
     else {
         if (-not (Test-Path -LiteralPath $gitMeta -PathType Container)) { throw 'HMS install root must use a normal .git directory, not an indirection file.' }
@@ -408,8 +431,7 @@ function Reconcile-HmsCheckout {
     }
 
     $sourceRef = [string]$Authority.source_ref
-    & $GitExe -C $repo fetch --no-tags origin ($sourceRef + ':' + $SetupRemoteRef) 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Unable to fetch exact HMS setup authority ref: $sourceRef" }
+    $null = Invoke-HmsGit -GitExe $GitExe -RepoRoot $repo -Arguments @('fetch','--no-tags','origin',($sourceRef + ':' + $SetupRemoteRef)) -FailureMessage "Unable to fetch exact HMS setup authority ref: $sourceRef"
     $fetched = (Invoke-HmsGit -GitExe $GitExe -RepoRoot $repo -Arguments @('rev-parse',$SetupRemoteRef) -FailureMessage 'Unable to resolve fetched HMS setup authority.').ToLowerInvariant()
     if ($fetched -cne [string]$Authority.commit) { throw "Fetched HMS authority commit mismatch. Expected $($Authority.commit), found $fetched." }
     $fetchedTree = (Invoke-HmsGit -GitExe $GitExe -RepoRoot $repo -Arguments @('rev-parse',($fetched + '^{tree}')) -FailureMessage 'Unable to resolve fetched HMS authority tree.').ToLowerInvariant()
@@ -421,17 +443,14 @@ function Reconcile-HmsCheckout {
     catch { if ($isExistingRepo) { throw }; $headExists = $false }
 
     if (-not $headExists) {
-        & $GitExe -C $repo checkout -B main $fetched 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'Unable to activate exact HMS setup authority on main.' }
+        $null = Invoke-HmsGit -GitExe $GitExe -RepoRoot $repo -Arguments @('checkout','-B','main',$fetched) -FailureMessage 'Unable to activate exact HMS setup authority on main.'
     }
     elseif ($head -cne $fetched) {
         if (Test-HmsGitAncestor -GitExe $GitExe -RepoRoot $repo -Older $head -Newer $fetched) {
-            & $GitExe -C $repo merge --ff-only $SetupRemoteRef 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Unable to fast-forward HMS checkout to setup authority.' }
+            $null = Invoke-HmsGit -GitExe $GitExe -RepoRoot $repo -Arguments @('merge','--ff-only',$SetupRemoteRef) -FailureMessage 'Unable to fast-forward HMS checkout to setup authority.'
         }
         elseif (Test-HmsGitAncestor -GitExe $GitExe -RepoRoot $repo -Older $fetched -Newer $head) {
-            & $GitExe -C $repo fetch --no-tags origin 'refs/heads/main:refs/remotes/origin/main' 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw 'Unable to verify newer HMS checkout against canonical origin/main.' }
+            $null = Invoke-HmsGit -GitExe $GitExe -RepoRoot $repo -Arguments @('fetch','--no-tags','origin','refs/heads/main:refs/remotes/origin/main') -FailureMessage 'Unable to verify newer HMS checkout against canonical origin/main.'
             $originMain = (Invoke-HmsGit -GitExe $GitExe -RepoRoot $repo -Arguments @('rev-parse','refs/remotes/origin/main') -FailureMessage 'Unable to resolve canonical origin/main.').ToLowerInvariant()
             if ($head -cne $originMain) { throw 'Refusing to treat an unverified local descendant as a newer HMS release.' }
             Write-Host "Verified newer HMS checkout present at $head; setup will not downgrade it."
@@ -439,10 +458,8 @@ function Reconcile-HmsCheckout {
         else { throw 'HMS checkout history diverges from the setup authority.' }
     }
 
-    & $GitExe -C $repo config branch.main.remote origin 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Unable to configure HMS main remote tracking.' }
-    & $GitExe -C $repo config branch.main.merge refs/heads/main 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Unable to configure HMS main merge tracking.' }
+    $null = Invoke-HmsGit -GitExe $GitExe -RepoRoot $repo -Arguments @('config','branch.main.remote','origin') -FailureMessage 'Unable to configure HMS main remote tracking.'
+    $null = Invoke-HmsGit -GitExe $GitExe -RepoRoot $repo -Arguments @('config','branch.main.merge','refs/heads/main') -FailureMessage 'Unable to configure HMS main merge tracking.'
     Assert-HmsCleanCheckout -GitExe $GitExe -RepoRoot $repo
     return $repo
 }
