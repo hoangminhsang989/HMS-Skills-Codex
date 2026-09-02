@@ -156,7 +156,7 @@ jobs:
           `$previous1=New-CodeGraphBundleIdentity -TransactionId '11111111111111111111111111111111' -Role 'candidate' -Version 'old1' -Tag 'v-old1' -Commit 'c-old1' -Asset 'a-old1' -Sha256 's-old1'
           New-TestBundle -Path `$backup1 -Identity `$previous1
           `$backup1id=New-CodeGraphBundleIdentity -TransactionId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' -Role 'backup' -Version 'old1' -Tag 'v-old1' -Commit 'c-old1' -Asset 'a-old1' -Sha256 's-old1' -BundleTreeSha256 ([string]`$previous1.bundle_tree_sha256)
-          Write-CodeGraphBundleMarker -Path `$backup1 -Identity `$backup1id
+          Write-CodeGraphBundleMarker -Path `$backup1 -Identity `$backup1id -ExpectedPreviousIdentity `$previous1
           Assert-CodeGraphTransactionBundle -Path `$backup1 -Identity `$backup1id
           `$candidate1=New-CodeGraphBundleIdentity -TransactionId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' -Role 'candidate' -Version 'new1' -Tag 'v-new1' -Commit 'c-new1' -Asset 'a-new1' -Sha256 's-new1'
           New-TestBundle -Path `$current1 -Identity `$candidate1
@@ -164,6 +164,7 @@ jobs:
           `$newManifest1=New-ManifestFromIdentity -Identity `$candidate1
           `$oldBytes1=(New-Object Text.UTF8Encoding(`$false)).GetBytes((`$oldManifest1|ConvertTo-Json -Compress))
           [IO.File]::WriteAllText(`$CodeGraphManifest,(`$newManifest1|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
+          `$candidateManifestGuard1=Open-HmsDeliveryFileGuard -Path `$CodeGraphManifest -Label 'Review486 candidate manifest 1'
           `$partialCandidate=Join-Path `$case1 '.hms-codegraph-deleting-injected-candidate'
           `$injectCandidateFailure={
             param(`$Path,`$Identity)
@@ -171,7 +172,7 @@ jobs:
             Remove-Item -LiteralPath (Join-Path `$partialCandidate 'bin\codegraph.cmd') -Force
             throw 'INJECTED_CANDIDATE_PARTIAL_DELETE'
           }
-          `$r1=Repair-CodeGraphRollbackState -CurrentPath `$current1 -BackupPath `$backup1 -CandidateIdentity `$candidate1 -BackupIdentity `$backup1id -PreviousIdentity `$previous1 -ManifestPublished `$true -PublishedManifest `$newManifest1 -PreviousManifestBytes `$oldBytes1 -HadPrevious `$true -CandidateRemovalAction `$injectCandidateFailure
+          `$r1=Repair-CodeGraphRollbackState -CurrentPath `$current1 -BackupPath `$backup1 -CandidateIdentity `$candidate1 -BackupIdentity `$backup1id -PreviousIdentity `$previous1 -ManifestPublished `$true -PublishedManifest `$newManifest1 -CandidateManifestGuard `$candidateManifestGuard1 -PreviousManifestBytes `$oldBytes1 -HadPrevious `$true -CandidateRemovalAction `$injectCandidateFailure
           if(`$r1.CurrentBundleState -cne 'previous' -or -not `$r1.BackupActivated -or -not `$r1.CandidateRemovalCompleted){throw 'Partial candidate deletion did not adjudicate to the restored previous bundle.'}
           if((@(`$r1.RollbackErrors)-join ' | ') -notmatch 'INJECTED_CANDIDATE_PARTIAL_DELETE'){throw 'Injected partial candidate cleanup failure was not retained as rollback evidence.'}
           Assert-CodeGraphTransactionBundle -Path `$current1 -Identity `$previous1
@@ -187,7 +188,7 @@ jobs:
           `$previous2=New-CodeGraphBundleIdentity -TransactionId '22222222222222222222222222222222' -Role 'candidate' -Version 'old2' -Tag 'v-old2' -Commit 'c-old2' -Asset 'a-old2' -Sha256 's-old2'
           New-TestBundle -Path `$backup2 -Identity `$previous2
           `$backup2id=New-CodeGraphBundleIdentity -TransactionId 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -Role 'backup' -Version 'old2' -Tag 'v-old2' -Commit 'c-old2' -Asset 'a-old2' -Sha256 's-old2' -BundleTreeSha256 ([string]`$previous2.bundle_tree_sha256)
-          Write-CodeGraphBundleMarker -Path `$backup2 -Identity `$backup2id
+          Write-CodeGraphBundleMarker -Path `$backup2 -Identity `$backup2id -ExpectedPreviousIdentity `$previous2
           Assert-CodeGraphTransactionBundle -Path `$backup2 -Identity `$backup2id
           `$candidate2=New-CodeGraphBundleIdentity -TransactionId 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' -Role 'candidate' -Version 'new2' -Tag 'v-new2' -Commit 'c-new2' -Asset 'a-new2' -Sha256 's-new2'
           New-TestBundle -Path `$current2 -Identity `$candidate2
@@ -195,11 +196,12 @@ jobs:
           `$newManifest2=New-ManifestFromIdentity -Identity `$candidate2
           `$oldBytes2=(New-Object Text.UTF8Encoding(`$false)).GetBytes((`$oldManifest2|ConvertTo-Json -Compress))
           [IO.File]::WriteAllText(`$CodeGraphManifest,(`$newManifest2|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
+          `$candidateManifestGuard2=Open-HmsDeliveryFileGuard -Path `$CodeGraphManifest -Label 'Review486 candidate manifest 2'
           `$partialBackup=Join-Path `$case2 '.hms-codegraph-deleting-injected-backup'
           Rename-Item -LiteralPath `$backup2 -NewName (Split-Path -Leaf `$partialBackup) -ErrorAction Stop
           Remove-Item -LiteralPath (Join-Path `$partialBackup 'bin\codegraph.cmd') -Force
           `$forbiddenCandidateRemoval={param(`$Path,`$Identity);throw 'CANDIDATE_REMOVAL_MUST_NOT_RUN_WHEN_PREVIOUS_BACKUP_IS_UNAVAILABLE'}
-          `$r2=Repair-CodeGraphRollbackState -CurrentPath `$current2 -BackupPath `$backup2 -CandidateIdentity `$candidate2 -BackupIdentity `$backup2id -PreviousIdentity `$previous2 -ManifestPublished `$true -PublishedManifest `$newManifest2 -PreviousManifestBytes `$oldBytes2 -HadPrevious `$true -CandidateRemovalAction `$forbiddenCandidateRemoval
+          `$r2=Repair-CodeGraphRollbackState -CurrentPath `$current2 -BackupPath `$backup2 -CandidateIdentity `$candidate2 -BackupIdentity `$backup2id -PreviousIdentity `$previous2 -ManifestPublished `$true -PublishedManifest `$newManifest2 -CandidateManifestGuard `$candidateManifestGuard2 -PreviousManifestBytes `$oldBytes2 -HadPrevious `$true -CandidateRemovalAction `$forbiddenCandidateRemoval
           if(`$r2.CurrentBundleState -cne 'candidate' -or -not `$r2.CandidatePreserved -or `$r2.BackupActivated){throw 'Unavailable previous backup did not preserve the verified candidate as the active bundle.'}
           if(@(`$r2.RollbackErrors).Count -ne 0){throw "Unexpected rollback adjudication errors while preserving candidate: `$(@(`$r2.RollbackErrors)-join ' | ')"}
           Assert-CodeGraphTransactionBundle -Path `$current2 -Identity `$candidate2

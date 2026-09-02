@@ -254,6 +254,7 @@ jobs:
           `$oldManifest3=New-CodeGraphManifestFromIdentity -Identity `$previous3
           `$oldBytes3=(New-Object Text.UTF8Encoding(`$false)).GetBytes((`$oldManifest3|ConvertTo-Json -Compress))
           [IO.File]::WriteAllText(`$CodeGraphManifest,(`$newManifest3|ConvertTo-Json -Compress),(New-Object Text.UTF8Encoding(`$false)))
+          `$candidateManifestGuard3=Open-HmsDeliveryFileGuard -Path `$CodeGraphManifest -Label 'Latest rollback candidate manifest 3'
           `$script:InjectedBackupPath=`$backup3
           `$script:InjectedForeignSentinel=Join-Path `$backup3 'FOREIGN.txt'
           `$removeAfterReserve={
@@ -262,7 +263,7 @@ jobs:
             [IO.File]::WriteAllText(`$script:InjectedForeignSentinel,'foreign',[Text.Encoding]::ASCII)
             Remove-CodeGraphTransactionBundle -Path `$Path -Identity `$Identity
           }
-          `$r3=Repair-CodeGraphRollbackState -CurrentPath `$current3 -BackupPath `$backup3 -CandidateIdentity `$candidate3 -BackupIdentity `$backup3id -PreviousIdentity `$previous3 -ManifestPublished `$true -PublishedManifest `$newManifest3 -PreviousManifestBytes `$oldBytes3 -HadPrevious `$true -CandidateRemovalAction `$removeAfterReserve
+          `$r3=Repair-CodeGraphRollbackState -CurrentPath `$current3 -BackupPath `$backup3 -CandidateIdentity `$candidate3 -BackupIdentity `$backup3id -PreviousIdentity `$previous3 -ManifestPublished `$true -PublishedManifest `$newManifest3 -CandidateManifestGuard `$candidateManifestGuard3 -PreviousManifestBytes `$oldBytes3 -HadPrevious `$true -CandidateRemovalAction `$removeAfterReserve
           if(@(`$r3.RollbackErrors).Count -ne 0 -or `$r3.CurrentBundleState -cne 'previous' -or -not `$r3.BackupActivated -or -not `$r3.CandidateRemovalCompleted){throw "Reserved-backup rollback failed: `$(@(`$r3.RollbackErrors)-join ' | ')"}
           Assert-CodeGraphTransactionBundle -Path `$current3 -Identity `$previous3
           if(-not(Test-Path -LiteralPath `$script:InjectedForeignSentinel)){throw 'Foreign replacement at original backup pathname was moved or deleted.'}
