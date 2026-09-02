@@ -21,83 +21,115 @@ jobs:
           ref: ${{ env.CANDIDATE_SHA }}
           fetch-depth: 1
 
-      - name: Compare sequential and concurrent committed-blob drains inside Start-Job
+      - name: Compare child-job git invocation modes
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $root = $env:GITHUB_WORKSPACE
           $relative = 'scripts/Initialize-HmsLifecycleTrust.ps1'
           $head = $env:CANDIDATE_SHA.ToLowerInvariant()
-          $expected = ((& git -C $root rev-parse "$head`:$relative" 2>$null) -join '').Trim().ToLowerInvariant()
-          if ($LASTEXITCODE -ne 0 -or $expected -notmatch '^[0-9a-f]{40}$') { throw 'Bootstrap blob lookup failed.' }
-          Write-Host "BOOTSTRAP_BLOB=$expected"
+          $blob = ((& git -C $root rev-parse "$head`:$relative" 2>$null) -join '').Trim().ToLowerInvariant()
+          if ($LASTEXITCODE -ne 0 -or $blob -notmatch '^[0-9a-f]{40}$') { throw 'Bootstrap blob lookup failed.' }
+          $gitExe = (Get-Command git -CommandType Application -ErrorAction Stop).Source
+          Write-Host "BOOTSTRAP_BLOB=$blob"
+          Write-Host "GIT_EXE=$gitExe"
 
-          $syncJob = Start-Job -ScriptBlock {
+          function Invoke-DiagJob {
+            param([Parameter(Mandatory)][string]$Label,[Parameter(Mandatory)][scriptblock]$Body,[Parameter(Mandatory)][object[]]$Args,[int]$TimeoutSeconds=15)
+            $job = Start-Job -ScriptBlock $Body -ArgumentList $Args
+            try {
+              $null = Wait-Job $job -Timeout $TimeoutSeconds
+              $output = @(Receive-Job $job -ErrorAction Continue 2>&1)
+              $output | ForEach-Object { Write-Host $_ }
+              Write-Host ("{0}_STATE={1}" -f $Label,$job.State)
+              return [pscustomobject]@{ State=$job.State; Output=$output }
+            }
+            finally {
+              if ($job.State -in @('Running','NotStarted')) { Stop-Job $job -ErrorAction SilentlyContinue }
+              Remove-Job $job -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          $native = Invoke-DiagJob -Label 'NATIVE' -Args @($root,$blob,$gitExe) -Body {
+            param($RepoRoot,$Blob,$GitExe)
+            $ErrorActionPreference='Stop'
+            Write-Output ('NATIVE_CMD={0}' -f (Get-Command git -CommandType Application -ErrorAction Stop).Source)
+            $size = ((& $GitExe -C $RepoRoot cat-file -s $Blob 2>&1) -join '').Trim()
+            Write-Output ('NATIVE_SIZE={0}' -f $size)
+            $tmp = Join-Path $env:TEMP ('hms-native-' + [guid]::NewGuid().ToString('N') + '.bin')
+            try {
+              $psi = New-Object Diagnostics.ProcessStartInfo
+              $psi.FileName = $env:ComSpec
+              $psi.Arguments = ('/d /s /c ""{0}" -C "{1}" cat-file blob {2} > "{3}""' -f $GitExe,$RepoRoot,$Blob,$tmp)
+              $psi.UseShellExecute=$false
+              $psi.CreateNoWindow=$true
+              $p=New-Object Diagnostics.Process
+              $p.StartInfo=$psi
+              try {
+                if (-not $p.Start()) { throw 'cmd redirect start failed' }
+                if (-not $p.WaitForExit(10000)) { try { $p.Kill($true) } catch {}; throw 'cmd redirect timeout' }
+                Write-Output ('NATIVE_REDIRECT_EXIT={0}' -f $p.ExitCode)
+                Write-Output ('NATIVE_REDIRECT_BYTES={0}' -f (Get-Item -LiteralPath $tmp).Length)
+              }
+              finally { $p.Dispose() }
+            }
+            finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+          }
+
+          $pathDotNet = Invoke-DiagJob -Label 'DOTNET_PATH' -Args @($root,$blob) -Body {
             param($RepoRoot,$Blob)
             $ErrorActionPreference='Stop'
             $psi=New-Object Diagnostics.ProcessStartInfo
             $psi.FileName='git'
-            $psi.Arguments="cat-file blob $Blob"
-            $psi.WorkingDirectory=$RepoRoot
+            $psi.Arguments="-C `"$RepoRoot`" cat-file blob $Blob"
             $psi.UseShellExecute=$false
             $psi.RedirectStandardOutput=$true
             $psi.RedirectStandardError=$true
             $psi.CreateNoWindow=$true
-            $proc=New-Object Diagnostics.Process
-            $proc.StartInfo=$psi
-            $memory=New-Object IO.MemoryStream
+            $p=New-Object Diagnostics.Process
+            $p.StartInfo=$psi
+            $m=New-Object IO.MemoryStream
             try {
-              if (-not $proc.Start()) { throw 'sync start failed' }
-              Write-Output 'SYNC_AFTER_START'
-              $proc.StandardOutput.BaseStream.CopyTo($memory)
-              Write-Output ('SYNC_AFTER_STDOUT={0}' -f $memory.Length)
-              $stderr=$proc.StandardError.ReadToEnd()
-              Write-Output ('SYNC_AFTER_STDERR={0}' -f $stderr.Length)
-              $proc.WaitForExit()
-              Write-Output ('SYNC_EXIT={0}' -f $proc.ExitCode)
+              if (-not $p.Start()) { throw 'DOTNET_PATH start failed' }
+              Write-Output ('DOTNET_PATH_MAINMODULE={0}' -f $p.MainModule.FileName)
+              $ot=$p.StandardOutput.BaseStream.CopyToAsync($m)
+              $et=$p.StandardError.ReadToEndAsync()
+              if (-not $p.WaitForExit(10000)) { try { $p.Kill($true) } catch {}; throw 'DOTNET_PATH timeout' }
+              $ot.GetAwaiter().GetResult(); $err=$et.GetAwaiter().GetResult()
+              Write-Output ('DOTNET_PATH_EXIT={0}' -f $p.ExitCode)
+              Write-Output ('DOTNET_PATH_BYTES={0}' -f $m.Length)
+              Write-Output ('DOTNET_PATH_STDERR={0}' -f $err.Length)
             }
-            finally { $memory.Dispose(); $proc.Dispose() }
-          } -ArgumentList $root,$expected
+            finally { $m.Dispose(); $p.Dispose() }
+          }
 
-          $null=Wait-Job $syncJob -Timeout 12
-          Receive-Job $syncJob -ErrorAction Continue 2>&1 | ForEach-Object { Write-Host $_ }
-          Write-Host "SYNC_JOB_STATE=$($syncJob.State)"
-          if ($syncJob.State -in @('Running','NotStarted')) { Stop-Job $syncJob -ErrorAction SilentlyContinue }
-          Remove-Job $syncJob -Force -ErrorAction SilentlyContinue
-
-          $asyncJob = Start-Job -ScriptBlock {
-            param($RepoRoot,$Blob)
+          $absDotNet = Invoke-DiagJob -Label 'DOTNET_ABS' -Args @($root,$blob,$gitExe) -Body {
+            param($RepoRoot,$Blob,$GitExe)
             $ErrorActionPreference='Stop'
             $psi=New-Object Diagnostics.ProcessStartInfo
-            $psi.FileName='git'
-            $psi.Arguments="cat-file blob $Blob"
-            $psi.WorkingDirectory=$RepoRoot
+            $psi.FileName=$GitExe
+            $psi.Arguments="-C `"$RepoRoot`" cat-file blob $Blob"
             $psi.UseShellExecute=$false
             $psi.RedirectStandardOutput=$true
             $psi.RedirectStandardError=$true
             $psi.CreateNoWindow=$true
-            $proc=New-Object Diagnostics.Process
-            $proc.StartInfo=$psi
-            $memory=New-Object IO.MemoryStream
+            $p=New-Object Diagnostics.Process
+            $p.StartInfo=$psi
+            $m=New-Object IO.MemoryStream
             try {
-              if (-not $proc.Start()) { throw 'async start failed' }
-              Write-Output 'ASYNC_AFTER_START'
-              $stdoutTask=$proc.StandardOutput.BaseStream.CopyToAsync($memory)
-              $stderrTask=$proc.StandardError.ReadToEndAsync()
-              if (-not $proc.WaitForExit(15000)) { try { $proc.Kill($true) } catch {}; throw 'async git cat-file timeout' }
-              $stdoutTask.GetAwaiter().GetResult()
-              $stderr=$stderrTask.GetAwaiter().GetResult()
-              Write-Output ('ASYNC_AFTER_STDOUT={0}' -f $memory.Length)
-              Write-Output ('ASYNC_AFTER_STDERR={0}' -f $stderr.Length)
-              Write-Output ('ASYNC_EXIT={0}' -f $proc.ExitCode)
+              if (-not $p.Start()) { throw 'DOTNET_ABS start failed' }
+              Write-Output ('DOTNET_ABS_MAINMODULE={0}' -f $p.MainModule.FileName)
+              $ot=$p.StandardOutput.BaseStream.CopyToAsync($m)
+              $et=$p.StandardError.ReadToEndAsync()
+              if (-not $p.WaitForExit(10000)) { try { $p.Kill($true) } catch {}; throw 'DOTNET_ABS timeout' }
+              $ot.GetAwaiter().GetResult(); $err=$et.GetAwaiter().GetResult()
+              Write-Output ('DOTNET_ABS_EXIT={0}' -f $p.ExitCode)
+              Write-Output ('DOTNET_ABS_BYTES={0}' -f $m.Length)
+              Write-Output ('DOTNET_ABS_STDERR={0}' -f $err.Length)
             }
-            finally { $memory.Dispose(); $proc.Dispose() }
-          } -ArgumentList $root,$expected
+            finally { $m.Dispose(); $p.Dispose() }
+          }
 
-          $null=Wait-Job $asyncJob -Timeout 25
-          $asyncOutput=@(Receive-Job $asyncJob -ErrorAction Continue 2>&1)
-          $asyncOutput | ForEach-Object { Write-Host $_ }
-          Write-Host "ASYNC_JOB_STATE=$($asyncJob.State)"
-          if ($asyncJob.State -ne 'Completed') { throw 'Concurrent pipe drain did not complete in child job.' }
-          if (-not ($asyncOutput -match '^ASYNC_EXIT=0$')) { throw 'Concurrent pipe drain did not prove git exit 0.' }
-          Remove-Job $asyncJob -Force -ErrorAction SilentlyContinue
+          Write-Host ('SUMMARY_NATIVE={0}' -f $native.State)
+          Write-Host ('SUMMARY_DOTNET_PATH={0}' -f $pathDotNet.State)
+          Write-Host ('SUMMARY_DOTNET_ABS={0}' -f $absDotNet.State)
