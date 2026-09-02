@@ -1,0 +1,59 @@
+name: TMP diagnose non-Windows blob reader output fa340
+
+on:
+  push:
+    branches:
+      - remediate/cross-platform-blob-reader-fa340
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      BASE_SHA: fa340bda134612b1df42222e21becf2f96563937
+    steps:
+      - name: Checkout diagnostic branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: remediate/cross-platform-blob-reader-fa340
+          fetch-depth: 0
+
+      - name: Inspect exact blob-reader outputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          $paths = @('install.ps1','scripts/Initialize-HmsLifecycleTrust.ps1','update.ps1')
+          foreach ($path in $paths) {
+            & git -C $root checkout $env:BASE_SHA -- $path
+            if ($LASTEXITCODE -ne 0) { throw "Unable to materialize base bytes for $path" }
+          }
+          Push-Location $root
+          try {
+            & python '.github/tmp/author_cross_platform_blob_reader_fa340.py'
+            if ($LASTEXITCODE -ne 0) { throw "Mechanical patcher failed with exit $LASTEXITCODE" }
+
+            . './scripts/Initialize-HmsLifecycleTrust.ps1'
+            $outputs = @(Get-HmsCommittedBlobSnapshot -RepoRoot $root -Head $env:BASE_SHA -RelativePath 'scripts/Read-HmsCompositeModuleState.ps1' -Label 'Diagnostic committed reader')
+            Write-Host "PROBE_OUTPUT_COUNT=$($outputs.Count)"
+            for ($i = 0; $i -lt $outputs.Count; $i++) {
+              $item = $outputs[$i]
+              if ($null -eq $item) {
+                Write-Host "PROBE_OUTPUT_${i}_TYPE=<null>"
+                continue
+              }
+              Write-Host "PROBE_OUTPUT_${i}_TYPE=$($item.GetType().FullName)"
+              Write-Host "PROBE_OUTPUT_${i}_TEXT=$([string]$item)"
+              $props = @($item.PSObject.Properties.Name | Sort-Object)
+              Write-Host "PROBE_OUTPUT_${i}_PROPS=$($props -join ',')"
+            }
+            if ($outputs.Count -ge 1) {
+              $last = $outputs[-1]
+              Write-Host "PROBE_LAST_HAS_BYTES=$($null -ne $last.PSObject.Properties['Bytes'])"
+              Write-Host "PROBE_LAST_HAS_SHA=$($null -ne $last.PSObject.Properties['Sha'])"
+            }
+          }
+          finally { Pop-Location }
