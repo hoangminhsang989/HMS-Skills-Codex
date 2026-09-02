@@ -1,0 +1,57 @@
+name: Diagnose PS5.1 closure command visibility
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diagnose-ps51-closure-command-visibility.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-ps51-closure-command-visibility:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout exact diagnostic SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Compare normal and GetNewClosure command visibility under Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $probe = Join-Path $env:RUNNER_TEMP 'hms-ps51-closure-visibility.ps1'
+          $payload = Join-Path $env:RUNNER_TEMP 'hms-ps51-closure-payload.bin'
+          [IO.File]::WriteAllBytes($payload,[byte[]](1,2,3,4,5))
+          $probeText = @'
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          Write-Host ("PS_VERSION={0} EDITION={1}" -f $PSVersionTable.PSVersion,$PSVersionTable.PSEdition)
+          Write-Host ("PSMODULEPATH={0}" -f $env:PSModulePath)
+          $outside = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+          Write-Host ("OUTSIDE_GET_FILE_HASH={0}" -f ($null -ne $outside))
+          if ($null -ne $outside) { Write-Host ("OUTSIDE_SOURCE={0}" -f $outside.Source) }
+          $path = $args[0]
+          $closure = { param($P) (Get-FileHash -LiteralPath $P -Algorithm SHA256).Hash }.GetNewClosure()
+          try {
+            $value = & $closure $path
+            Write-Host ("CLOSURE_GET_FILE_HASH=SUCCESS HASH={0}" -f $value)
+          }
+          catch {
+            Write-Host ("CLOSURE_GET_FILE_HASH=FAIL TYPE={0} MESSAGE={1}" -f $_.Exception.GetType().FullName,$_.Exception.Message)
+          }
+          try {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            $stream = [IO.File]::OpenRead($path)
+            try { $value = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','').ToLowerInvariant() }
+            finally { $stream.Dispose(); $sha.Dispose() }
+            Write-Host ("CLOSURE_DOTNET_SHA256_BASELINE={0}" -f $value)
+          }
+          catch { throw }
+          '@
+          [IO.File]::WriteAllText($probe,$probeText,(New-Object Text.UTF8Encoding($false)))
+          $powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+          $proc = Start-Process -FilePath $powershell -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"' + $probe + '"'),('"' + $payload + '"')) -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "PS5.1 closure visibility diagnostic exited $($proc.ExitCode)." }
